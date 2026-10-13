@@ -1,0 +1,2 @@
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 state UNKNOWN qdisc noqueue
+2: ens5: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP qdisc mq

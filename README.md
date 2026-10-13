@@ -35,7 +35,7 @@
 | `AGENTS.md` | agent 的入口：权限边界 + 四阶段流程 | 只读 |
 | `program.md` | 调优循环细则：决策规则、退出机制、剪枝策略 | 只读 |
 | `README.md` | 本文件 | 只读 |
-| `probe.py` | 多机环境探测（并行）→ env.json / env_report.md / model_profile.json | 只读（后续阶段交付） |
+| `probe.py` | 多机环境探测（并行）→ env.json / env_report.md / model_profile.json | 只读 |
 | `bench.py` | 远端起服 + `vllm bench serve --goodput` 度量 + 僵尸清理 | 只读（后续阶段交付） |
 | `report.py` | 收尾汇总 → report.md | 只读（后续阶段交付） |
 | `run.sh` | 两段式执行：rsync + 远端 nohup 启动 + 轮询状态 | 只读（后续阶段交付） |
@@ -64,7 +64,7 @@
 2. 用初始 `config.yaml`（基线）跑一次 `bash run.sh`，确认 bench 出数正常。
 3. 跑一次短预算循环，确认 keep / discard 判定与三层退出逻辑正确。
 
-> 注：本仓库当前为 Phase 1（契约与文档）；`probe.py` / `bench.py` / `run.sh` / `setup_remote.sh` / `report.py` 将在后续阶段交付，交付前本清单不可执行。
+> 注：`probe.py` 已交付（清单第 1 条可执行）；`bench.py` / `run.sh` / `report.py` / `setup_remote.sh` 待后续阶段交付，届时第 2/3 条可执行。
 
 ## 依赖
 

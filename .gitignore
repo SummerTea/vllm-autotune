@@ -3,7 +3,8 @@
 
 # Local instance config & secrets
 .env
-target.yaml                     # 本地实例配置，含 ssh 主机地址，勿提交
+# 本地实例配置，含 ssh 主机地址，勿提交
+target.yaml
 
 # Generated artifacts (per-run, not part of the template)
 run.log

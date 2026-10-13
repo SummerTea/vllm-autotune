@@ -30,7 +30,7 @@
 ### Phase 2 — 基线
 - **读**：`config.yaml`（初始即为基线态）。
 - **跑**：`bash run.sh` 一次。
-- **产出**：基线行的 goodput / 时延指标写入 `results.tsv`；用 vLLM 启动日志中的实测值（如权重加载耗时、显存占用）校准 `model_profile.json`。
+- **产出**：基线行的 goodput / 时延指标写入 `results.tsv`；用 vLLM 启动日志中的实测值校准 `model_profile.json`——写入 `boot.measured_seconds` 与 `kv.measured_capacity_tokens`（实测），并置 `calibrated: true`。
 
 ### Phase 3 — 调优循环
 - **读**：`program.md`（循环细则与退出机制）、`env.json` / `model_profile.json`（剪枝依据）、`results.tsv`（历史与当前最佳）。

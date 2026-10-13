@@ -1,0 +1,4 @@
+Name: vllm
+Version: 0.31.0
+Summary: A high-throughput and memory-efficient inference and serving engine for LLMs
+Home-page: https://github.com/vllm-project/vllm
