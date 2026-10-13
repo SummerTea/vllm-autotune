@@ -20,7 +20,7 @@
 
 ## git 约定
 
-- 每次 trial：改 `config.yaml` → `git commit`（同一 run 分支，线性历史）→ 跑实验 → 记录。
+- 每次 trial：改 `config.yaml` → `git commit`（同一 run 分支，线性历史）→ `bash run.sh` 启动（秒回）→ 轮询 `bash run.sh --poll` 至退出 0（done）或 1（crash）；3 = 仍在运行 → 记录。
 - **不回退提交**：discard 的配置仍留在 git 历史里可复盘；下一个 trial 前只需把工作区恢复到当前最佳：`git checkout <best_commit> -- config.yaml`。
 - keep 即更新 `results.tsv` 中的 `best` 标记（记录其 commit）。
 - `results.tsv` 与 `run.log` 保持 untracked，永不提交。

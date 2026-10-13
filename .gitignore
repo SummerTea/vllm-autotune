@@ -13,6 +13,7 @@ env.json
 env_report.md
 model_profile.json
 report.md
+result.json
 
 # Python
 __pycache__/

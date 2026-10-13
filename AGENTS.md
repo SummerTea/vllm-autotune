@@ -29,12 +29,12 @@
 
 ### Phase 2 — 基线
 - **读**：`config.yaml`（初始即为基线态）。
-- **跑**：`bash run.sh` 一次。
+- **跑**：`bash run.sh` 启动基线 trial，轮询 `bash run.sh --poll` 直至退出 0（done）/ 1（crash）。
 - **产出**：基线行的 goodput / 时延指标写入 `results.tsv`；用 vLLM 启动日志中的实测值校准 `model_profile.json`——写入 `boot.measured_seconds` 与 `kv.measured_capacity_tokens`（实测），并置 `calibrated: true`。
 
 ### Phase 3 — 调优循环
 - **读**：`program.md`（循环细则与退出机制）、`env.json` / `model_profile.json`（剪枝依据）、`results.tsv`（历史与当前最佳）。
-- **跑**：每轮「改 `config.yaml` → commit → `bash run.sh` → 记录结果 → keep / discard」。
+- **跑**：每轮「改 `config.yaml` → commit → `bash run.sh` 启动（秒回）→ 轮询 `bash run.sh --poll`（退出码 3=仍在运行，0=done，1=crash）→ 记录结果 → keep / discard」。
 - **产出**：更新 `results.tsv`；每轮一个 config.yaml 的 git commit。
 
 ### Phase 4 — 收尾
@@ -50,7 +50,7 @@
 
 ## 远程执行约定
 
-- `run.sh` 为两段式：先 rsync 同步 harness 到远端，再远端 `nohup` 启动 + 本机轮询状态。
+- `run.sh` 为两段式启动/轮询：`bash run.sh` 先 rsync 同步 harness 到远端，再远端 `nohup` 启动并秒回；随后循环 `bash run.sh --poll` 直到退出 0（done）或 1（crash）；退出码 3 = 仍在运行，继续轮询。
 - 假定 head 主机由本次实验独占；`bench.py` 负责清理僵尸 vllm 进程。
 
 ## 循环细则

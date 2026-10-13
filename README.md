@@ -18,7 +18,7 @@
 1. Fork / clone 本仓库。
 2. `cp target.example.yaml target.yaml`，填写主机、模型、SLO、预算。
 3. `cp .env.example .env`，填写 SSH 选项（端口、私钥路径、远端目录）。
-4. 在 head 主机上运行 `bash setup_remote.sh`（一次性，pin vLLM 版本）。
+4. 在编排机（本仓库目录）运行 `bash setup_remote.sh`（一次性，经 ssh 对 head 主机执行并 pin vLLM 版本）。
 5. 把编码 agent（Claude Code / Codex / opencode）指向本仓库。
 6. 对它说：「读 AGENTS.md，开始」——之后它自主循环，你睡觉。
 
@@ -36,10 +36,10 @@
 | `program.md` | 调优循环细则：决策规则、退出机制、剪枝策略 | 只读 |
 | `README.md` | 本文件 | 只读 |
 | `probe.py` | 多机环境探测（并行）→ env.json / env_report.md / model_profile.json | 只读 |
-| `bench.py` | 远端起服 + `vllm bench serve --goodput` 度量 + 僵尸清理 | 只读（后续阶段交付） |
+| `bench.py` | 远端起服 + `vllm bench serve --goodput` 度量 + 僵尸清理 | 只读 |
 | `report.py` | 收尾汇总 → report.md | 只读（后续阶段交付） |
-| `run.sh` | 两段式执行：rsync + 远端 nohup 启动 + 轮询状态 | 只读（后续阶段交付） |
-| `setup_remote.sh` | head 主机一次性环境准备（pin vLLM 版本） | 只读（后续阶段交付） |
+| `run.sh` | 两段式执行：rsync + 远端 nohup 启动 + 轮询状态 | 只读 |
+| `setup_remote.sh` | head 主机一次性环境准备（pin vLLM 版本） | 只读 |
 | `docs/vllm-facts.md` | 模板依赖的 vLLM 行为事实（版本相关，升级需重新核对） | 只读 |
 | `pyproject.toml` / `LICENSE` / `.gitignore` | 工程元数据 | 只读 |
 
@@ -61,10 +61,10 @@
 > 模板交付前只在 mock 级验证过，真机首次使用务必按顺序冒烟：
 
 1. 跑 `python probe.py`，检查生成的 `env_report.md`（系统参数清单 pass / warn / fail）。
-2. 用初始 `config.yaml`（基线）跑一次 `bash run.sh`，确认 bench 出数正常。
+2. 用初始 `config.yaml`（基线）跑 `bash run.sh` 并轮询 `bash run.sh --poll` 至退出 0，确认 bench 出数正常。
 3. 跑一次短预算循环，确认 keep / discard 判定与三层退出逻辑正确。
 
-> 注：`probe.py` 已交付（清单第 1 条可执行）；`bench.py` / `run.sh` / `report.py` / `setup_remote.sh` 待后续阶段交付，届时第 2/3 条可执行。
+> 注：`probe.py` / `bench.py` / `run.sh` / `setup_remote.sh` 均已交付（清单第 1、2 条可执行）；仅 `report.py` 留待后续阶段交付，届时第 3 条可执行。
 
 ## 依赖
 
