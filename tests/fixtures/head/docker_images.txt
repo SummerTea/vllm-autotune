@@ -1,0 +1,2 @@
+vllm/vllm-openai:v0.31.0
+nvcr.io/nvidia/cuda:12.4.1-base-ubuntu22.04

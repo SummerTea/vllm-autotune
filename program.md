@@ -4,6 +4,8 @@
 
 在 SLO 约束下最大化 goodput；每次实验只改 `config.yaml`，其余文件只读。满足任一退出条件即进 Phase 4，不要无限循环。
 
+- **远端约束**：所有远端操作只写 `target.yaml` 确认的 `work_dir`；默认不 pull 镜像、不安装环境（除非 `runtime.install_allowed: true` 且仅限 work_dir 内）。
+
 ## 指标定义
 
 - **goodput** = 满足 SLO 的成功请求吞吐，来自 `vllm bench serve --goodput ttft:<slo.ttft_p99_ms> tpot:<slo.tpot_p99_ms>` 输出的 `request_goodput`（单位 **req/s**，只统计同时满足全部 SLO 的成功请求）。工具细节见 `docs/vllm-facts.md`。
@@ -72,6 +74,7 @@ commit  goodput  output_tok_s  ttft_p99_ms  tpot_p99_ms  peak_vram_gb  dur_s  st
 - **合法 tp 集合**：由 `num_attention_heads` / `num_key_value_heads` 的约数决定，非法 tp 值不试。
 - **系统级参数**：governor / hugepages / 锁频等只探测 + 建议（写进 report.md），不自动修改（v1 不提供自动修改开关）。
 - **布尔参数约定**：`true` → 裸 flag（`--enable-x`）；`false` → 省略（保持 vLLM 默认）；要关闭默认开启的开关，写 `no-<flag>: true`（原样透传为 `--no-<flag>`）。
+- **运行时与镜像（docker 模式）**：`runtime.image` 是合法搜索维度（如 CUDA 12/13 变体镜像）；切换镜像成本高（需拉取），先固定镜像再调参；native 模式无此维度。
 - **执行主机**：`run.sh` / `bench.py` 仅作用于唯一 `role: head` 的主机；缺失或重复即报错。
 
 ## 成本梯度

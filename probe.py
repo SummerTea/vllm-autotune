@@ -153,8 +153,11 @@ def _collect_plan(target: dict, harness: dict) -> dict[str, list]:
             _cmd("thp", "cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true"),
             _cmd("swappiness", "sysctl -n vm.swappiness 2>/dev/null || true"),
             _cmd("ibstat", "command -v ibstat >/dev/null 2>&1 && ibstat || true"),
-            _cmd("ip_link", "ip -br link 2>/dev/null || true"),
+            # 用 -o 格式（每行一条 + mtu），避免 -br 别名在不同系统上的解析差异
+            _cmd("ip_link", "ip -o link show 2>/dev/null || true"),
             _cmd("ibv_devinfo", "command -v ibv_devinfo >/dev/null 2>&1 && ibv_devinfo -l || true"),
+            _cmd("docker_version", "docker --version 2>/dev/null || true"),
+            _cmd("docker_images", "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null || true"),
             # 用 pip show（不 import）避免在主机上写入 torch/vllm 缓存
             _cmd("vllm_version", f"{shlex.quote(vllm_python)} -m pip show vllm 2>/dev/null || true"),
             _cmd("hostname", "hostname"),
@@ -318,6 +321,7 @@ def parse_topo(text: str | None, gpu_count: int) -> tuple[str | None, str | None
 
 
 def parse_ip_link(text: str | None) -> list[dict]:
+    """解析 `ip -o link show`（每行: `N: name: <flags> mtu M …`）；缺 mtu/坏行跳过。"""
     if not text:
         return []
     ifaces = []
@@ -337,6 +341,44 @@ def parse_thp(text: str | None) -> str | None:
 
 
 # ── 纯估算函数（单元测试目标）──────────────────────────────────────────
+
+_NESTED_KEYS = (
+    "hidden_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
+    "head_dim", "vocab_size", "intermediate_size", "max_position_embeddings",
+    "torch_dtype", "model_type", "kv_lora_rank", "linear_attn",
+    "num_local_experts", "num_experts", "shared_expert",
+)
+
+
+def normalize_config(config: dict) -> dict:
+    """规范化模型 config：新式 HF 配置（如 glm5_next / Glm5NextForConditionalGeneration）
+    把文本模型参数嵌在 text_config 下——顶层缺关键字段时从 text_config 补齐；
+    head_dim=0 → 置 None（调用方以 hidden_size//num_attention_heads 兜底）。
+    对真正未知的 schema 不做编造：仍保持原样，由上层以 None + note 处理。"""
+    if not isinstance(config, dict):
+        return config
+    c = dict(config)
+    tc = c.get("text_config")
+    if isinstance(tc, dict):
+        for k in _NESTED_KEYS:
+            if (k not in c or c[k] is None) and k in tc:
+                c[k] = tc[k]
+    if c.get("head_dim") == 0:
+        c["head_dim"] = None
+    return c
+
+
+def effective_head_dim(config: dict) -> int | None:
+    """head_dim：显式值 > 0 用之；否则 hidden_size // num_attention_heads 兜底。"""
+    hd = config.get("head_dim")
+    if hd:
+        return int(hd)
+    hidden = config.get("hidden_size")
+    heads = config.get("num_attention_heads")
+    if hidden and heads:
+        return int(hidden // heads)
+    return None
+
 
 def dtype_bytes(config: dict) -> float:
     """每参数字节数：量化方法（gptq/awq 4bit）优先——真实量化模型的 torch_dtype
@@ -500,6 +542,10 @@ def build_host_facts(host: dict, raw: dict) -> dict:
     ib_devs_raw = raw.get("ibv_devinfo", {}).get("value")
     ib_devs = [l.strip() for l in ib_devs_raw.splitlines() if l.strip()] if ib_devs_raw else None
 
+    docker_ver = (raw.get("docker_version", {}).get("value") or "").strip() or None
+    docker_imgs_raw = raw.get("docker_images", {}).get("value") or ""
+    docker_vllm = [l.strip() for l in docker_imgs_raw.splitlines() if "vllm" in l.lower()] or None
+
     return {
         "role": host.get("role"),
         "hostname": (raw.get("hostname", {}).get("value") or "").strip() or None,
@@ -528,6 +574,7 @@ def build_host_facts(host: dict, raw: dict) -> dict:
             },
         },
         "disk": {"model_path": None, "avail_bytes": df_avail},
+        "docker": {"version": docker_ver, "vllm_images": docker_vllm},
         "model_src": model_src,
     }
 
@@ -613,6 +660,14 @@ def _system_checklist(facts: dict, is_head: bool, weights_bytes: int | None) -> 
     else:
         items.append({"name": "RDMA 网卡 MTU", "status": "pass", "detail": "未启用 RDMA/IB", "fix": "—"})
 
+    dv = (facts.get("docker") or {}).get("version")
+    if dv:
+        items.append({"name": "docker 可用", "status": "pass", "detail": f"docker: {dv}", "fix": "—"})
+    else:
+        items.append({"name": "docker 可用", "status": "warn",
+                      "detail": "docker 不可用（仅 docker 运行时相关；native 模式可忽略）",
+                      "fix": "安装 docker + nvidia-container-toolkit"})
+
     for g in gpus:
         sm, smmax = g.get("clocks_sm"), g.get("clocks_max_sm")
         if sm is not None and smmax and sm < smmax * GPU_SMCLOCK_WARN_FRACTION:
@@ -630,7 +685,7 @@ def _system_checklist(facts: dict, is_head: bool, weights_bytes: int | None) -> 
 def build_model_profile(model: dict, head_facts: dict, gmu: float) -> dict:
     """组装 model_profile.json（见 probe 需求 §4 字段契约）。"""
     src = head_facts["model_src"]
-    config = src["config_json"]
+    config = normalize_config(src["config_json"])
     gpus = head_facts["gpu"]["gpus"] or []
     gpu_mem = min((g.get("memory_total") or 0 for g in gpus), default=0)
 
@@ -655,7 +710,7 @@ def build_model_profile(model: dict, head_facts: dict, gmu: float) -> dict:
         "hidden_size": config.get("hidden_size"),
         "num_attention_heads": config.get("num_attention_heads"),
         "num_key_value_heads": config.get("num_key_value_heads"),
-        "head_dim": config.get("head_dim"),
+        "head_dim": effective_head_dim(config),  # head_dim=0 → hidden/heads 兜底
         "vocab_size": config.get("vocab_size"),
     }
     tp = valid_tp_divisors(config, gpu_mem, gmu, wb) if gpu_mem else {
@@ -759,6 +814,9 @@ def render_env_report(target: dict, facts: dict, interconnect: dict,
         lines.append(f"- vLLM：`{f.get('vllm_version')}`（{f.get('python3_version')}，hostname={f.get('hostname')}）")
         lines.append(f"- 网络接口：{', '.join(i['name'] for i in f['net']['interfaces']) or '—'}"
                      f"；RDMA/IB：{'有' if f['net']['rdma']['ibstat_present'] else '无'}")
+        dk = f.get("docker") or {}
+        lines.append(f"- docker：{dk.get('version') or '不可用'}；本地 vllm 镜像："
+                     f"{', '.join(dk.get('vllm_images') or []) or '无'}")
         lines.append("")
     lines.append("## 跨机互联")
     lines.append("")

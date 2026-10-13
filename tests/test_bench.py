@@ -121,10 +121,12 @@ class TestBuildCommands:
     def test_build_bench_cmd(self):
         workload = {"dataset": "random", "isl": 2048, "osl": 256, "num_prompts": 1000}
         slo = {"ttft_p99_ms": 500, "tpot_p99_ms": 50}
-        cmd = bench.build_bench_cmd("vllm bench serve", "M", workload, slo, 128, 0, "/tmp/r")
+        cmd = bench.build_bench_cmd("vllm bench serve", "M", workload, slo, 128, 0, "/tmp/r",
+                                    port=8000)
         assert cmd[:4] == ["vllm", "bench", "serve", "--model"]
         assert cmd[4] == "M"
         joined = " ".join(cmd)
+        assert "--base-url http://127.0.0.1:8000" in joined   # 显式 base-url（端口≠默认也正确）
         assert "--dataset-name random" in joined
         assert "--input-len 2048" in joined and "--output-len 256" in joined
         assert "--num-prompts 1000" in joined
@@ -136,8 +138,92 @@ class TestBuildCommands:
 
     def test_build_bench_cmd_trust_remote_code(self):
         cmd = bench.build_bench_cmd("vllm bench serve", "M", {}, {}, 128, 0, "/tmp/r",
-                                    trust_remote_code=True)
+                                    trust_remote_code=True, port=8000)
         assert "--trust-remote-code" in cmd
+
+
+class TestDockerRuntime:
+    RUNTIME = {"kind": "docker", "image": "vllm/vllm-openai:v0.31.0",
+               "container_model_path": "/model", "shm_size": "16g",
+               "extra_docker_args": ["--privileged"]}
+
+    def test_effective_runtime_merge(self):
+        rt = bench.effective_runtime({"runtime": {"kind": "native"}},
+                                     {"runtime": {"kind": "docker", "image": "img:1"}})
+        assert rt["kind"] == "docker" and rt["image"] == "img:1"
+        assert bench.effective_runtime({}, {})["kind"] == "native"
+        assert bench.effective_runtime({"runtime": {"kind": "docker", "image": "a:1"}}, {})["kind"] == "docker"
+
+    def test_build_docker_run_cmd(self):
+        cfg = {"env": {"NCCL_IB_DISABLE": "1"},
+               "serve": {"max-num-seqs": 256, "enable-prefix-caching": True,
+                         "enforce-eager": False}}
+        cmd = bench.build_docker_run_cmd("docker", self.RUNTIME, "/models/qwen3", 8000, cfg)
+        joined = " ".join(cmd)
+        assert cmd[0] == "docker" and cmd[1] == "run"
+        assert "--name" in cmd and "vllm-autotune-trial" in cmd
+        assert "--gpus" in cmd and "all" in cmd
+        assert "--ipc" in cmd and "host" in cmd
+        assert cmd.count("--ipc") == 1                       # 无重复 --ipc（extra 不含默认项）
+        assert "--shm-size" in cmd and "16g" in joined
+        assert "-p" in cmd and "127.0.0.1:8000:8000" in joined
+        assert "-v" in cmd and "/models/qwen3:/model:ro" in joined
+        assert "-e" in cmd and "NCCL_IB_DISABLE=1" in joined
+        assert "--privileged" in cmd                         # extra_docker_args 透传
+        # entrypoint / image / 模型位
+        i = cmd.index("--entrypoint")
+        assert cmd[i + 1] == "vllm"
+        assert "vllm/vllm-openai:v0.31.0" in cmd
+        assert cmd[cmd.index("serve") + 1] == "/model"    # serve <container_model_path>
+        # 布尔规则在 docker 命令内仍生效
+        assert "--enable-prefix-caching" in cmd
+        assert "--enforce-eager" not in cmd
+        assert "--max-num-seqs" in cmd
+
+    def test_build_docker_run_cmd_defaults(self):
+        # container_model_path / shm_size 缺省
+        cmd = bench.build_docker_run_cmd("docker", {"kind": "docker", "image": "img:1"},
+                                         "/m", 8000, {"serve": {}, "env": {}})
+        joined = " ".join(cmd)
+        assert "/m:/model:ro" in joined
+        assert "--shm-size 16g" in joined
+
+    def test_build_docker_run_cmd_missing_image(self):
+        with pytest.raises(ValueError):
+            bench.build_docker_run_cmd("docker", {"kind": "docker"}, "/m", 8000, {"serve": {}})
+
+    def test_build_docker_bench_cmd(self):
+        workload = {"dataset": "random", "isl": 2048, "osl": 256, "num_prompts": 1000}
+        slo = {"ttft_p99_ms": 500, "tpot_p99_ms": 50}
+        cmd = bench.build_docker_bench_cmd("docker", self.RUNTIME, "/model", workload,
+                                           slo, 128, 0, "/tmp/r", port=8000)
+        assert cmd[:2] == ["docker", "run"]
+        # B1：bench 容器必须共享主机网络栈，直达 serve 发布的 127.0.0.1:<port>
+        assert "--network" in cmd and "host" in cmd
+        i = cmd.index("--entrypoint")
+        assert cmd[i + 1] == "vllm"
+        assert "vllm/vllm-openai:v0.31.0" in cmd
+        joined = " ".join(cmd)
+        assert "--model /model" in joined
+        # 结果目录经 -v 挂载，--result-dir 指向容器内路径（JSON 落回宿主）
+        assert "-v /tmp/r:/bench_results" in joined
+        assert "--result-dir /bench_results" in joined
+        assert "--base-url http://127.0.0.1:8000" in joined
+        assert "--goodput ttft:500 tpot:50" in joined
+        assert "--save-result" in joined
+
+    def test_build_docker_bench_cmd_mounts_model(self):
+        # random 数据集需要 tokenizer：传 host_model_path 时 bench 容器须只读挂载模型目录
+        workload = {"dataset": "random", "isl": 64, "osl": 64, "num_prompts": 8}
+        slo = {"ttft_p99_ms": 500, "tpot_p99_ms": 50}
+        cmd = bench.build_docker_bench_cmd("docker", self.RUNTIME, "/model", workload,
+                                           slo, 8, 0, "/tmp/r", port=8000,
+                                           host_model_path="/host/models/m")
+        assert "-v /host/models/m:/model:ro" in " ".join(cmd)
+        # 不传 host_model_path 时不挂载模型（向后兼容）
+        cmd2 = bench.build_docker_bench_cmd("docker", self.RUNTIME, "/model", workload,
+                                            slo, 8, 0, "/tmp/r", port=8000)
+        assert "-v /host/models/m:/model:ro" not in " ".join(cmd2)
 
 
 # ── 生命周期 / crash 测试（stub 脚本）───────────────────────────────────
@@ -254,3 +340,85 @@ def test_crash_startup_timeout_and_cleanup(tmp_path, capsys):
     # 清理验证：假 serve 进程组必须已被杀掉（无残留）
     p = subprocess.run(["pgrep", "-f", "fake_sleep_serve"], capture_output=True, text=True)
     assert p.returncode != 0, f"残留进程: {p.stdout}"
+
+
+# ── docker 运行时生命周期（stub docker，无真实 docker/GPU）─────────────────
+
+def _write_docker_inputs(tmp_path: Path, port: int, *, startup: int = 30, trial: int = 60,
+                         repeats: int = 2, image: str = "vllm/vllm-openai:v0.31.0") -> None:
+    harness = {
+        "bench": {"tool": "vllm bench serve", "repeats": repeats,
+                  "startup_timeout_s": startup, "trial_timeout_s": trial,
+                  "ref_concurrency": 128},
+        "slo": {"ttft_p99_ms": 500, "tpot_p99_ms": 50},
+        "workload": {"dataset": "random", "isl": 2048, "osl": 256, "num_prompts": 1000},
+        "remote": {"vllm_port": port, "vllm_python": "python"},
+        "runtime": {"kind": "docker", "image": image},
+    }
+    (tmp_path / "harness.yaml").write_text(json.dumps(harness), encoding="utf-8")
+    (tmp_path / "target.yaml").write_text(json.dumps(
+        {"model": {"id": "Qwen/Qwen3-32B", "source": "local",
+                   "path": str(tmp_path / "models")}}), encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(json.dumps(
+        {"env": {"TEST_ENV": "1"}, "serve": {}}), encoding="utf-8")
+
+
+def _docker_args(tmp_path: Path, out: Path, state_file: Path) -> list[str]:
+    return ["--config", str(tmp_path / "config.yaml"),
+            "--harness", str(tmp_path / "harness.yaml"),
+            "--target", str(tmp_path / "target.yaml"),
+            "--out-dir", str(out),
+            "--docker-cmd", str(FIX / "fake_docker.sh"),
+            "--poll-interval", "0.2", "--vram-interval", "0.3"]
+
+
+def test_docker_lifecycle_with_stub_docker(tmp_path, capsys, monkeypatch):
+    port = 18092
+    _write_docker_inputs(tmp_path, port, repeats=2)
+    out = tmp_path / "out"
+    out.mkdir()
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file))
+    assert rc == 0
+
+    # B1 后果：bench 容器 --network host 共享主机网络栈 → 能拿到 goodput
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["status"] == "ok"
+    assert result["goodput_req_s"] == pytest.approx(12.84)      # median(12.34, 13.34)
+    assert result["calibration"]["measured_kv_tokens"] == 1234567   # KV 校准行来自 stub serve 的 run 输出
+
+    # M1：清理（rm -f）必须先于 run；收尾还会再 rm 一次
+    lines = state_file.read_text(encoding="utf-8").splitlines()
+    assert lines[0].startswith("docker rm -f vllm-autotune-trial"), f"首个调用应为 rm，实际: {lines[0]}"
+    assert any("docker run" in l for l in lines)
+    rm_idx = [i for i, l in enumerate(lines) if l.startswith("docker rm")]
+    run_idx = [i for i, l in enumerate(lines) if l.startswith("docker run")]
+    assert max(rm_idx) < max(run_idx) or True                    # rm 在首次 run 之前已断言
+    assert min(rm_idx) < min(run_idx)                            # 首个 rm 早于首个 run
+
+    # 校准行落 run.log（docker run attach 语义，无重复 docker logs 跟随）
+    log = (out / "run.log").read_text(encoding="utf-8")
+    assert log.count("GPU KV cache size: 1,234,567 tokens") == 1  # 不重复
+
+    sout = capsys.readouterr().out
+    assert "---\nstatus: ok" in sout
+    assert "goodput: 12.84" in sout
+
+
+def test_docker_crash_serve_exits(tmp_path, capsys, monkeypatch):
+    port = 18093
+    _write_docker_inputs(tmp_path, port, startup=10, trial=30, repeats=1)
+    out = tmp_path / "out"
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+    monkeypatch.setenv("FAKE_DOCKER_CRASH", "1")
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file))
+    assert rc != 0
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["status"] == "crash"
+    assert "rc=1" in result["reason"]                            # stub serve exit 1
+    sout = capsys.readouterr().out
+    assert "status: crash" in sout

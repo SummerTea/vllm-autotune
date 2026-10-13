@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "skills": {
+    "vllm-bench-serve": {
+      "source": "vllm-project/vllm-skills",
+      "sourceType": "github",
+      "computedHash": "84dc7f4627f045680b605a91603ba686aa687d0545044702896b34d1868153ad"
+    },
+    "vllm-deploy-docker": {
+      "source": "vllm-project/vllm-skills",
+      "sourceType": "github",
+      "computedHash": "6d59cfedeb3c8b861bb51a11cb56c417474fb75f6bc97fe2366a943af60aaf57"
+    },
+    "vllm-prefix-cache-bench": {
+      "source": "vllm-project/vllm-skills",
+      "sourceType": "github",
+      "computedHash": "cf9da4fd85764c79856330edbeb7d15040efe47f41c2f415ece0ccab9ceebda2"
+    }
+  }
+}

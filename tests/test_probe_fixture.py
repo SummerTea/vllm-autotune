@@ -71,6 +71,8 @@ def test_fixture_probe_produces_artifacts(tmp_path):
     assert head["gpu"]["count"] == 2
     assert head["gpu"]["topo"]["summary"] == "nvlink-full"
     assert head["cpu"]["governor"] == "performance"
+    assert head["docker"]["version"]                    # docker 检测（fixture docker_version.txt）
+    assert any("vllm/vllm-openai" in i for i in (head["docker"]["vllm_images"] or []))
     assert isinstance(head["checklist"], list) and head["checklist"]  # 检查清单存在
     assert any(i["status"] == "pass" for i in head["checklist"])
     assert env["interconnect"]["covered"] is False      # 单主机 → 不执行跨机检查

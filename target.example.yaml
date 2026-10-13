@@ -1,18 +1,22 @@
 # target.example.yaml — 复制为 target.yaml 后填写。这是唯一需要你提供的背景信息。
 # 缺项时编码 agent 会向你提问，不会自行假设。
+# 注：每个主机的 work_dir 是该主机上模板唯一允许写入的目录，必须由用户确认
+#（Phase 0 缺项时 agent 必须询问确认，不得自行假设或写入其他路径）。
 
 hosts:                          # 1..N 台。v1 只在 role=head 的主机上跑实验，其余仅做采集探测。
   - name: head
     ssh: user@10.0.0.1          # 可路由的 ssh 目标
     role: head
+    work_dir: ~/vllm-autotune   # 专属目录（必须由用户确认）；模板除此外绝不写入主机
   # - name: worker1
   #   ssh: user@10.0.0.2
   #   role: worker
+  #   work_dir: ~/vllm-autotune
 
 model:
   id: Qwen/Qwen3-32B            # HF 模型 id 或本地路径
   source: hf                    # hf | local
-  # path: /models/qwen3-32b     # source=local 时必填
+  # path: /models/qwen3-32b     # source=local 时必填；docker 运行时也必填（宿主目录，挂载进容器）
   trust_remote_code: false
   # hf_token_env: HF_TOKEN      # gated 模型时填写环境变量名
 

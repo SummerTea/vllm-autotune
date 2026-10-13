@@ -8,7 +8,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
-# ── .env：手工解析而非 source，保留字面值（REMOTE_DIR 的 ~ 留给远端 shell 展开）──
+# ── .env：手工解析而非 source，保留字面值（work_dir 的 ~ 留给远端 shell 展开）──
 load_env() {
   [ -f .env ] || return 0
   while IFS= read -r line || [ -n "$line" ]; do
@@ -20,7 +20,7 @@ load_env() {
         case "$key" in
           SSH_PORT | SSH_KEY | REMOTE_DIR)
             printf -v "$key" '%s' "$value"
-            # SSH_KEY 是本地路径：以 ~/ 开头时在本机展开（REMOTE_DIR 不做此处理）
+            # SSH_KEY 是本地路径：以 ~/ 开头时在本机展开（WORK_DIR 不做此处理）
             case "$key:$value" in
               SSH_KEY:'~/'*) printf -v SSH_KEY '%s' "$HOME${value#\~}" ;;
             esac
@@ -33,7 +33,10 @@ load_env() {
 load_env
 SSH_PORT="${SSH_PORT:-22}"
 SSH_KEY="${SSH_KEY:-}"
-REMOTE_DIR="${REMOTE_DIR:-~/vllm-autotune}"
+# REMOTE_DIR 不再有默认值：主来源是 target.yaml 的 work_dir；
+# .env 的 REMOTE_DIR 仅为向后兼容的覆盖项（已弃用，见 resolve_remote_dir）
+REMOTE_DIR_ENV="${REMOTE_DIR:-}"
+REMOTE_DIR=""
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
 if [ -n "$SSH_PORT" ]; then SSH_OPTS+=(-p "$SSH_PORT"); fi
@@ -60,7 +63,8 @@ path_for_remote() {
 # 单引号包裹并转义内部单引号，用于嵌入远端 shell 命令串
 sh_quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 
-# 提取 head 主机 ssh 地址 / remote.vllm_python / config.yaml env（参数 1 = 是否需要 env）
+# 提取 head 主机 ssh 地址（第 1 行）/ work_dir（第 2 行）/ remote.vllm_python（第 3 行）
+# / config.yaml env（参数 1 = 1 时，第 4 行起）
 extract_meta() {
   "$PY" - "$1" <<'PYEOF'
 import sys
@@ -84,11 +88,29 @@ if not ssh_addr:
 harness = load("harness.yaml")
 vllm_python = (harness.get("remote") or {}).get("vllm_python") or "python"
 print(ssh_addr)
+print(heads[0].get("work_dir") or "")
 print(vllm_python)
 if sys.argv[1] == "1":
     for k, v in (load("config.yaml").get("env") or {}).items():
         print(f"{k}={v}")
 PYEOF
+}
+
+# 远端专属目录：主来源 = target.yaml 的 work_dir（模板唯一允许写入的位置，需用户确认）；
+# .env REMOTE_DIR 仅作已弃用的覆盖项
+resolve_remote_dir() {  # $1 = work_dir
+  local work_dir="$1"
+  if [ -z "$work_dir" ]; then
+    echo "请在 target.yaml 的 head 主机上提供 work_dir（主机专属目录，需用户确认；模板仅写此目录）" >&2
+    return 1
+  fi
+  if [ -n "$REMOTE_DIR_ENV" ] && [ "$REMOTE_DIR_ENV" != "$work_dir" ]; then
+    echo "警告: .env 的 REMOTE_DIR（$REMOTE_DIR_ENV）覆盖 target.yaml 的 work_dir（$work_dir）；" \
+         "REMOTE_DIR 已弃用，建议改 target.yaml" >&2
+    printf '%s' "$REMOTE_DIR_ENV"
+  else
+    printf '%s' "$work_dir"
+  fi
 }
 
 # 探活远端 trial 三态：echo ALIVE(存活) / DEAD(进程不存在) / UNKNOWN(ssh 失败)
@@ -124,12 +146,14 @@ cmd_start() {
     fi
   done
 
-  local out head_ssh vllm_python
+  local out head_ssh work_dir vllm_python
   out="$(extract_meta 1)" || return 1
   head_ssh="$(printf '%s\n' "$out" | sed -n '1p')"
-  vllm_python="$(printf '%s\n' "$out" | sed -n '2p')"
+  work_dir="$(printf '%s\n' "$out" | sed -n '2p')"
+  vllm_python="$(printf '%s\n' "$out" | sed -n '3p')"
+  REMOTE_DIR="$(resolve_remote_dir "$work_dir")" || return 1
   local config_env=()
-  while IFS= read -r line; do config_env+=("$line"); done < <(printf '%s\n' "$out" | sed -n '3,$p')
+  while IFS= read -r line; do config_env+=("$line"); done < <(printf '%s\n' "$out" | sed -n '4,$p')
 
   if is_trial_running "$head_ssh"; then
     echo "远端已有 trial 在运行（bench.pid 存活）：请先运行 bash run.sh --poll 等其结束，勿重复启动。" >&2
@@ -148,7 +172,10 @@ cmd_start() {
   # 附加 </dev/null 与 mkdir -p：防 ssh 因后台进程占用 stdin 而挂起（不改 bench.py 契约）。
   local env_str kv
   env_str=""
-  for kv in "${config_env[@]}"; do env_str+=" $(sh_quote "$kv")"; done
+  # bash 3.2 (macOS 自带) 下 set -u + 空数组展开会报 unbound；仅当非空时展开
+  if [ "${#config_env[@]}" -gt 0 ]; then
+    for kv in "${config_env[@]}"; do env_str+=" $(sh_quote "$kv")"; done
+  fi
   if ! ssh "${SSH_OPTS[@]}" -n "$head_ssh" \
       "mkdir -p $p && cd $p && nohup env$env_str $(path_for_remote "$vllm_python") bench.py --config config.yaml --harness harness.yaml --target target.yaml --out-dir . </dev/null > bench.stdout 2>&1 & echo \$! > bench.pid"; then
     echo "远端启动失败（请查 $head_ssh:$p/bench.stdout）" >&2
@@ -165,9 +192,11 @@ cmd_start() {
 }
 
 cmd_poll() {
-  local out head_ssh p
+  local out head_ssh work_dir p
   out="$(extract_meta 0)" || return 1
   head_ssh="$(printf '%s\n' "$out" | sed -n '1p')"
+  work_dir="$(printf '%s\n' "$out" | sed -n '2p')"
+  REMOTE_DIR="$(resolve_remote_dir "$work_dir")" || return 1
   p="$(path_for_remote "$REMOTE_DIR")"
 
   local rc=0 raw

@@ -77,6 +77,76 @@ class TestParseGpuSmi:
         assert gpus[0]["power_draw"] is None
 
 
+class TestParseIpLink:
+    def test_ip_o_link_show(self):
+        # `ip -o link show` 格式：N: name: <flags> mtu M …
+        text = (
+            "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT "
+            "group default qlen 1000\\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n"
+            "2: ens5: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT "
+            "group default qlen 1000\\    link/ether 02:00:00:00:00:01 brd ff:ff:ff:ff:ff:ff\n"
+        )
+        ifaces = probe.parse_ip_link(text)
+        assert len(ifaces) == 2
+        assert ifaces[0]["name"] == "lo" and ifaces[0]["mtu"] == 65536
+        assert ifaces[1]["name"] == "ens5" and ifaces[1]["mtu"] == 1500
+
+    def test_bad_lines_skipped(self):
+        assert probe.parse_ip_link("no mtu here\n") == []
+        assert probe.parse_ip_link(None) == []
+
+
+class TestNestedTextConfig:
+    # 新式 HF 配置：文本模型参数嵌在 text_config 下（glm5_next / Glm5NextForConditionalGeneration）
+    NESTED = {
+        "model_type": "glm5_next",
+        "architectures": ["Glm5NextForConditionalGeneration"],
+        "text_config": {
+            "num_hidden_layers": 64,
+            "hidden_size": 4096,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 0,                     # 0 → 用 hidden/heads 兜底
+            "vocab_size": 152064,
+            "intermediate_size": 14336,
+            "max_position_embeddings": 32768,
+        },
+    }
+
+    def test_normalize_pulls_from_text_config(self):
+        c = probe.normalize_config(self.NESTED)
+        assert c["hidden_size"] == 4096
+        assert c["num_hidden_layers"] == 64
+        assert c["num_key_value_heads"] == 8
+        assert c["model_type"] == "glm5_next"
+
+    def test_head_dim_zero_normalized(self):
+        c = probe.normalize_config(self.NESTED)
+        assert c["head_dim"] is None           # 0 → None（kv 估算以 hidden//heads 兜底）
+        assert probe.effective_head_dim(c) == 128
+
+    def test_kv_bytes_non_null_after_normalize(self):
+        c = probe.normalize_config(self.NESTED)
+        assert probe.kv_bytes_per_token(c) == 262144   # 64×8×128×2×2
+
+    def test_arch_fields_from_text_config_via_profile(self):
+        head_facts = {
+            "model_src": {"config_json": dict(self.NESTED), "safetensors_index": None},
+            "gpu": {"gpus": [{"name": "NVIDIA A100-SXM4-40GB", "memory_total": 42234101760}]},
+        }
+        prof = probe.build_model_profile({"id": "glm5-next"}, head_facts, 0.92)
+        assert prof["arch"]["num_layers"] == 64
+        assert prof["arch"]["hidden_size"] == 4096
+        assert prof["arch"]["num_key_value_heads"] == 8
+        assert prof["arch"]["head_dim"] == 128     # head_dim=0 → hidden/heads
+        assert prof["kv"]["bytes_per_token"] == 262144
+
+    def test_plain_config_untouched(self):
+        c = probe.normalize_config(dict(GQA_CONFIG))
+        assert c["hidden_size"] == GQA_CONFIG["hidden_size"]
+        assert c["head_dim"] == GQA_CONFIG["head_dim"]
+
+
 class TestWeightBytes:
     def test_prefers_safetensors_index_total_size(self):
         index = _load_fixture_json("safetensors.index.json")

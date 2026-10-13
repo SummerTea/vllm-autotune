@@ -23,5 +23,15 @@ __pycache__/
 .venv/
 .uv/
 
+# Agent skills：保留工程级 .agents/（精选 skill 随仓库分发）
+# 忽略 skills CLI 为其他 harness 生成的软链目录，避免噪声
+.claude/
+.codebuddy/
+.continue/
+.pi/
+.qoder/
+.trae/
+/skills/
+
 # OS
 .DS_Store

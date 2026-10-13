@@ -18,7 +18,7 @@
 1. Fork / clone 本仓库。
 2. `cp target.example.yaml target.yaml`，填写主机、模型、SLO、预算。
 3. `cp .env.example .env`，填写 SSH 选项（端口、私钥路径、远端目录）。
-4. 在编排机（本仓库目录）运行 `bash setup_remote.sh`（一次性，经 ssh 对 head 主机执行并 pin vLLM 版本）。
+4. 在编排机（本仓库目录）运行 `bash setup_remote.sh`（一次性校验：docker 模式检查镜像是否已就绪；native 默认只检查不安装，仅在 `runtime.install_allowed: true` 时于 work_dir 内 pin vLLM 版本）。
 5. 把编码 agent（Claude Code / Codex / opencode）指向本仓库。
 6. 对它说：「读 AGENTS.md，开始」——之后它自主循环，你睡觉。
 
@@ -39,7 +39,7 @@
 | `bench.py` | 远端起服 + `vllm bench serve --goodput` 度量 + 僵尸清理 | 只读 |
 | `report.py` | 收尾汇总 → report.md（基线 vs 最佳 + 全部 trial + 系统级建议） | 只读 |
 | `run.sh` | 两段式执行：rsync + 远端 nohup 启动 + 轮询状态 | 只读 |
-| `setup_remote.sh` | head 主机一次性环境准备（pin vLLM 版本） | 只读 |
+| `setup_remote.sh` | 主机环境校验/可选准备（docker 只校验镜像；native 默认只检查不安装，仅 `install_allowed` 时在 work_dir 内 pin vLLM） | 只读 |
 | `scripts/mock_loop.py` | 循环规则的可执行规格/演示（REFERENCE，供离线核对 program.md 规则） | 只读 |
 | `docs/vllm-facts.md` | 模板依赖的 vLLM 行为事实（版本相关，升级需重新核对） | 只读 |
 | `pyproject.toml` / `LICENSE` / `.gitignore` | 工程元数据 | 只读 |
@@ -51,6 +51,7 @@
 - **三层退出**：deadline 主退出（硬保证）+ 平台期（连续 N 次无 > 噪声带的改进）+ 崩溃连击（连续 N 次 crash）。每轮开头做 deadline 感知调度，来不及就不开新 trial；在途 trial 宽限跑完。
 - **系统参数只建议**：governor / hugepages / 锁频等系统级参数只探测并写入报告建议，不自动修改；v1 不提供自动修改开关。
 - **多机采集 + 单机执行**：v1 只在 `role=head` 的主机上跑实验，其余主机仅做采集探测；跨机调度留到 v2。
+- **两种运行时（native / docker）**：默认 `native`（head 主机上的 vllm CLI）；真实部署常跑在 docker 镜像里（如 `vllm/vllm-openai:v0.31.0`）——在 `config.yaml` 的 `runtime` 写 `kind: docker` + `image` 即可（逐键覆盖 `harness.yaml` 默认）；`image` 本身是合法的搜索维度（如 CUDA 12/13 变体镜像）；模型目录经 `-v host:container:ro` 挂载进容器，docker 模式下 serve/bench 都在容器内跑、本机无需安装 vllm。
 
 ## 支持矩阵
 
@@ -67,6 +68,12 @@
 
 > 注：全部脚本均已交付（清单 1/2/3 条均可执行）。离线排练：`uv run pytest -q` 无需 GPU/网络即可跑通 probe → bench → report 的 mock 全链路与循环规则核对。
 
+## 主机零破坏契约
+
+- 模板在每台主机上**只写** `target.yaml` 里用户确认的 `work_dir`（专属目录，Phase 0 必须与用户确认；`run.sh`/`setup_remote.sh` 的所有远端写入都局限于此）。
+- **默认不 pull 镜像、不安装环境**：docker 模式只使用主机上已预先准备的镜像（`docker image inspect` 校验，缺失则 FAIL 提示人工准备）；native 模式默认不安装任何环境。
+- 需要安装时显式设 `runtime.install_allowed: true`，且**仅**在 `work_dir` 内建 venv（绝不全局安装）。
+
 ## 如何解读 report.md
 
 - 「基线 vs 最佳」：goodput 提升 % =（最佳 − 基线）/ 基线；若标注「⚠ 无满足 SLO 的 trial」，则最佳为回退选择（全部已测量行中最高），需人工复核 SLO 是否过严。
@@ -76,7 +83,8 @@
 
 ## 依赖
 
-- 远端：vLLM（版本由 `setup_remote.sh` pin 住）+ NVIDIA 驱动 + uv。
+- 远端：NVIDIA 驱动 + docker 镜像（docker 运行时，须预先就绪）或现成 vLLM（native）；零破坏默认不安装，仅 `install_allowed: true` 时在 work_dir 内建 venv。
+- 远端运行 `bench.py` 的 python（`harness.yaml` 的 `remote.vllm_python`）须已装 **pyyaml**（零破坏默认不装；系统 python3 通常自带）。
 - 本机：Python 3.10+。
 
 ## License
