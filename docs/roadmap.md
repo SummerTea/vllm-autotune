@@ -6,7 +6,7 @@
 
 ## 现状与取舍
 
-- v1 保持**单节点（head 独占）+ native/docker 双运行时**：跨机涉及 NCCL/RDMA 拓扑与故障域，v2 才做；单节点上「serve 参数 + 进程级 env」已可覆盖大部分收益。
+- v1 保持**单节点（head 独占）+ docker-only 运行时**：跨机涉及 NCCL/RDMA 拓扑与故障域，v2 才做；单节点上「serve 参数 + 进程级 env」已可覆盖大部分收益。vLLM 环境复杂，运行时统一收敛为 docker 镜像（此前曾支持本机安装式，已移除）。
 - 零破坏契约不变：默认不 pull 镜像、不安装环境；v1.1 的监控/基准均为可选旁路，缺失不影响默认循环。
 - 真机已验证：**8×RTX6000D**（docker 运行时）跑通 probe → bench → report 全链路与校准。
 - 已随仓库交付工程级 skills（`.agents/skills/`：vllm-bench-serve / vllm-deploy-docker / vllm-prefix-cache-bench，见 `skills-lock.json`）。

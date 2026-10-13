@@ -52,8 +52,8 @@
 
 - `run.sh` 为两段式启动/轮询：`bash run.sh` 先 rsync 同步 harness 到远端，再远端 `nohup` 启动并秒回；随后循环 `bash run.sh --poll` 直到退出 0（done）或 1（crash）；退出码 3 = 仍在运行，继续轮询。
 - 假定 head 主机由本次实验独占；`bench.py` 负责清理僵尸 vllm 进程。
-- 运行时由 `config.yaml` 的 `runtime` 逐键覆盖 `harness.yaml` 默认（`kind: native | docker`）；docker 模式下 serve/bench 都在容器内跑、模型路径经挂载注入，本机无需安装 vllm。
-- **零破坏**：所有远端操作只写 `target.yaml` 确认的 `work_dir`；默认不 pull 镜像、不安装环境（除非显式 `runtime.install_allowed: true` 且仅限 work_dir 内）。
+- 运行时为 **docker-only**：镜像由 `config.yaml` 的 `runtime.image` 指定（逐键覆盖 `harness.yaml` 默认，kind 键如存在则忽略）；serve/bench 都在容器内跑、模型路径经只读挂载注入，本机无需安装 vllm。
+- **零破坏**：所有远端操作只写 `target.yaml` 确认的 `work_dir`；默认不 pull 镜像、不安装环境。
 
 ## 循环细则
 

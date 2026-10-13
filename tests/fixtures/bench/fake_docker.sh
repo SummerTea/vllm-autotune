@@ -1,6 +1,7 @@
 #!/bin/sh
 # fake_docker.sh — 模拟 docker 客户端（docker 运行时生命周期测试，无真实 docker/GPU）。
 # 每次调用把完整命令行追加到 FAKE_DOCKER_STATE_FILE（用于断言 rm 先于 run）；
+#   image inspect  → 镜像存在性检查（FAKE_DOCKER_NO_IMAGE=1 时假装缺失；不入状态文件）
 #   rm -f 容器      → 无操作（幂等）
 #   run … serve …  → 打印 KV 校准行并起 /health=200 的服务常驻（docker run attach 语义）
 #   run … bench …  → 打印样例 bench 表格并把 saved JSON 写进 -v host:container 的宿主侧目录
@@ -8,6 +9,12 @@
 
 STATE_FILE="${FAKE_DOCKER_STATE_FILE:-/tmp/fake_docker_state.txt}"
 mkdir -p "$(dirname "$STATE_FILE")"
+
+# image inspect：FAKE_DOCKER_NO_IMAGE=1 → 镜像缺失（M1 预检查 crash 路径测试）
+if [ "$1" = "image" ]; then
+  [ "${FAKE_DOCKER_NO_IMAGE:-0}" = "1" ] && exit 1 || exit 0
+fi
+
 printf 'docker %s\n' "$*" >> "$STATE_FILE"
 
 # rm -f：幂等清理，无操作

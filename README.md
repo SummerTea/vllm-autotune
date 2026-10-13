@@ -18,7 +18,7 @@
 1. Fork / clone 本仓库。
 2. `cp target.example.yaml target.yaml`，填写主机、模型、SLO、预算。
 3. `cp .env.example .env`，填写 SSH 选项（端口、私钥路径、远端目录）。
-4. 在编排机（本仓库目录）运行 `bash setup_remote.sh`（一次性校验：docker 模式检查镜像是否已就绪；native 默认只检查不安装，仅在 `runtime.install_allowed: true` 时于 work_dir 内 pin vLLM 版本）。
+4. 在编排机（本仓库目录）运行 `bash setup_remote.sh`（一次性校验：docker 可用 + 镜像已就绪；零 pull、零安装）。
 5. 把编码 agent（Claude Code / Codex / opencode）指向本仓库。
 6. 对它说：「读 AGENTS.md，开始」——之后它自主循环，你睡觉。
 
@@ -39,7 +39,7 @@
 | `bench.py` | 远端起服 + `vllm bench serve --goodput` 度量 + 僵尸清理 | 只读 |
 | `report.py` | 收尾汇总 → report.md（基线 vs 最佳 + 全部 trial + 系统级建议） | 只读 |
 | `run.sh` | 两段式执行：rsync + 远端 nohup 启动 + 轮询状态 | 只读 |
-| `setup_remote.sh` | 主机环境校验/可选准备（docker 只校验镜像；native 默认只检查不安装，仅 `install_allowed` 时在 work_dir 内 pin vLLM） | 只读 |
+| `setup_remote.sh` | 主机环境校验（docker-only：校验 docker 可用 + 镜像就绪；零 pull、零安装） | 只读 |
 | `scripts/mock_loop.py` | 循环规则的可执行规格/演示（REFERENCE，供离线核对 program.md 规则） | 只读 |
 | `docs/vllm-facts.md` | 模板依赖的 vLLM 行为事实（版本相关，升级需重新核对） | 只读 |
 | `docs/external-resources.md` | 外部 skills / MCP / 工具调研（vLLM 调优生态） | 只读 |
@@ -55,7 +55,7 @@
 - **三层退出**：deadline 主退出（硬保证）+ 平台期（连续 N 次无 > 噪声带的改进）+ 崩溃连击（连续 N 次 crash）。每轮开头做 deadline 感知调度，来不及就不开新 trial；在途 trial 宽限跑完。
 - **系统参数只建议**：governor / hugepages / 锁频等系统级参数只探测并写入报告建议，不自动修改；v1 不提供自动修改开关。
 - **多机采集 + 单机执行**：v1 只在 `role=head` 的主机上跑实验，其余主机仅做采集探测；跨机调度留到 v2。
-- **两种运行时（native / docker）**：默认 `native`（head 主机上的 vllm CLI）；真实部署常跑在 docker 镜像里（如 `vllm/vllm-openai:v0.31.0`）——在 `config.yaml` 的 `runtime` 写 `kind: docker` + `image` 即可（逐键覆盖 `harness.yaml` 默认）；`image` 本身是合法的搜索维度（如 CUDA 12/13 变体镜像）；模型目录经 `-v host:container:ro` 挂载进容器，docker 模式下 serve/bench 都在容器内跑、本机无需安装 vllm。
+- **运行时：docker-only**：vLLM 环境复杂，统一用镜像（如 `vllm/vllm-openai:v0.31.0`）——`config.yaml` 的 `runtime.image` 指定（逐键覆盖 `harness.yaml` 默认），**不支持**本机安装式 vLLM；`image` 本身是合法的搜索维度（如 CUDA 12/13 变体镜像）；模型目录经 `-v host:container:ro` 只读挂载进容器，serve/bench 都在容器内跑、本机无需安装 vllm。
 
 ## 支持矩阵
 
@@ -75,8 +75,6 @@
 ## 主机零破坏契约
 
 - 模板在每台主机上**只写** `target.yaml` 里用户确认的 `work_dir`（专属目录，Phase 0 必须与用户确认；`run.sh`/`setup_remote.sh` 的所有远端写入都局限于此）。
-- **默认不 pull 镜像、不安装环境**：docker 模式只使用主机上已预先准备的镜像（`docker image inspect` 校验，缺失则 FAIL 提示人工准备）；native 模式默认不安装任何环境。
-- 需要安装时显式设 `runtime.install_allowed: true`，且**仅**在 `work_dir` 内建 venv（绝不全局安装）。
 
 ## 推荐 skills（工程级 `.agents/`）
 
@@ -105,8 +103,8 @@
 
 ## 依赖
 
-- 远端：NVIDIA 驱动 + docker 镜像（docker 运行时，须预先就绪）或现成 vLLM（native）；零破坏默认不安装，仅 `install_allowed: true` 时在 work_dir 内建 venv。
-- 远端运行 `bench.py` 的 python（`harness.yaml` 的 `remote.vllm_python`）须已装 **pyyaml**（零破坏默认不装；系统 python3 通常自带）。
+- 远端：NVIDIA 驱动 + docker 运行时 + 预先就绪的 vLLM 镜像（`runtime.image`，默认不 pull）。
+- 远端运行 `bench.py` 的 python（`harness.yaml` 的 `remote.vllm_python`）须已装 **pyyaml**（零破坏不安装；系统 python3 通常自带）。
 - 本机：Python 3.10+。
 
 ## License

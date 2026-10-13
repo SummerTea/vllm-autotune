@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""bench.py — 单次实验的度量 harness（在 head GPU 主机上运行）。
+"""bench.py — 单次实验的度量 harness（docker-only，在 head GPU 主机上运行）。
 
-run.sh 把本文件 rsync 到远端 head 主机后执行一次：按 config.yaml 起 vllm serve，
-轮询 /health 至就绪，跑 harness.bench.repeats 次 `vllm bench serve --goodput`，
-取中位数，写 status.json / result.json / run.log，并用启动日志实测值就地校准
-model_profile.json，最后清理 server 进程（不留僵尸）。
+run.sh 把本文件 rsync 到远端 head 主机后执行一次：按 config.yaml 起 docker 容器跑
+vllm serve，轮询 /health 至就绪，跑 harness.bench.repeats 次 `vllm bench serve
+--goodput`（bench 客户端也在容器内），取中位数，写 status.json / result.json /
+run.log，并用启动日志实测值就地校准 model_profile.json，最后 docker rm -f 清理。
 
 对仓库只读（绝不改 config.yaml）；只写 --out-dir。
 
 冻结接口（run.sh / 编码 agent 依赖，勿改）：
   CLI: python bench.py --config config.yaml --harness harness.yaml --target target.yaml --out-dir .
-       可选测试钩子：--serve-cmd / --bench-cmd（指向 stub 脚本）；
+       测试钩子：--docker-cmd（指向 stub docker 客户端）；
        轮询间隔 --poll-interval、显存采样间隔 --vram-interval 亦可调参（保证测试可跑）。
   产物:
     status.json   {"state":"running|done|crash","phase":"loading|benching|done|crash",
@@ -18,7 +18,7 @@ model_profile.json，最后清理 server 进程（不留僵尸）。
     result.json   成功 {"status":"ok", goodput_req_s, output_tok_s, ttft_p99_ms, tpot_p99_ms,
                         peak_vram_gb, dur_s, repeats, env_fingerprint, calibration}
                    失败 {"status":"crash","reason":str, ...}
-    run.log       vllm server 的 stdout/stderr（另附 bench 每次调用的标注与输出，便于排障）
+    run.log       vllm serve 容器的 stdout/stderr（另附 bench 每次调用的标注与输出，便于排障）
     model_profile.json 就地校准 boot.measured_seconds / kv.measured_capacity_tokens / calibrated=true
   stdout 末尾固定输出 "---\nstatus: ...\n..." 块，供 agent grep。
 """
@@ -31,7 +31,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import signal
 import statistics
 import subprocess
@@ -145,24 +144,10 @@ def find_newest_json(d: str) -> str | None:
 
 # ── 命令构建（单元测试目标）─────────────────────────────────────────────
 
-def resolve_vllm_cli() -> str:
-    """定位 vllm 控制台脚本：优先当前 python bin 同目录，其次 PATH；
-    都找不到 → 抛 RuntimeError（明确报错，不再裸依赖 PATH 里的 `vllm`）。"""
-    bin_dir = os.path.dirname(os.path.abspath(sys.executable))
-    cand = os.path.join(bin_dir, "vllm")
-    if os.path.isfile(cand) and os.access(cand, os.X_OK):
-        return cand
-    found = shutil.which("vllm")
-    if found:
-        return found
-    raise RuntimeError("vllm CLI 不可达：未在 <python bin>/vllm 或 PATH 找到（请先运行 setup_remote.sh）")
-
-
 def effective_runtime(harness: dict, config: dict) -> dict:
-    """运行时 = harness.runtime 与 config.runtime 逐键合并（config 覆盖）；缺省 kind=native。"""
-    rt = {**(harness.get("runtime") or {}), **((config.get("runtime") or {}))}
-    rt.setdefault("kind", "native")
-    return rt
+    """运行时 = harness.runtime 与 config.runtime 逐键合并（config 覆盖）。
+    docker-only：若仍有 kind 键则接受并忽略（向后兼容）。"""
+    return {**(harness.get("runtime") or {}), **((config.get("runtime") or {}))}
 
 
 def container_model_path(runtime: dict) -> str:
@@ -193,24 +178,19 @@ def _serve_flags(config: dict, port: int) -> list[str]:
     return args
 
 
-def build_serve_cmd(serve_cmd: str, config: dict, model: str, port: int) -> list[str]:
-    """native：`vllm serve <model> <serve 参数…>`（布尔约定见 _serve_flags）。"""
-    toks = shlex.split(serve_cmd) or ["vllm", "serve"]
-    return toks + [model] + _serve_flags(config, port)
-
-
 def build_docker_run_cmd(docker_cmd: str, runtime: dict, model_path: str, port: int,
                          config: dict) -> list[str]:
     """docker 运行时 serve 命令（frozen 设计）：
-    docker run --rm --name vllm-autotune-trial --gpus all --ipc=host --shm-size=<shm|16g>
+    docker run --pull=never --rm --name vllm-autotune-trial --gpus all --ipc=host --shm-size=<shm|16g>
       -p 127.0.0.1:<port>:<port> -v <model_path>:<container_path>:ro [-e K=V ...]
       [extra_docker_args...] --entrypoint vllm <image> serve <container_path> <serve flags…>"""
     image = runtime.get("image")
     if not image:
         raise ValueError("docker 运行时缺少 runtime.image（写进 config.yaml 或 harness.yaml）")
     cpath = container_model_path(runtime)
-    cmd = [docker_cmd, "run", "--rm", "--name", "vllm-autotune-trial",
+    cmd = [docker_cmd, "run", "--pull=never", "--rm", "--name", "vllm-autotune-trial",
            "--gpus", "all", "--ipc", "host", "--shm-size", str(runtime.get("shm_size") or "16g"),
+           # --ipc host 共享宿主机 /dev/shm，--shm-size 实际不生效（保留两者，仅说明）
            "-p", f"127.0.0.1:{port}:{port}",
            "-v", f"{model_path}:{cpath}:ro"]
     for k, v in (config.get("env") or {}).items():
@@ -244,22 +224,13 @@ def _bench_args(model: str, workload: dict, slo: dict, ref_conc: int, seed: int,
     return args
 
 
-def build_bench_cmd(bench_cmd: str, model: str, workload: dict, slo: dict,
-                    ref_conc: int, seed: int, result_dir: str,
-                    trust_remote_code: bool = False, port: int = 8000) -> list[str]:
-    """native：`vllm bench serve <参数…>`。"""
-    toks = shlex.split(bench_cmd) or ["vllm", "bench", "serve"]
-    return toks + _bench_args(model, workload, slo, ref_conc, seed, result_dir,
-                              trust_remote_code, port)
-
-
 def build_docker_bench_cmd(docker_cmd: str, runtime: dict, model: str, workload: dict,
                            slo: dict, ref_conc: int, seed: int, host_result_dir: str,
                            trust_remote_code: bool = False, port: int = 8000,
                            container_result_dir: str = "/bench_results",
                            host_model_path: str | None = None) -> list[str]:
     """docker 模式 bench 客户端也在容器内跑（本机无需 vllm CLI）：
-    docker run --rm --network host -v <host_result_dir>:<container_result_dir>
+    docker run --pull=never --rm --network host -v <host_result_dir>:<container_result_dir>
       [-v <host_model_path>:<cpath>:ro] --entrypoint vllm <image> bench serve <参数…>
     --network host 让容器共享主机网络栈，可直达 serve 发布的 127.0.0.1:<port>；
     --result-dir 指向容器内挂载点（--save-result JSON 经 -v 落回宿主目录）。
@@ -268,7 +239,7 @@ def build_docker_bench_cmd(docker_cmd: str, runtime: dict, model: str, workload:
     image = runtime.get("image")
     if not image:
         raise ValueError("docker 运行时缺少 runtime.image")
-    base = [docker_cmd, "run", "--rm", "--network", "host",
+    base = [docker_cmd, "run", "--pull=never", "--rm", "--network", "host",
             "-v", f"{host_result_dir}:{container_result_dir}"]
     if host_model_path:
         base += ["-v", f"{host_model_path}:{container_model_path(runtime)}:ro"]
@@ -394,7 +365,7 @@ def _wait_mem_freed(timeout: float = 30) -> None:
 
 
 def _cleanup(procs: list[subprocess.Popen] | None, docker_cmd: str | None = None) -> None:
-    """终止 server 相关进程组 + docker rm -f（docker 模式）+ pkill 兜底 + 等显存释放。
+    """终止 docker 客户端进程组 + docker rm -f（docker 模式）+ 等显存释放。
     绝不让僵尸存活，绝不抛异常。"""
     for proc in procs or []:
         if proc is not None and proc.poll() is None:
@@ -415,9 +386,6 @@ def _cleanup(procs: list[subprocess.Popen] | None, docker_cmd: str | None = None
                     pass
     if docker_cmd:
         _run_local([docker_cmd, "rm", "-f", "vllm-autotune-trial"])  # 幂等；容器随 run 一起终止
-    # 兜底（尽力而为）：假定 head 主机由本次实验独占（AGENTS.md 远程执行约定），
-    # 否则 pkill 可能误杀无关的 vllm serve 进程
-    _run_local(["pkill", "-f", "vllm serve"])
     _wait_mem_freed(timeout=30)
 
 
@@ -493,10 +461,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--harness", default="harness.yaml")
     ap.add_argument("--target", default="target.yaml")
     ap.add_argument("--out-dir", default=".")
-    ap.add_argument("--serve-cmd", default=None,
-                    help="serve 命令（缺省自动解析 vllm CLI；测试可指向 stub 脚本）")
-    ap.add_argument("--bench-cmd", default=None,
-                    help="bench 命令（缺省自动解析 vllm CLI；测试可指向 stub 脚本）")
     ap.add_argument("--docker-cmd", default="docker", help="docker 客户端命令（测试可指向 stub）")
     ap.add_argument("--poll-interval", type=float, default=2.0, help="/health 轮询间隔（秒）")
     ap.add_argument("--vram-interval", type=float, default=2.0, help="显存采样间隔（秒）")
@@ -506,21 +470,11 @@ def main(argv: list[str] | None = None) -> int:
     harness = load_yaml(args.harness)
     target = load_yaml(args.target)
 
-    # 运行时：harness.runtime 与 config.runtime 逐键合并（config 覆盖）
+    # docker-only：运行时 = harness.runtime 与 config.runtime 逐键合并（config 覆盖）
     runtime = effective_runtime(harness, config)
-    native = runtime.get("kind") != "docker"
-
-    # native 模式的 serve/bench 命令缺省解析 vllm CLI（仅当用户未显式传入时）；
-    # docker 模式本机无需 vllm CLI（serve/bench 都在容器内跑），解析失败 → 明确报错
-    serve_cmd = args.serve_cmd
-    bench_cmd = args.bench_cmd
-    if native and (serve_cmd is None or bench_cmd is None):
-        try:
-            cli = resolve_vllm_cli()
-        except RuntimeError as e:
-            _err(str(e))
-        serve_cmd = serve_cmd or f"{cli} serve"
-        bench_cmd = bench_cmd or f"{cli} bench serve"
+    if not runtime.get("image"):
+        _err("需要 docker 镜像：在 config.yaml 或 harness.yaml 的 runtime.image 指定"
+             "（如 vllm/vllm-openai:v0.31.0）")
 
     bench_cfg = harness.get("bench") or {}
     remote = harness.get("remote") or {}
@@ -569,27 +523,24 @@ def main(argv: list[str] | None = None) -> int:
     try:
         log_path = os.path.join(out_dir, "run.log")
         log_fh = open(log_path, "ab")
-        if native:
-            serve_tokens = build_serve_cmd(serve_cmd, config, model, port)
-            env_all = {**os.environ, **{str(k): str(v) for k, v in (config.get("env") or {}).items()}}
-            log_fh.write(f"=== bench.py {_now_iso()} serve(native): {shlex.join(serve_tokens)}\n".encode())
-            log_fh.flush()
-            procs.append(subprocess.Popen(serve_tokens, stdout=log_fh, stderr=subprocess.STDOUT,
-                                          env=env_all, start_new_session=True))
-        else:
-            # docker：serve/bench 都在容器内跑；本机只跑 docker 客户端
-            host_model_path = (target.get("model") or {}).get("path")
-            if not host_model_path:
-                raise TrialCrash("docker 模式需要 target.yaml 的 model.path（宿主上的模型目录，将挂载进容器）")
-            docker_clean_stale(args.docker_cmd)  # 先清残留同名容器（幂等），再 run
-            serve_tokens = build_docker_run_cmd(args.docker_cmd, runtime, host_model_path, port, config)
-            cpath = container_model_path(runtime)
-            log_fh.write(f"=== bench.py {_now_iso()} serve(docker): {shlex.join(serve_tokens)}\n".encode())
-            log_fh.flush()
-            # docker run 前台/attach 模式：容器 stdout 即 serve 日志，直接落入 run.log（含 KV 校准行）
-            procs.append(subprocess.Popen(serve_tokens, stdout=log_fh, stderr=subprocess.STDOUT,
-                                          env=os.environ, start_new_session=True))
-            model = cpath  # docker 下 serve/bench 的模型位都用容器挂载点
+        # docker：serve/bench 都在容器内跑；本机只跑 docker 客户端
+        host_model_path = (target.get("model") or {}).get("path")
+        if not host_model_path:
+            raise TrialCrash("需要 target.yaml 的 model.path（宿主上的模型目录，将只读挂载进容器）")
+        # M1：零 pull 契约——先确认镜像已预先准备（docker run 另带 --pull=never 兜底，给出可诊断信息）
+        img = str(runtime.get("image"))  # 前面 _err 已保证 image 非空
+        if _run_local([args.docker_cmd, "image", "inspect", img])[0] != 0:
+            raise TrialCrash(f"镜像 {img} 未在主机预先准备（本模板不自动拉取，保持主机零新增；"
+                             "请人工预先 docker pull 或改用已存在的镜像）")
+        docker_clean_stale(args.docker_cmd)  # 先清残留同名容器（幂等），再 run
+        serve_tokens = build_docker_run_cmd(args.docker_cmd, runtime, host_model_path, port, config)
+        cpath = container_model_path(runtime)
+        log_fh.write(f"=== bench.py {_now_iso()} serve(docker): {shlex.join(serve_tokens)}\n".encode())
+        log_fh.flush()
+        # docker run 前台/attach 模式：容器 stdout 即 serve 日志，直接落入 run.log（含 KV 校准行）
+        procs.append(subprocess.Popen(serve_tokens, stdout=log_fh, stderr=subprocess.STDOUT,
+                                      env=os.environ, start_new_session=True))
+        model = cpath  # docker 下 serve/bench 的模型位都用容器挂载点
 
         # 就绪轮询：/health 200；503(EngineDeadError)/进程退出/超时 → crash
         budget = max(0.0, deadline - time.monotonic())
@@ -616,7 +567,7 @@ def main(argv: list[str] | None = None) -> int:
         kv = _scan_kv(log_path)
         if kv:
             kv_tokens = kv
-        msg = f"就绪（load={load_seconds}s，runtime={runtime.get('kind')}），开始 bench（repeats={repeats}）"
+        msg = f"就绪（load={load_seconds}s，runtime=docker），开始 bench（repeats={repeats}）"
         if diff:
             msg += f"；环境指纹变化：{diff}"
         _write_status(out_dir, "running", "benching", msg, started_at)
@@ -628,14 +579,10 @@ def main(argv: list[str] | None = None) -> int:
                                        args=(stop, args.vram_interval, peak_mib), daemon=True)
         vram_thread.start()
         try:
-            bench_tokens = (build_docker_bench_cmd(args.docker_cmd, runtime, model, workload, slo,
-                                                   ref_conc, seed, os.path.join(out_dir, "bench_results"),
-                                                   trust_remote_code, port,
-                                                   host_model_path=host_model_path)
-                            if not native else
-                            build_bench_cmd(bench_cmd, model, workload, slo, ref_conc, seed,
-                                            os.path.join(out_dir, "bench_results"),
-                                            trust_remote_code, port))
+            bench_tokens = build_docker_bench_cmd(args.docker_cmd, runtime, model, workload, slo,
+                                                  ref_conc, seed, os.path.join(out_dir, "bench_results"),
+                                                  trust_remote_code, port,
+                                                  host_model_path=host_model_path)
             results = []
             for i in range(repeats):
                 remaining = deadline - time.monotonic()
@@ -679,7 +626,7 @@ def main(argv: list[str] | None = None) -> int:
                   "started_at": started_at,
                   "calibration": {"measured_kv_tokens": kv_tokens, "load_seconds": load_seconds}}
     finally:
-        _cleanup(procs, args.docker_cmd if not native else None)
+        _cleanup(procs, args.docker_cmd)
         if log_fh is not None:
             try:
                 log_fh.close()

@@ -5,14 +5,12 @@
 env: {}                         # 进程级环境变量，随每次 server 启动注入（如 NCCL_*、VLLM_*）
 
 model:                          # 可选：覆盖 target.yaml 的模型（如量化变体 repo id）。留空则不覆盖。
-runtime: {}                     # 可选；覆盖 harness.yaml 的 runtime 默认（逐键合并）。docker 模式示例：
+runtime: {}                     # 可选；覆盖 harness.yaml 的 runtime 默认（逐键合并）。docker-only 示例：
 # runtime:
-#   kind: docker
 #   image: vllm/vllm-openai:v0.31.0     # ★ 合法的搜索维度（如 CUDA 12/13 变体镜像）；默认不 pull，需预先准备
 #   container_model_path: /model        # 容器内模型挂载点（默认 /model）
 #   shm_size: 16g                       # --shm-size（默认 16g）
 #   extra_docker_args: []                # 附加 docker run 参数（--ipc=host/--shm-size 已含默认，无需重复）
-#   install_allowed: false              # 允许在 work_dir 内建 venv 安装（默认 false=不安装，零破坏）
 serve: {}                       # vLLM serve 参数，kebab-case 作为 CLI flag。
                                 # 布尔约定：true → 裸 flag（--enable-x）；false → 省略（保持默认）；
                                 # 要关闭默认开启的开关，写 no-<flag>: true（原样透传为 --no-<flag>）。例如：

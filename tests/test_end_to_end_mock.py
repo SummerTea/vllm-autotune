@@ -1,6 +1,6 @@
 """test_end_to_end_mock.py — probe → bench → report 全链路 mock 集成测试。
 
-在临时 cwd 中用真实模块跑通：probe.py（fixture 模式）→ bench.py（stub serve/bench）
+在临时 cwd 中用真实模块跑通：probe.py（fixture 模式）→ bench.py（stub docker）
 → 手写 results.tsv → report.py。无 GPU / 无网络；可在 Mac 上运行。
 """
 
@@ -47,6 +47,7 @@ def test_full_pipeline(tmp_path):
         "workload": {"dataset": "random", "isl": 2048, "osl": 256, "num_prompts": 1000},
         "exit": {"plateau_trials": 8, "crash_streak": 3},
         "remote": {"vllm_port": PORT, "vllm_python": "python"},
+        "runtime": {"kind": "docker", "image": "vllm/vllm-openai:v0.31.0"},
     })
     _write_yaml(tmp_path, "config.yaml", {"env": {}, "serve": {}})
 
@@ -57,14 +58,13 @@ def test_full_pipeline(tmp_path):
     for f in ("env.json", "env_report.md", "model_profile.json"):
         assert (tmp_path / f).exists(), f"probe 缺产物 {f}"
 
-    # (b) bench.py（stub serve/bench）
+    # (b) bench.py（stub docker：serve/bench 都在 fake_docker.sh 容器内跑）
     r = _run([sys.executable, str(BENCH),
               "--config", str(tmp_path / "config.yaml"),
               "--harness", str(tmp_path / "harness.yaml"),
               "--target", str(tmp_path / "target.yaml"),
               "--out-dir", ".",
-              "--serve-cmd", str(BENCH_FIX / "fake_serve.sh"),
-              "--bench-cmd", f"{sys.executable} {BENCH_FIX / 'fake_bench.py'}",
+              "--docker-cmd", str(BENCH_FIX / "fake_docker.sh"),
               "--poll-interval", "0.2", "--vram-interval", "0.3"],
              cwd=tmp_path)
     assert r.returncode == 0, f"bench 失败:\n{r.stdout}\n{r.stderr}"

@@ -1,15 +1,15 @@
-"""test_bench.py — bench.py 单元测试 + 生命周期（stub 脚本）测试。
+"""test_bench.py — bench.py 单元测试 + 生命周期（stub docker）测试。
 
-可在无 GPU 的 Mac 上运行：
+可在无 GPU 的 Mac 上运行（docker-only）：
 - 解析器：stdout 表格 / --save-result JSON / 启动日志校准行
-- 命令构建：serve 的 kebab flag / 布尔（true→裸 flag，false→省略，no- 前缀关默认开关） / 端口
-- 生命周期：fake_serve.sh + fake_bench.py 全流程（status/result/校准/summary 块）
-- crash 路径：立即退出 / 启动超时（并验证清理真的杀掉了假 serve）
+- 命令构建（docker）：serve 的 kebab flag / 布尔（true→裸 flag，false→省略，no- 前缀关默认开关）
+  / 端口；bench 的 --network host / --base-url / 结果目录挂载 / 模型只读挂载
+- 生命周期：fake_docker.sh 全流程（status/result/校准/summary 块，docker rm 先于 run）
+- crash 路径：serve 容器立即退出（并验证清理被调用）
 """
 
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -85,74 +85,18 @@ class TestParsers:
         assert bench.find_newest_json(str(tmp_path / "nope")) is None
 
 
-class TestBuildCommands:
-    def test_build_serve_cmd_kebab_bool_port(self):
-        cfg = {"env": {"NCCL_IB_DISABLE": "1"},
-               "serve": {"max-num-seqs": 256, "gpu-memory-utilization": 0.92,
-                         "enable-prefix-caching": True, "kv-cache-dtype": "fp8"}}
-        cmd = bench.build_serve_cmd("vllm serve", cfg, "Qwen/Qwen3-32B", 8000)
-        assert cmd[:2] == ["vllm", "serve"]
-        assert cmd[2] == "Qwen/Qwen3-32B"
-        for flag, val in (("--max-num-seqs", "256"), ("--gpu-memory-utilization", "0.92"),
-                          ("--kv-cache-dtype", "fp8")):
-            assert cmd[cmd.index(flag) + 1] == val
-        assert "--enable-prefix-caching" in cmd        # True → 裸 flag
-        assert "--port" in cmd and "8000" in cmd        # 端口默认补齐
-        assert "NCCL_IB_DISABLE" not in cmd             # env 不进命令（由调用方注入）
-
-    def test_build_serve_cmd_false_bool_omitted(self):
-        # M3 回归：False 布尔 → 整体省略，绝不产出 "--flag false"（vLLM 布尔是开关式）
-        cmd = bench.build_serve_cmd("vllm serve", {"serve": {"enforce-eager": False}},
-                                    "M", 8000)
-        assert "--enforce-eager" not in cmd
-        assert "--enforce-eager false" not in " ".join(cmd)
-
-    def test_build_serve_cmd_no_flag_turns_off_default(self):
-        # 关闭默认开启的开关：写 no-<flag>: true，键原样透传为 --no-<flag>
-        cmd = bench.build_serve_cmd("vllm serve",
-                                    {"serve": {"no-enable-prefix-caching": True}}, "M", 8000)
-        assert "--no-enable-prefix-caching" in cmd
-
-    def test_build_serve_cmd_explicit_port_not_duplicated(self):
-        cmd = bench.build_serve_cmd("vllm serve", {"serve": {"port": 9999}}, "M", 8000)
-        assert cmd.count("--port") == 1
-        assert "9999" in cmd
-
-    def test_build_bench_cmd(self):
-        workload = {"dataset": "random", "isl": 2048, "osl": 256, "num_prompts": 1000}
-        slo = {"ttft_p99_ms": 500, "tpot_p99_ms": 50}
-        cmd = bench.build_bench_cmd("vllm bench serve", "M", workload, slo, 128, 0, "/tmp/r",
-                                    port=8000)
-        assert cmd[:4] == ["vllm", "bench", "serve", "--model"]
-        assert cmd[4] == "M"
-        joined = " ".join(cmd)
-        assert "--base-url http://127.0.0.1:8000" in joined   # 显式 base-url（端口≠默认也正确）
-        assert "--dataset-name random" in joined
-        assert "--input-len 2048" in joined and "--output-len 256" in joined
-        assert "--num-prompts 1000" in joined
-        assert "--request-rate inf" in joined
-        assert "--max-concurrency 128" in joined
-        assert "--goodput ttft:500 tpot:50" in joined
-        assert "--seed 0" in joined and "--save-result" in joined
-        assert "--result-dir /tmp/r" in joined
-
-    def test_build_bench_cmd_trust_remote_code(self):
-        cmd = bench.build_bench_cmd("vllm bench serve", "M", {}, {}, 128, 0, "/tmp/r",
-                                    trust_remote_code=True, port=8000)
-        assert "--trust-remote-code" in cmd
-
-
 class TestDockerRuntime:
     RUNTIME = {"kind": "docker", "image": "vllm/vllm-openai:v0.31.0",
                "container_model_path": "/model", "shm_size": "16g",
                "extra_docker_args": ["--privileged"]}
 
     def test_effective_runtime_merge(self):
-        rt = bench.effective_runtime({"runtime": {"kind": "native"}},
-                                     {"runtime": {"kind": "docker", "image": "img:1"}})
-        assert rt["kind"] == "docker" and rt["image"] == "img:1"
-        assert bench.effective_runtime({}, {})["kind"] == "native"
-        assert bench.effective_runtime({"runtime": {"kind": "docker", "image": "a:1"}}, {})["kind"] == "docker"
+        rt = bench.effective_runtime({"runtime": {}}, {"runtime": {"image": "img:1"}})
+        assert rt["image"] == "img:1"
+        assert bench.effective_runtime({}, {}) == {}
+        # 遗留 kind 键被接受并忽略（向后兼容），不影响 docker-only
+        rt2 = bench.effective_runtime({"runtime": {"kind": "docker", "image": "a:1"}}, {})
+        assert rt2["kind"] == "docker" and rt2["image"] == "a:1"
 
     def test_build_docker_run_cmd(self):
         cfg = {"env": {"NCCL_IB_DISABLE": "1"},
@@ -161,6 +105,7 @@ class TestDockerRuntime:
         cmd = bench.build_docker_run_cmd("docker", self.RUNTIME, "/models/qwen3", 8000, cfg)
         joined = " ".join(cmd)
         assert cmd[0] == "docker" and cmd[1] == "run"
+        assert cmd[2] == "--pull=never"                      # M1：零 pull 契约（缺失镜像不自动拉取）
         assert "--name" in cmd and "vllm-autotune-trial" in cmd
         assert "--gpus" in cmd and "all" in cmd
         assert "--ipc" in cmd and "host" in cmd
@@ -192,12 +137,31 @@ class TestDockerRuntime:
         with pytest.raises(ValueError):
             bench.build_docker_run_cmd("docker", {"kind": "docker"}, "/m", 8000, {"serve": {}})
 
+    def test_build_docker_run_cmd_false_bool_omitted(self):
+        # M3 回归：False 布尔 → 在 docker serve 参数内整体省略（vLLM 布尔是开关式）
+        cmd = bench.build_docker_run_cmd("docker", self.RUNTIME, "/m", 8000,
+                                         {"serve": {"enforce-eager": False}, "env": {}})
+        assert "--enforce-eager" not in cmd
+        assert "--enforce-eager false" not in " ".join(cmd)
+
+    def test_build_docker_run_cmd_no_flag_turns_off_default(self):
+        # 关闭默认开启的开关：no-<flag>: true 原样透传为 --no-<flag>
+        cmd = bench.build_docker_run_cmd("docker", self.RUNTIME, "/m", 8000,
+                                         {"serve": {"no-enable-prefix-caching": True}, "env": {}})
+        assert "--no-enable-prefix-caching" in cmd
+
+    def test_build_docker_run_cmd_explicit_port_not_duplicated(self):
+        cmd = bench.build_docker_run_cmd("docker", self.RUNTIME, "/m", 8000,
+                                         {"serve": {"port": 9999}, "env": {}})
+        assert cmd.count("--port") == 1
+        assert "9999" in cmd
+
     def test_build_docker_bench_cmd(self):
         workload = {"dataset": "random", "isl": 2048, "osl": 256, "num_prompts": 1000}
         slo = {"ttft_p99_ms": 500, "tpot_p99_ms": 50}
         cmd = bench.build_docker_bench_cmd("docker", self.RUNTIME, "/model", workload,
                                            slo, 128, 0, "/tmp/r", port=8000)
-        assert cmd[:2] == ["docker", "run"]
+        assert cmd[:3] == ["docker", "run", "--pull=never"]    # M1：零 pull 契约
         # B1：bench 容器必须共享主机网络栈，直达 serve 发布的 127.0.0.1:<port>
         assert "--network" in cmd and "host" in cmd
         i = cmd.index("--entrypoint")
@@ -224,122 +188,6 @@ class TestDockerRuntime:
         cmd2 = bench.build_docker_bench_cmd("docker", self.RUNTIME, "/model", workload,
                                             slo, 8, 0, "/tmp/r", port=8000)
         assert "-v /host/models/m:/model:ro" not in " ".join(cmd2)
-
-
-# ── 生命周期 / crash 测试（stub 脚本）───────────────────────────────────
-
-def _write_inputs(tmp_path: Path, port: int, *, startup: int = 30, trial: int = 60,
-                  repeats: int = 2) -> None:
-    harness = {
-        "bench": {"tool": "vllm bench serve", "repeats": repeats,
-                  "startup_timeout_s": startup, "trial_timeout_s": trial,
-                  "ref_concurrency": 128},
-        "slo": {"ttft_p99_ms": 500, "tpot_p99_ms": 50},
-        "workload": {"dataset": "random", "isl": 2048, "osl": 256, "num_prompts": 1000},
-        "remote": {"vllm_port": port, "vllm_python": "python"},
-    }
-    (tmp_path / "harness.yaml").write_text(json.dumps(harness), encoding="utf-8")
-    (tmp_path / "target.yaml").write_text(json.dumps(
-        {"model": {"id": "Qwen/Qwen3-32B", "trust_remote_code": False},
-         "workload": {"ref_concurrency": 128}}), encoding="utf-8")
-    (tmp_path / "config.yaml").write_text(json.dumps(
-        {"env": {"TEST_ENV": "1"}, "serve": {}}), encoding="utf-8")
-
-
-def _base_args(tmp_path: Path, out: Path, serve_cmd: str) -> list[str]:
-    return ["--config", str(tmp_path / "config.yaml"),
-            "--harness", str(tmp_path / "harness.yaml"),
-            "--target", str(tmp_path / "target.yaml"),
-            "--out-dir", str(out),
-            "--serve-cmd", serve_cmd,
-            "--poll-interval", "0.2", "--vram-interval", "0.3"]
-
-
-def test_lifecycle_with_stub_scripts(tmp_path, capsys):
-    port = 18080
-    _write_inputs(tmp_path, port, repeats=2)
-    out = tmp_path / "out"
-    out.mkdir()
-    # 预置 model_profile.json，验证就地校准
-    profile = {
-        "model": "Qwen/Qwen3-32B",
-        "arch": {"model_type": "qwen2", "num_layers": 64, "hidden_size": 4096},
-        "boot": {"estimated_seconds": 14.6, "measured_seconds": None},
-        "kv": {"bytes_per_token": 262144, "est_capacity_tokens": 36832,
-               "measured_capacity_tokens": None},
-        "calibrated": False,
-    }
-    (out / "model_profile.json").write_text(json.dumps(profile), encoding="utf-8")
-
-    rc = bench.main(_base_args(tmp_path, out, str(FIX / "fake_serve.sh")) + [
-        "--bench-cmd", f"{sys.executable} {FIX / 'fake_bench.py'}"])
-    assert rc == 0
-
-    status = json.loads((out / "status.json").read_text(encoding="utf-8"))
-    assert status["state"] == "done" and status["phase"] == "done"
-
-    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
-    assert result["status"] == "ok"
-    assert result["goodput_req_s"] == pytest.approx(12.84)      # median(12.34, 13.34)
-    assert result["output_tok_s"] == pytest.approx(12345.6)
-    assert result["ttft_p99_ms"] == pytest.approx(620.1)
-    assert result["tpot_p99_ms"] == pytest.approx(18.3)
-    assert result["repeats"] == 2
-    assert result["peak_vram_gb"] is None                       # 无 nvidia-smi → null
-    assert result["dur_s"] > 0
-    assert result["calibration"]["measured_kv_tokens"] == 1234567
-    assert result["calibration"]["load_seconds"] > 0
-    assert "captured" in result["env_fingerprint"]              # 指纹键存在（Mac 上无 nvidia-smi/sysfs 可为空）
-    assert result["env_fingerprint"]["note"]                    # 无 env.json → 跳过对比
-
-    # run.log 含校准行（fake_serve 的 stdout）
-    assert "GPU KV cache size: 1,234,567 tokens" in (out / "run.log").read_text(encoding="utf-8")
-
-    # model_profile.json 就地校准：保留 estimated，写 measured，置 calibrated
-    p2 = json.loads((out / "model_profile.json").read_text(encoding="utf-8"))
-    assert p2["calibrated"] is True
-    assert p2["boot"]["estimated_seconds"] == 14.6
-    assert p2["boot"]["measured_seconds"] > 0
-    assert p2["kv"]["bytes_per_token"] == 262144
-    assert p2["kv"]["measured_capacity_tokens"] == 1234567
-
-    # summary 块（agent grep 用）
-    sout = capsys.readouterr().out
-    assert "---\nstatus: ok" in sout
-    assert "goodput: 12.84" in sout
-    assert "peak_vram_gb: null" in sout
-
-
-def test_crash_immediate_exit(tmp_path, capsys):
-    port = 18081
-    _write_inputs(tmp_path, port, startup=10, trial=30, repeats=1)
-    out = tmp_path / "out"
-    rc = bench.main(_base_args(tmp_path, out, str(FIX / "fake_crash_serve.sh")) + [
-        "--bench-cmd", "vllm bench serve"])
-    assert rc != 0
-    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
-    assert result["status"] == "crash"
-    assert "rc=1" in result["reason"]                       # 假 serve 立即 exit 1
-    status = json.loads((out / "status.json").read_text(encoding="utf-8"))
-    assert status["state"] == "crash" and status["phase"] == "crash"
-    sout = capsys.readouterr().out
-    assert "status: crash" in sout
-    assert "goodput:" not in sout                            # crash 不输出指标行
-
-
-def test_crash_startup_timeout_and_cleanup(tmp_path, capsys):
-    port = 18082
-    _write_inputs(tmp_path, port, startup=2, trial=30, repeats=1)
-    out = tmp_path / "out"
-    rc = bench.main(_base_args(tmp_path, out, str(FIX / "fake_sleep_serve.sh")) + [
-        "--bench-cmd", "vllm bench serve"])
-    assert rc != 0
-    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
-    assert result["status"] == "crash"
-    assert "startup_timeout" in result["reason"]
-    # 清理验证：假 serve 进程组必须已被杀掉（无残留）
-    p = subprocess.run(["pgrep", "-f", "fake_sleep_serve"], capture_output=True, text=True)
-    assert p.returncode != 0, f"残留进程: {p.stdout}"
 
 
 # ── docker 运行时生命周期（stub docker，无真实 docker/GPU）─────────────────
@@ -420,5 +268,27 @@ def test_docker_crash_serve_exits(tmp_path, capsys, monkeypatch):
     result = json.loads((out / "result.json").read_text(encoding="utf-8"))
     assert result["status"] == "crash"
     assert "rc=1" in result["reason"]                            # stub serve exit 1
+    sout = capsys.readouterr().out
+    assert "status: crash" in sout
+
+
+def test_docker_missing_image_crash(tmp_path, capsys, monkeypatch):
+    # M1：镜像未预先准备 → main() 的 image inspect 预检查给出可诊断 crash（零 pull 契约）
+    port = 18094
+    _write_docker_inputs(tmp_path, port, startup=10, trial=30, repeats=1)
+    out = tmp_path / "out"
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+    monkeypatch.setenv("FAKE_DOCKER_NO_IMAGE", "1")
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file))
+    assert rc != 0
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["status"] == "crash"
+    assert "未在主机预先准备" in result["reason"]
+    status = json.loads((out / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "crash" and status["phase"] == "crash"
+    # 预检查失败：不进入 docker run（状态文件只有 image inspect 相关调用，无 rm/run）
+    assert not state_file.exists() or "docker run" not in state_file.read_text(encoding="utf-8")
     sout = capsys.readouterr().out
     assert "status: crash" in sout

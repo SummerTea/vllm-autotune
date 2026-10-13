@@ -665,7 +665,7 @@ def _system_checklist(facts: dict, is_head: bool, weights_bytes: int | None) -> 
         items.append({"name": "docker 可用", "status": "pass", "detail": f"docker: {dv}", "fix": "—"})
     else:
         items.append({"name": "docker 可用", "status": "warn",
-                      "detail": "docker 不可用（仅 docker 运行时相关；native 模式可忽略）",
+                      "detail": "docker 不可用（本模板为 docker-only，serve/bench 都需在主机上跑 docker）",
                       "fix": "安装 docker + nvidia-container-toolkit"})
 
     for g in gpus:
