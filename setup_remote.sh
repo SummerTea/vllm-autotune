@@ -99,8 +99,15 @@ if [ -n "$CUDA_MAJ" ]; then
 else
   bad "nvidia-smi 不可用或读不到 CUDA 版本（vLLM 需要 NVIDIA GPU + 驱动）"
 fi
-if [ "$CUDA_MAJ" = "12" ]; then WHEEL="vllm==0.31.0+cu129"; else WHEEL="vllm==0.31.0"; fi
-echo "    选用 wheel: $WHEEL（docs/vllm-facts.md §7）"
+# 只认明确可判定的 CUDA 主版本：12 → +cu129 wheel；13 → 默认 wheel；
+# 其余（11/10/空/未知）→ 记 FAIL、跳过安装，绝不猜测 wheel 导致假 PASS
+case "$CUDA_MAJ" in
+  12) WHEEL="vllm==0.31.0+cu129" ;;
+  13) WHEEL="vllm==0.31.0" ;;
+  *)  bad "无法确定/不支持的 CUDA 主版本（'$CUDA_MAJ'）；支持 12.x / 13.x"
+      SKIP_INSTALL=1 ;;
+esac
+echo "    选用 wheel: ${WHEEL:-<跳过>}（docs/vllm-facts.md §7）"
 
 echo "== [2/4] uv =="
 if command -v uv >/dev/null 2>&1; then
@@ -112,9 +119,10 @@ else
   bad "uv 安装失败（head 主机需可访问网络）"
 fi
 
-echo "== [3/4] uv pip install $WHEEL（--python $VLLM_PYTHON） =="
-echo "    安装/校验中，可能需要数分钟……"
-if LOG="$(uv pip install --python "$VLLM_PYTHON" "$WHEEL" 2>&1)"; then
+echo "== [3/4] uv pip install ${WHEEL:-<未定>}（--python $VLLM_PYTHON） =="
+if [ "${SKIP_INSTALL:-0}" = "1" ]; then
+  echo "    CUDA 主版本无法确定/不支持：跳过安装（修复驱动后重跑 setup_remote.sh）"
+elif LOG="$(uv pip install --python "$VLLM_PYTHON" "$WHEEL" 2>&1)"; then
   ok "vllm $WHEEL 已就绪"
 else
   printf '%s\n' "$LOG" >&2
@@ -132,6 +140,16 @@ if [ -n "$VLLM_VER" ]; then
   ok "vllm --version: $VLLM_VER"
 else
   bad "vllm import 失败（$VLLM_PYTHON -c 'import vllm'）"
+fi
+# vllm 控制台脚本可达性：command -v vllm 或 python 同目录下的 vllm，且 --version 能跑
+VLLM_BIN="$(command -v vllm 2>/dev/null)"
+if [ -z "$VLLM_BIN" ] && [ -x "$(dirname "$VLLM_PYTHON")/vllm" ]; then
+  VLLM_BIN="$(dirname "$VLLM_PYTHON")/vllm"
+fi
+if [ -n "$VLLM_BIN" ] && "$VLLM_BIN" --version >/dev/null 2>&1; then
+  ok "vllm CLI 可达（$VLLM_BIN --version）"
+else
+  bad "vllm CLI 不可达（command -v vllm 与 $VLLM_PYTHON 同目录的 vllm 均不可用）"
 fi
 if nvidia-smi -L >/dev/null 2>&1; then
   ok "nvidia-smi -L 可枚举 GPU"

@@ -10,7 +10,7 @@ model_profile.json，最后清理 server 进程（不留僵尸）。
 
 冻结接口（run.sh / 编码 agent 依赖，勿改）：
   CLI: python bench.py --config config.yaml --harness harness.yaml --target target.yaml --out-dir .
-       可选测试钩子：--serve-cmd / --bench-cmd（指向 stub 脚本）、--python（前置解释器）；
+       可选测试钩子：--serve-cmd / --bench-cmd（指向 stub 脚本）；
        轮询间隔 --poll-interval、显存采样间隔 --vram-interval 亦可调参（保证测试可跑）。
   产物:
     status.json   {"state":"running|done|crash","phase":"loading|benching|done|crash",
@@ -31,6 +31,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import statistics
 import subprocess
@@ -143,10 +144,26 @@ def find_newest_json(d: str) -> str | None:
 
 # ── 命令构建（单元测试目标）─────────────────────────────────────────────
 
-def build_serve_cmd(serve_cmd: str, config: dict, model: str, port: int,
-                    python: str | None = None) -> list[str]:
+def resolve_vllm_cli() -> str:
+    """定位 vllm 控制台脚本：优先当前 python bin 同目录，其次 PATH；
+    都找不到 → 抛 RuntimeError（明确报错，不再裸依赖 PATH 里的 `vllm`）。"""
+    bin_dir = os.path.dirname(os.path.abspath(sys.executable))
+    cand = os.path.join(bin_dir, "vllm")
+    if os.path.isfile(cand) and os.access(cand, os.X_OK):
+        return cand
+    found = shutil.which("vllm")
+    if found:
+        return found
+    raise RuntimeError("vllm CLI 不可达：未在 <python bin>/vllm 或 PATH 找到（请先运行 setup_remote.sh）")
+
+
+def build_serve_cmd(serve_cmd: str, config: dict, model: str, port: int) -> list[str]:
     """vllm serve 命令：`vllm serve <model> <serve 参数…>`。
-    serve 键 kebab-case 转 `--flag`；布尔 False → `--flag false`；缺 --port 则补默认。"""
+    布尔约定（vLLM 布尔 flag 是开关式、不接受值 token，`--flag false` 会启动失败）：
+      true  → 裸 flag `--<kebab>`；
+      false → 整体省略（保持 vLLM 默认）；要关闭默认开启的开关，agent 写
+              `no-<flag>: true`（键原样透传，产出 `--no-<flag>`）。
+    缺 --port 则补默认。"""
     toks = shlex.split(serve_cmd) or ["vllm", "serve"]
     args = [model]
     for k, v in (config.get("serve") or {}).items():
@@ -154,21 +171,17 @@ def build_serve_cmd(serve_cmd: str, config: dict, model: str, port: int,
         if isinstance(v, bool):
             if v:
                 args.append(flag)
-            else:
-                args += [flag, "false"]
+            # false → 不产出任何 token（省略，保持默认）
         else:
             args += [flag, str(v)]
     if "--port" not in args:
         args += ["--port", str(port)]
-    full = toks + args
-    if python:
-        full = [python] + full
-    return full
+    return toks + args
 
 
 def build_bench_cmd(bench_cmd: str, model: str, workload: dict, slo: dict,
                     ref_conc: int, seed: int, result_dir: str,
-                    trust_remote_code: bool = False, python: str | None = None) -> list[str]:
+                    trust_remote_code: bool = False) -> list[str]:
     """vllm bench serve 命令（docs §1 CLI + --goodput + --save-result）。"""
     toks = shlex.split(bench_cmd) or ["vllm", "bench", "serve"]
     wl = {**DEFAULT_WORKLOAD, **workload}
@@ -187,10 +200,7 @@ def build_bench_cmd(bench_cmd: str, model: str, workload: dict, slo: dict,
     ]
     if trust_remote_code:
         args.append("--trust-remote-code")
-    full = toks + args
-    if python:
-        full = [python] + full
-    return full
+    return toks + args
 
 
 # ── 环境指纹与校准 ──────────────────────────────────────────────────────
@@ -327,7 +337,9 @@ def _cleanup(proc: subprocess.Popen | None) -> None:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
-    _run_local(["pkill", "-f", "vllm serve"])  # 兜底（尽力而为）
+    # 兜底（尽力而为）：假定 head 主机由本次实验独占（AGENTS.md 远程执行约定），
+    # 否则 pkill 可能误杀无关的 vllm serve 进程
+    _run_local(["pkill", "-f", "vllm serve"])
     _wait_mem_freed(timeout=30)
 
 
@@ -403,12 +415,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--harness", default="harness.yaml")
     ap.add_argument("--target", default="target.yaml")
     ap.add_argument("--out-dir", default=".")
-    ap.add_argument("--serve-cmd", default="vllm serve", help="serve 命令（测试可指向 stub 脚本）")
-    ap.add_argument("--bench-cmd", default="vllm bench serve", help="bench 命令（测试可指向 stub 脚本）")
-    ap.add_argument("--python", default=None, help="可选：serve/bench 命令前追加的解释器")
+    ap.add_argument("--serve-cmd", default=None,
+                    help="serve 命令（缺省自动解析 vllm CLI；测试可指向 stub 脚本）")
+    ap.add_argument("--bench-cmd", default=None,
+                    help="bench 命令（缺省自动解析 vllm CLI；测试可指向 stub 脚本）")
     ap.add_argument("--poll-interval", type=float, default=2.0, help="/health 轮询间隔（秒）")
     ap.add_argument("--vram-interval", type=float, default=2.0, help="显存采样间隔（秒）")
     args = ap.parse_args(argv)
+
+    # serve/bench 命令缺省解析 vllm CLI（仅当用户未显式传入时）；解析失败 → 明确报错
+    serve_cmd = args.serve_cmd
+    bench_cmd = args.bench_cmd
+    if serve_cmd is None or bench_cmd is None:
+        try:
+            cli = resolve_vllm_cli()
+        except RuntimeError as e:
+            _err(str(e))
+        serve_cmd = serve_cmd or f"{cli} serve"
+        bench_cmd = bench_cmd or f"{cli} bench serve"
 
     config = load_yaml(args.config)
     harness = load_yaml(args.harness)
@@ -458,7 +482,7 @@ def main(argv: list[str] | None = None) -> int:
     result: dict | None = None
 
     try:
-        serve_tokens = build_serve_cmd(args.serve_cmd, config, model, port, args.python)
+        serve_tokens = build_serve_cmd(serve_cmd, config, model, port)
         env_all = {**os.environ, **{str(k): str(v) for k, v in (config.get("env") or {}).items()}}
         log_path = os.path.join(out_dir, "run.log")
         log_fh = open(log_path, "ab")
@@ -504,9 +528,9 @@ def main(argv: list[str] | None = None) -> int:
                                        args=(stop, args.vram_interval, peak_mib), daemon=True)
         vram_thread.start()
         try:
-            bench_tokens = build_bench_cmd(args.bench_cmd, model, workload, slo, ref_conc, seed,
+            bench_tokens = build_bench_cmd(bench_cmd, model, workload, slo, ref_conc, seed,
                                            os.path.join(out_dir, "bench_results"),
-                                           trust_remote_code, args.python)
+                                           trust_remote_code)
             results = []
             for i in range(repeats):
                 remaining = deadline - time.monotonic()

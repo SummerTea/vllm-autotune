@@ -71,6 +71,7 @@ commit  goodput  output_tok_s  ttft_p99_ms  tpot_p99_ms  peak_vram_gb  dur_s  st
 - **RDMA**：有 RoCE / IB → NCCL 相关 env、NIXL / PD 分离进入搜索空间；无 → 移出搜索空间（NCCL env 名见 `docs/vllm-facts.md` §6；NIXL / PD 相关 env 需 agent 自行查证后使用）。
 - **合法 tp 集合**：由 `num_attention_heads` / `num_key_value_heads` 的约数决定，非法 tp 值不试。
 - **系统级参数**：governor / hugepages / 锁频等只探测 + 建议（写进 report.md），不自动修改（v1 不提供自动修改开关）。
+- **布尔参数约定**：`true` → 裸 flag（`--enable-x`）；`false` → 省略（保持 vLLM 默认）；要关闭默认开启的开关，写 `no-<flag>: true`（原样透传为 `--no-<flag>`）。
 - **执行主机**：`run.sh` / `bench.py` 仅作用于唯一 `role: head` 的主机；缺失或重复即报错。
 
 ## 成本梯度

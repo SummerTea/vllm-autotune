@@ -2,7 +2,7 @@
 
 可在无 GPU 的 Mac 上运行：
 - 解析器：stdout 表格 / --save-result JSON / 启动日志校准行
-- 命令构建：serve 的 kebab flag / 布尔 / 端口 / python 前置
+- 命令构建：serve 的 kebab flag / 布尔（true→裸 flag，false→省略，no- 前缀关默认开关） / 端口
 - 生命周期：fake_serve.sh + fake_bench.py 全流程（status/result/校准/summary 块）
 - crash 路径：立即退出 / 启动超时（并验证清理真的杀掉了假 serve）
 """
@@ -100,20 +100,23 @@ class TestBuildCommands:
         assert "--port" in cmd and "8000" in cmd        # 端口默认补齐
         assert "NCCL_IB_DISABLE" not in cmd             # env 不进命令（由调用方注入）
 
-    def test_build_serve_cmd_false_bool_two_tokens(self):
-        cmd = bench.build_serve_cmd("vllm serve", {"serve": {"enable-expert-parallel": False}},
+    def test_build_serve_cmd_false_bool_omitted(self):
+        # M3 回归：False 布尔 → 整体省略，绝不产出 "--flag false"（vLLM 布尔是开关式）
+        cmd = bench.build_serve_cmd("vllm serve", {"serve": {"enforce-eager": False}},
                                     "M", 8000)
-        i = cmd.index("--enable-expert-parallel")
-        assert cmd[i + 1] == "false"
+        assert "--enforce-eager" not in cmd
+        assert "--enforce-eager false" not in " ".join(cmd)
+
+    def test_build_serve_cmd_no_flag_turns_off_default(self):
+        # 关闭默认开启的开关：写 no-<flag>: true，键原样透传为 --no-<flag>
+        cmd = bench.build_serve_cmd("vllm serve",
+                                    {"serve": {"no-enable-prefix-caching": True}}, "M", 8000)
+        assert "--no-enable-prefix-caching" in cmd
 
     def test_build_serve_cmd_explicit_port_not_duplicated(self):
         cmd = bench.build_serve_cmd("vllm serve", {"serve": {"port": 9999}}, "M", 8000)
         assert cmd.count("--port") == 1
         assert "9999" in cmd
-
-    def test_build_serve_cmd_python_prepend(self):
-        cmd = bench.build_serve_cmd("vllm serve", {}, "M", 8000, python="/venv/bin/python")
-        assert cmd[0] == "/venv/bin/python"
 
     def test_build_bench_cmd(self):
         workload = {"dataset": "random", "isl": 2048, "osl": 256, "num_prompts": 1000}

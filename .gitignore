@@ -8,6 +8,8 @@ target.yaml
 
 # Generated artifacts (per-run, not part of the template)
 run.log
+status.json
+bench_results/
 results.tsv
 env.json
 env_report.md

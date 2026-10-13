@@ -91,14 +91,18 @@ if sys.argv[1] == "1":
 PYEOF
 }
 
-# 远端是否有 trial 在跑（bench.pid 存在且进程存活）；kill -0 探活
-is_trial_running() {  # $1 = head_ssh
+# 探活远端 trial 三态：echo ALIVE(存活) / DEAD(进程不存在) / UNKNOWN(ssh 失败)
+trial_alive_state() {  # $1 = head_ssh
   local head_ssh="$1" p out rc=0
   p="$(path_for_remote "$REMOTE_DIR")"
   out="$(ssh "${SSH_OPTS[@]}" "$head_ssh" \
-    "if [ -f $p/bench.pid ] && kill -0 \"\$(cat \"$p/bench.pid\")\" 2>/dev/null; then echo ALIVE; fi" 2>/dev/null)" || rc=$?
-  [ "$rc" -eq 0 ] && [ -n "$out" ]
+    "if [ -f $p/bench.pid ] && kill -0 \"\$(cat \"$p/bench.pid\")\" 2>/dev/null; then echo ALIVE; else echo DEAD; fi" 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then echo UNKNOWN; return; fi
+  case "$out" in ALIVE) echo ALIVE ;; DEAD) echo DEAD ;; *) echo UNKNOWN ;; esac
 }
+
+# 远端 trial 是否存活（仅 ALIVE 为真；用于启动前的重复启动守卫）
+is_trial_running() { [ "$(trial_alive_state "$1")" = ALIVE ]; }
 
 # 把远端 $REMOTE_DIR 下某文件回传本机（文件不存在则跳过，失败仅警告）
 rsync_back() {  # $1 = head_ssh  $2 = 远端文件名（相对 REMOTE_DIR）
@@ -115,7 +119,7 @@ cmd_start() {
   local f
   for f in config.yaml harness.yaml target.yaml bench.py; do
     if [ ! -f "$f" ]; then
-      echo "缺少 $f（bench.py 由 Phase 3 Lane A 交付，请确认在仓库根目录）" >&2
+      echo "缺少 $f（请确认在仓库根目录）" >&2
       return 1
     fi
   done
@@ -173,8 +177,20 @@ cmd_poll() {
     return 3
   fi
   if [ -z "$raw" ]; then
-    echo "starting（远端尚无 status.json）；继续: bash run.sh --poll"
-    return 3
+    # 尚无 status.json：可能在启动中，也可能已死在写出首个状态之前（如 vllm CLI 不可达 / 配置错误）。
+    # 探活区分，避免该失败路径在 poll 层变成永久悬挂。
+    case "$(trial_alive_state "$head_ssh")" in
+      DEAD)
+        rsync_back "$head_ssh" result.json
+        echo "远端进程已消失且未产出 status.json（按 crash 处理：常见于 vllm CLI 不可达 / 配置错误，见远端 bench.stdout）"
+        return 1 ;;
+      ALIVE)
+        echo "starting（远端尚无 status.json）；继续: bash run.sh --poll"
+        return 3 ;;
+      *)
+        echo "starting（状态未知，ssh 抖动）；稍后重试: bash run.sh --poll"
+        return 3 ;;
+    esac
   fi
 
   local state phase message
@@ -184,9 +200,20 @@ cmd_poll() {
 
   case "$state" in
     running)
-      # 说明：poll 以 status.json 为准；若进程被外部杀死而 status.json 停留 running，需人工介入
-      echo "running（phase=${phase:-?}${message:+, message=$message}）；仍运行中: bash run.sh --poll"
-      return 3
+      # 以 status.json 为主，但先探活远端进程：DEAD（OOM/断电/被 kill）→ 按 crash 收尾，
+      # 避免 --poll 永久返回 3；UNKNOWN（ssh 抖动）→ 视为仍运行，避免误杀健康 trial。
+      case "$(trial_alive_state "$head_ssh")" in
+        DEAD)
+          rsync_back "$head_ssh" result.json
+          echo "远端进程已消失（按 crash 处理）：${message:-详见远端 status.json / bench.stdout}"
+          return 1 ;;
+        ALIVE)
+          echo "running（phase=${phase:-?}${message:+, message=$message}）；仍运行中: bash run.sh --poll"
+          return 3 ;;
+        *)
+          echo "running（探活 ssh 抖动，暂按运行中）：bash run.sh --poll"
+          return 3 ;;
+      esac
       ;;
     done)
       rsync_back "$head_ssh" result.json
