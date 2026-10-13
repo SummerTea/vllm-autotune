@@ -48,13 +48,13 @@ commit  goodput  output_tok_s  ttft_p99_ms  tpot_p99_ms  peak_vram_gb  dur_s  st
 - `target.yaml` 的 `budget`：`max_hours` 与 `stop_at` 二选一，同时填写时以 `max_hours` 优先；`max_hours` 为运行满 N 小时，`stop_at` 为启动后下一个该时刻（跨天自动理解，按编排机本地时钟）。
 
 ### 平台期
-- 连续 `exit.plateau_trials` 次（默认 8 次）无超过噪声带的改进 → 平台期退出；crash 行不计入平台期序列（只计入崩溃连击）。
+- 连续 `exit.plateau_trials` 次（默认 8 次）无超过噪声带的改进 → 平台期退出；crash 行不推进也不重置平台期连击（只计入崩溃连击）。
 
 ### 崩溃连击
 - 连续 `exit.crash_streak` 次（默认 3 次）crash → 停下并报告，不自动重试结构性改动。
 
 ### deadline 感知调度
-- 每轮开头检查：剩余预算是否 > 预估单 trial 耗时。预估值取 `results.tsv` 历史 `dur_s` 的中位数；无历史时用 `model_profile.json` 的启动耗时 + 一次 bench 粗估，并以 `startup_timeout_s` 作下限兜底。来不及 → 停止开新 trial，进 Phase 4；估算偏低由「在途宽限」兜底。
+- 每轮开头检查：剩余预算是否 ≥ 预估单 trial 耗时；仅当 剩余 < 预估耗时 才停止开新 trial（相等仍可开，超时由「在途宽限」兜底）。预估值取 `results.tsv` 历史 `dur_s` 的中位数；无历史时用 `model_profile.json` 的启动耗时 + 一次 bench 粗估，并以 `startup_timeout_s` 作下限兜底。来不及 → 停止开新 trial，进 Phase 4。
 
 ### 在途宽限
 - deadline 到时正在跑的 trial 让它跑完，再进 Phase 4。

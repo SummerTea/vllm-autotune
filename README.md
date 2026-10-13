@@ -37,9 +37,10 @@
 | `README.md` | 本文件 | 只读 |
 | `probe.py` | 多机环境探测（并行）→ env.json / env_report.md / model_profile.json | 只读 |
 | `bench.py` | 远端起服 + `vllm bench serve --goodput` 度量 + 僵尸清理 | 只读 |
-| `report.py` | 收尾汇总 → report.md | 只读（后续阶段交付） |
+| `report.py` | 收尾汇总 → report.md（基线 vs 最佳 + 全部 trial + 系统级建议） | 只读 |
 | `run.sh` | 两段式执行：rsync + 远端 nohup 启动 + 轮询状态 | 只读 |
 | `setup_remote.sh` | head 主机一次性环境准备（pin vLLM 版本） | 只读 |
+| `scripts/mock_loop.py` | 循环规则的可执行规格/演示（REFERENCE，供离线核对 program.md 规则） | 只读 |
 | `docs/vllm-facts.md` | 模板依赖的 vLLM 行为事实（版本相关，升级需重新核对） | 只读 |
 | `pyproject.toml` / `LICENSE` / `.gitignore` | 工程元数据 | 只读 |
 
@@ -64,7 +65,14 @@
 2. 用初始 `config.yaml`（基线）跑 `bash run.sh` 并轮询 `bash run.sh --poll` 至退出 0，确认 bench 出数正常。
 3. 跑一次短预算循环，确认 keep / discard 判定与三层退出逻辑正确。
 
-> 注：`probe.py` / `bench.py` / `run.sh` / `setup_remote.sh` 均已交付（清单第 1、2 条可执行）；仅 `report.py` 留待后续阶段交付，届时第 3 条可执行。
+> 注：全部脚本均已交付（清单 1/2/3 条均可执行）。离线排练：`uv run pytest -q` 无需 GPU/网络即可跑通 probe → bench → report 的 mock 全链路与循环规则核对。
+
+## 如何解读 report.md
+
+- 「基线 vs 最佳」：goodput 提升 % =（最佳 − 基线）/ 基线；若标注「⚠ 无满足 SLO 的 trial」，则最佳为回退选择（全部已测量行中最高），需人工复核 SLO 是否过严。
+- 「全部 trial 表」：按 goodput 降序，SLO 达标列一眼看出哪些配置可用。
+- 「最佳配置」：内嵌 `git show <best_commit>:config.yaml` 的快照（git 不可用时提示手动查看）。
+- 「系统级建议」：来自 `env_report.md` 的 warn/fail 项，均为人工可执行建议（v1 不自动改）。
 
 ## 依赖
 

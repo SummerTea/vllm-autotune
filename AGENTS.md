@@ -7,7 +7,7 @@
 ## 你的权限边界
 
 - **只编辑 `config.yaml`**。它是一次实验的全部输入：`env`（进程级环境变量）、`model`（可选覆盖）、`serve`（vLLM serve 参数）。
-- 除 `config.yaml` 外，本仓库所有文件均为只读（含 `README.md`、`docs/`、`.env`、`pyproject.toml`、`target.example.yaml` 等）。
+- 除 `config.yaml` 外，本仓库所有文件均为只读（含 `README.md`、`docs/`、`scripts/`、`.env`、`pyproject.toml`、`target.example.yaml` 等）。
 - 背景信息缺项时（如 target.yaml 缺主机 / 模型 / SLO / 预算）**向人类提问，不要编造**。
 
 ## 四阶段流程
@@ -40,7 +40,7 @@
 ### Phase 4 — 收尾
 - **读**：`results.tsv`、`env_report.md`。
 - **跑**：`python report.py`。
-- **产出**：`report.md`——推荐配置 vs 基线对比、SLO 是否达标、系统级建议项（不自动改）。
+- **产出**：`report.md`——基线 vs 最佳对比（含 goodput 提升 %）、全部 trial 表（SLO 达标标注）、最佳配置（config.yaml 快照）、系统级建议项（不自动改）、适用范围（v1 单节点结论，跨机不外推）。
 
 ## 结果与日志约定
 
