@@ -1,0 +1,15 @@
+{
+  "version": "1.0.0",
+  "updatedAt": "2026-10-14T00:27:00.000Z",
+  "dependencies": [
+    {
+      "name": "vllm auto_tune (benchmarks/auto_tune)",
+      "resolvedVersion": "0.31.0",
+      "repoUrl": "https://github.com/vllm-project/vllm.git",
+      "ref": "v0.31.0",
+      "path": ".slim/clonedeps/repos/vllm-project__vllm",
+      "packagePath": "benchmarks/auto_tune",
+      "reason": "官方 vLLM serve 参数自动调优脚本（网格 + --goodput SLO 搜索），是本模板循环的同构先例，用于借鉴"
+    }
+  ]
+}
