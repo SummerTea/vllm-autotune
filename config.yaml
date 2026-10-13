@@ -1,0 +1,15 @@
+# config.yaml — ★ agent 唯一编辑的文件。这是"一次实验"的全部输入。
+# 每次实验只改这里，然后 commit + 运行 run.sh。
+# 基线状态：serve 为空，即除必要参数外不加任何调优项。
+
+env: {}                         # 进程级环境变量，随每次 server 启动注入（如 NCCL_*、VLLM_*）
+
+model:                          # 可选：覆盖 target.yaml 的模型（如量化变体 repo id）。留空则不覆盖。
+serve: {}                       # vLLM serve 参数，kebab-case 作为 CLI flag。例如：
+# serve:
+#   max-num-seqs: 256
+#   max-num-batched-tokens: 8192
+#   gpu-memory-utilization: 0.92
+#   kv-cache-dtype: fp8
+#   enable-prefix-caching: true
+#   tensor-parallel-size: 8

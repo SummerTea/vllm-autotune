@@ -1,0 +1,24 @@
+[project]
+name = "vllm-autotune"
+version = "0.1.0"
+description = "Agent-driven autonomous loop for tuning vLLM serving parameters on real GPU hosts"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+# 纯脚本工程：不作为 Python 包安装/构建，uv 只管理依赖。
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

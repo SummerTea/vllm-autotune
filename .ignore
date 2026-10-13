@@ -1,0 +1,3 @@
+# Keep deepwork state readable to OpenCode even though git ignores it.
+!.slim/deepwork/
+!.slim/deepwork/**

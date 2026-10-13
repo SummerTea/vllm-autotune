@@ -1,0 +1,29 @@
+# harness.yaml — 只读。全局默认值与循环控制参数。
+# 修改此文件会破坏实验可比性；使用者应通过 target.yaml 覆盖允许的项。
+# 本文件由 bench.py / report.py / program.md 共同引用。
+
+bench:
+  tool: vllm bench serve        # 真实的度量命令（非可执行别名）
+  repeats: 2                    # 每个配置重复次数，取中位数抗噪
+  noise_band_pct: 3.0           # 改进需超过该百分比才算有效提升（keep 阈值）
+  startup_timeout_s: 1200       # 服务器启动就绪超时（大模型加载可能很慢）
+  trial_timeout_s: 2400         # 单次实验硬超时
+  ref_concurrency: 128          # 参考并发点
+
+slo:                            # goodput 约束；可被 target.yaml 的 metrics.slo 覆盖
+  ttft_p99_ms: 500
+  tpot_p99_ms: 50
+
+workload:                       # 合成 workload 默认；可被 target.yaml 的 workload 覆盖
+  dataset: random
+  isl: 2048
+  osl: 256
+  num_prompts: 1000
+
+exit:                           # 三层退出（主退出 max_hours/stop_at 来自 target.yaml budget）
+  plateau_trials: 8             # 连续 N 次无超过 noise_band_pct 的改进 → 平台期退出
+  crash_streak: 3               # 连续 N 次 crash → 停下并报告
+
+remote:
+  vllm_port: 8000               # head 节点上 vllm serve 绑定的端口
+  vllm_python: python           # 远端运行 vllm 的 python 解释器

@@ -1,0 +1,33 @@
+# target.example.yaml — 复制为 target.yaml 后填写。这是唯一需要你提供的背景信息。
+# 缺项时编码 agent 会向你提问，不会自行假设。
+
+hosts:                          # 1..N 台。v1 只在 role=head 的主机上跑实验，其余仅做采集探测。
+  - name: head
+    ssh: user@10.0.0.1          # 可路由的 ssh 目标
+    role: head
+  # - name: worker1
+  #   ssh: user@10.0.0.2
+  #   role: worker
+
+model:
+  id: Qwen/Qwen3-32B            # HF 模型 id 或本地路径
+  source: hf                    # hf | local
+  # path: /models/qwen3-32b     # source=local 时必填
+  trust_remote_code: false
+  # hf_token_env: HF_TOKEN      # gated 模型时填写环境变量名
+
+metrics:                        # 可选。缺省则用 harness.yaml 的默认 SLO。
+  slo:
+    ttft_p99_ms: 500
+    tpot_p99_ms: 50
+
+workload:                       # 可选。缺省则用 harness.yaml 默认。
+  dataset: random               # random | sharegpt
+  isl: 2048
+  osl: 256
+  num_prompts: 1000
+  ref_concurrency: 128         # 覆盖 harness.yaml 的 bench.ref_concurrency（参考并发点）
+
+budget:                         # 主退出条件（过夜场景必填；max_hours 与 stop_at 二选一，同时填写时 max_hours 优先）
+  max_hours: 10                 # 运行满 N 小时后停止
+  # stop_at: "08:00"            # 或指定停止时刻（启动后下一个该时刻，按编排机本地时钟，跨天自动理解）

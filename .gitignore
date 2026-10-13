@@ -1,0 +1,23 @@
+# Deepwork session state (git-local, OpenCode-readable via .ignore)
+.slim/deepwork/
+
+# Local instance config & secrets
+.env
+target.yaml                     # 本地实例配置，含 ssh 主机地址，勿提交
+
+# Generated artifacts (per-run, not part of the template)
+run.log
+results.tsv
+env.json
+env_report.md
+model_profile.json
+report.md
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.uv/
+
+# OS
+.DS_Store
