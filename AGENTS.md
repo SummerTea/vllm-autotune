@@ -58,3 +58,5 @@
 ## 循环细则
 
 调优循环的决策规则、搜索空间剪枝与三层退出机制，见 **[program.md](program.md)**。
+
+工程级 skills（`vllm-bench-serve` / `vllm-deploy-docker` / `vllm-prefix-cache-bench`）在 `.agents/skills/`；外部调研与后续路线图见 `docs/external-resources.md` / `docs/roadmap.md`。

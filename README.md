@@ -42,6 +42,10 @@
 | `setup_remote.sh` | 主机环境校验/可选准备（docker 只校验镜像；native 默认只检查不安装，仅 `install_allowed` 时在 work_dir 内 pin vLLM） | 只读 |
 | `scripts/mock_loop.py` | 循环规则的可执行规格/演示（REFERENCE，供离线核对 program.md 规则） | 只读 |
 | `docs/vllm-facts.md` | 模板依赖的 vLLM 行为事实（版本相关，升级需重新核对） | 只读 |
+| `docs/external-resources.md` | 外部 skills / MCP / 工具调研（vLLM 调优生态） | 只读 |
+| `docs/roadmap.md` | 后续路线图（v1.1 证据/验收层、v2 架构扩展） | 只读 |
+| `.agents/skills/` | 工程级 agent skills（vllm-bench-serve / vllm-deploy-docker / vllm-prefix-cache-bench，版本由 skills-lock.json 锁定） | 只读 |
+| `skills-lock.json` | skills 来源与哈希锁定（防漂移） | 只读 |
 | `pyproject.toml` / `LICENSE` / `.gitignore` | 工程元数据 | 只读 |
 
 ## Design choices
@@ -74,12 +78,30 @@
 - **默认不 pull 镜像、不安装环境**：docker 模式只使用主机上已预先准备的镜像（`docker image inspect` 校验，缺失则 FAIL 提示人工准备）；native 模式默认不安装任何环境。
 - 需要安装时显式设 `runtime.install_allowed: true`，且**仅**在 `work_dir` 内建 venv（绝不全局安装）。
 
+## 推荐 skills（工程级 `.agents/`）
+
+仓库已内置 3 个工程级 agent skills（来源 `vllm-project/vllm-skills`，由 `skills-lock.json` 锁定版本）：
+
+| skill | 用途 |
+|---|---|
+| `vllm-bench-serve` | `vllm bench serve` 基准运行（与模板度量一致） |
+| `vllm-deploy-docker` | vLLM 的 docker 部署/参数核对（与 docker 运行时互补） |
+| `vllm-prefix-cache-bench` | prefix-caching 专项压测（`enable-prefix-caching` 调优证据） |
+
+添加更多：`npx skills add vllm-project/vllm-skills`（或 NVIDIA/skills 等，见 `docs/external-resources.md`）。注意 CLI 会为其他 harness 创建 gitignore 掉的软链接。
+
 ## 如何解读 report.md
 
 - 「基线 vs 最佳」：goodput 提升 % =（最佳 − 基线）/ 基线；若标注「⚠ 无满足 SLO 的 trial」，则最佳为回退选择（全部已测量行中最高），需人工复核 SLO 是否过严。
 - 「全部 trial 表」：按 goodput 降序，SLO 达标列一眼看出哪些配置可用。
 - 「最佳配置」：内嵌 `git show <best_commit>:config.yaml` 的快照（git 不可用时提示手动查看）。
 - 「系统级建议」：来自 `env_report.md` 的 warn/fail 项，均为人工可执行建议（v1 不自动改）。
+
+## 更多文档
+
+- `docs/vllm-facts.md` — vLLM 行为事实（bench CLI / 输出字段 / 启动校准行）。
+- `docs/external-resources.md` — 外部 skills / MCP / 工具调研（vLLM 调优生态）。
+- `docs/roadmap.md` — 后续路线图（v1.1：监控证据层 / GuideLLM 验收 / nvbandwidth 拓扑实测 / lm-eval 精度 gate / vllm-tuner 大脑；v2：跨机执行 / PD 分离 / Dynamo AIConfigurator / 系统参数白名单）。
 
 ## 依赖
 

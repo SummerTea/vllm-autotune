@@ -78,7 +78,18 @@ print(str((runtime.get("install_allowed") or False)).lower())
 PYEOF
 }
 
+usage() {
+  cat <<'EOF'
+用法: bash setup_remote.sh
+  对 head 主机做零破坏环境校验（docker 校验镜像 / native 只检查不安装）+ 主机工具清单。
+  --help | -h  显示本帮助
+EOF
+}
+
 main() {
+  case "${1:-}" in
+    --help | -h) usage; return 0 ;;
+  esac
   local out head_ssh work_dir vllm_python runtime_kind runtime_image install_allowed
   out="$(extract_head)" || exit 1
   head_ssh="$(printf '%s\n' "$out" | sed -n '1p')"
@@ -227,6 +238,37 @@ else
     bad "创建 $WORK_DIR 失败"
   fi
 fi
+
+# ── [5/5] 主机工具清单（只读检测，零安装；信息性，不计入 PASS/FAIL）──────
+echo ""
+echo "== [5/5] 主机工具清单（只读；缺失不影响本模板默认运行） =="
+check_tool() {  # $1 = 工具名  $2 = 检测命令  $3 = 用途
+  if eval "$2" >/dev/null 2>&1; then
+    printf '   %-14s present   (%s)\n' "$1" "$3"
+  else
+    printf '   %-14s MISSING  (%s)\n' "$1" "$3"
+  fi
+}
+# 必需（按运行时分支）
+check_tool "nvidia-smi" "command -v nvidia-smi" "必需：GPU 枚举/显存/时钟"
+check_tool "python3"    "command -v python3"    "必需：远端运行 bench.py"
+check_tool "pyyaml"     "$VLLM_PYTHON -c 'import yaml'" "必需：bench.py 依赖"
+if [ "$RUNTIME_KIND" = "docker" ]; then
+  check_tool "docker" "command -v docker" "必需（docker 运行时）：容器执行"
+else
+  check_tool "uv" "command -v uv" "必需（native 运行时）：环境管理（仅 install_allowed 时用）"
+fi
+# 推荐（v1.1 路线图相关，见 docs/roadmap.md）
+check_tool "nsys"            "command -v nsys"            "推荐：Nsight Systems profiling"
+check_tool "ib_write_bw"     "command -v ib_write_bw"      "推荐：perftest，RDMA 带宽"
+check_tool "nvbandwidth"     "command -v nvbandwidth"       "推荐：NVLink/PCIe 实测带宽"
+check_tool "all_reduce_perf" "command -v all_reduce_perf"   "推荐：nccl-tests 集合带宽"
+check_tool "dcgmi"           "command -v dcgmi"             "推荐：DCGM 命令行"
+check_tool "dcgm-exporter"   "command -v dcgm-exporter"     "推荐：DCGM Prometheus exporter(9400)"
+check_tool "nvitop"          "command -v nvitop"            "推荐：GPU 监控 TUI/JSON"
+check_tool "gpustat"         "command -v gpustat"           "推荐：GPU 监控（nvitop 替代）"
+check_tool "prometheus"      "command -v prometheus"        "推荐：指标存储 + prometheus-mcp"
+echo "  缺失工具不影响本模板默认运行；可按 docs/roadmap.md 补齐（推荐项为 v1.1 可选增强）"
 
 printf '\nSUMMARY: %s（%d PASS / %d FAIL）\n' "$([ "$FAIL" -eq 0 ] && echo PASS || echo FAIL)" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
