@@ -14,11 +14,11 @@ import report  # noqa: E402
 SLO = {"ttft_p99_ms": 500, "tpot_p99_ms": 50}
 
 TSV = (
-    "commit\tgoodput\toutput_tok_s\tttft_p99_ms\ttpot_p99_ms\tpeak_vram_gb\tdur_s\tstatus\tdescription\n"
-    "aaaa111\t10.0\t9000.0\t420.1\t18.3\t71.2\t912.4\tkeep\t基线（mock）\n"
-    "bbbb222\t10.2\t9200.0\t430.2\t19.1\t71.5\t910.0\tdiscard\tmax-num-seqs 256\n"
-    "cccc333\t11.0\t9800.0\t450.0\t20.0\t72.0\t905.0\tkeep\tgpu-memory-utilization 0.92\n"
-    "dddd444\t\t\t\t\t\t\tcrash\tOOM\n"
+    "commit\tgoodput\tgoodput_std\toutput_tok_s\tttft_p99_ms\ttpot_p99_ms\tpeak_vram_gb\tdur_s\tstatus\tdescription\n"
+    "aaaa111\t10.0\t0.2\t9000.0\t420.1\t18.3\t71.2\t912.4\tkeep\t基线（mock）\n"
+    "bbbb222\t10.2\t0.3\t9200.0\t430.2\t19.1\t71.5\t910.0\tdiscard\tmax-num-seqs 256\n"
+    "cccc333\t11.0\t0.5\t9800.0\t450.0\t20.0\t72.0\t905.0\tkeep\tgpu-memory-utilization 0.92\n"
+    "dddd444\t\t\t\t\t\t\t\tcrash\tOOM\n"
 )
 
 
@@ -37,6 +37,7 @@ class TestParseTsv:
     def test_numeric_coercion(self):
         rows = _rows()
         assert rows[0]["goodput"] == 10.0
+        assert rows[0]["goodput_std"] == 0.2          # 新列 numeric
         assert rows[0]["dur_s"] == 912.4
         assert rows[1]["goodput"] == 10.2
 

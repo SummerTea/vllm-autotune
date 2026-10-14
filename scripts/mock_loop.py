@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 NOISE_BAND_PCT = 3.0   # 内置默认（与 harness.yaml 当前值一致）
+NOISE_K_SIGMA = 2.0    # 显著性倍数 k（与 harness.yaml 当前值一致）
 PLATEAU_TRIALS = 8     # harness.yaml exit.plateau_trials
 CRASH_STREAK = 3       # harness.yaml exit.crash_streak
 
@@ -22,8 +23,9 @@ except ImportError:  # pragma: no cover
 
 
 def _load_thresholds():
-    """阈值优先取自仓库根 harness.yaml（bench.noise_band_pct / exit.plateau_trials /
-    exit.crash_streak），缺失/不可读时回退内置默认——脚本独立可跑，阈值不会静默漂移。"""
+    """阈值优先取自仓库根 harness.yaml（bench.noise_band_pct / bench.noise_k_sigma /
+    exit.plateau_trials / exit.crash_streak），缺失/不可读时回退内置默认——脚本独立可跑，
+    阈值不会静默漂移。"""
     repo_root = Path(__file__).resolve().parent.parent
     try:
         if yaml is not None:
@@ -32,22 +34,24 @@ def _load_thresholds():
             b = h.get("bench") or {}
             e = h.get("exit") or {}
             return (float(b.get("noise_band_pct", NOISE_BAND_PCT)),
+                    float(b.get("noise_k_sigma", NOISE_K_SIGMA)),
                     int(e.get("plateau_trials", PLATEAU_TRIALS)),
                     int(e.get("crash_streak", CRASH_STREAK)))
     except (OSError, ValueError, TypeError):
         pass
-    return NOISE_BAND_PCT, PLATEAU_TRIALS, CRASH_STREAK
+    return NOISE_BAND_PCT, NOISE_K_SIGMA, PLATEAU_TRIALS, CRASH_STREAK
 
 
 # 阈值来自 harness.yaml（可用时）；否则用内置默认
-NOISE_BAND_PCT, PLATEAU_TRIALS, CRASH_STREAK = _load_thresholds()
+NOISE_BAND_PCT, NOISE_K_SIGMA, PLATEAU_TRIALS, CRASH_STREAK = _load_thresholds()
 
 
-def decide(trial_goodput, best_goodput, noise_band_pct=NOISE_BAND_PCT, slo_ok=True):
-    """决策规则（program.md §决策规则）：
-    - keep   ：goodput 相比当前最佳提升 > 噪声带，且 SLO 达标；
-    - discard：提升 ≤ 噪声带（含变差）或 SLO 不达标；
-    - crash  ：启动失败 / OOM / 超时（调用方传 trial_goodput=None）。
+def decide(trial_goodput, best_goodput, sigma=0.0, noise_band_pct=NOISE_BAND_PCT,
+           noise_k_sigma=NOISE_K_SIGMA, slo_ok=True):
+    """决策规则（program.md §决策规则，统一单位 req/s）：
+    keep   ：(trial − best) > max(best × noise_band_pct/100, noise_k_sigma × σ)，且 SLO 达标；
+    discard：提升 ≤ 阈值（含变差）或 SLO 不达标；
+    crash  ：启动失败 / OOM / 超时（调用方传 trial_goodput=None）。
     首个有效 trial（best 尚为 None）即成为当前最佳。"""
     if trial_goodput is None:
         return "crash"
@@ -55,7 +59,8 @@ def decide(trial_goodput, best_goodput, noise_band_pct=NOISE_BAND_PCT, slo_ok=Tr
         return "discard"
     if best_goodput is None:
         return "keep" if trial_goodput > 0 else "discard"
-    if trial_goodput > best_goodput * (1 + noise_band_pct / 100.0):
+    threshold = max(best_goodput * noise_band_pct / 100.0, noise_k_sigma * (sigma or 0.0))
+    if (trial_goodput - best_goodput) > threshold:
         return "keep"
     return "discard"
 
@@ -74,8 +79,10 @@ class LoopState:
         self.best_goodput = None
         self.best_commit = None
 
-    def step(self, trial_goodput, slo_ok, noise_band_pct=NOISE_BAND_PCT, commit=None):
-        d = decide(trial_goodput, self.best_goodput, noise_band_pct, slo_ok)
+    def step(self, trial_goodput, slo_ok, noise_band_pct=NOISE_BAND_PCT, sigma=0.0,
+             noise_k_sigma=NOISE_K_SIGMA, commit=None):
+        d = decide(trial_goodput, self.best_goodput, sigma, noise_band_pct,
+                   noise_k_sigma, slo_ok)
         if d == "crash":
             self.crash_count += 1            # plateau_count 不前进（program.md §平台期）
         elif d == "keep":
@@ -133,8 +140,9 @@ def _pct_str(g, best):
 def main() -> int:
     print("== mock_loop.py：program.md 循环规则的可执行规格（REFERENCE）==")
     print("   真实循环由编码 agent 驱动；此处仅离线核对规则行为。")
-    print(f"   阈值：noise_band_pct={NOISE_BAND_PCT} plateau_trials={PLATEAU_TRIALS} "
-          f"crash_streak={CRASH_STREAK}（取自仓库根 harness.yaml，缺失时回退内置默认）\n")
+    print(f"   阈值：noise_band_pct={NOISE_BAND_PCT} noise_k_sigma={NOISE_K_SIGMA} "
+          f"plateau_trials={PLATEAU_TRIALS} crash_streak={CRASH_STREAK}（取自仓库根 harness.yaml，"
+          f"缺失时回退内置默认）\n")
 
     state = LoopState()
     for i, (commit, gp, slo_ok) in enumerate(_SCENARIO, 1):

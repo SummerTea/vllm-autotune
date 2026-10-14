@@ -14,6 +14,7 @@
 
 import json
 import os
+import statistics
 import sys
 import time
 import urllib.error
@@ -89,6 +90,33 @@ class TestParsers:
         os.utime(b, (future, future))
         assert bench.find_newest_json(str(tmp_path)) == str(b)
         assert bench.find_newest_json(str(tmp_path / "nope")) is None
+
+    def test_repeats_stats_stdev(self):
+        # σ：n≥2 用样本标准差（与实现一致的四舍五入到 4 位）；n<2 → 0.0；None 值不参与
+        rows = [{"goodput": 10.0}, {"goodput": 12.0}, {"goodput": 11.0}]
+        assert bench._repeats_stats(rows, "goodput") == pytest.approx(
+            round(statistics.stdev([10.0, 12.0, 11.0]), 4))
+        assert bench._repeats_stats([{"goodput": 10.0}], "goodput") == 0.0
+        assert bench._repeats_stats([], "goodput") == 0.0
+        mixed = [{"goodput": 10.0}, {"goodput": None}, {"goodput": 14.0}]
+        assert bench._repeats_stats(mixed, "goodput") == pytest.approx(
+            round(statistics.stdev([10.0, 14.0]), 4))
+
+    def test_parse_compute_apps(self):
+        # 有效行 + "512 MiB"/"2.5 GiB"（取首个整数）+ 内存 [N/A] 容忍 + 坏行跳过
+        text = "1234, /usr/bin/python3, 512 MiB\n" \
+               "5678, worker, [N/A]\n" \
+               "[N/A], python, 100 MiB\n" \
+               "badrow\n" \
+               "9999, torchrun, 2.5 GiB\n"
+        apps = bench.parse_compute_apps(text)
+        assert apps == [
+            {"pid": 1234, "process_name": "/usr/bin/python3", "used_memory_mib": 512},
+            {"pid": 5678, "process_name": "worker", "used_memory_mib": None},
+            {"pid": 9999, "process_name": "torchrun", "used_memory_mib": 2},
+        ]
+        assert bench.parse_compute_apps(None) == []
+        assert bench.parse_compute_apps("") == []
 
 
 class TestDockerRuntime:
@@ -503,6 +531,11 @@ def test_docker_lifecycle_with_stub_docker(tmp_path, capsys, monkeypatch):
     sout = capsys.readouterr().out
     assert "---\nstatus: ok" in sout
     assert "goodput: 12.84" in sout
+    assert "goodput_std:" in sout                             # σ 行进 summary 块
+    # stats：repeats=2 → [12.34, 13.34] 的样本 σ > 0（与实现一致的四舍五入）
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["stats"]["goodput_std"] == pytest.approx(
+        round(statistics.stdev([12.34, 13.34]), 4))
 
 
 def test_docker_crash_serve_exits(tmp_path, capsys, monkeypatch):

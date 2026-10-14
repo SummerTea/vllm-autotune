@@ -18,7 +18,9 @@ run.log，并用启动日志实测值就地校准 model_profile.json，最后 do
     status.json   {"state":"running|done|crash","phase":"loading|benching|done|crash",
                    "started_at":ISO,"updated_at":ISO,"message":str}
     result.json   成功 {"status":"ok", goodput_req_s, output_tok_s, ttft_p99_ms, tpot_p99_ms,
-                        peak_vram_gb, dur_s, repeats, env_fingerprint, calibration}
+                        stats:{goodput_std,...}（repeats 样本 σ）, peak_vram_gb, dur_s,
+                        repeats, env_fingerprint, calibration,
+                        contention?（检测到共租 GPU 进程时）}
                    失败 {"status":"crash","reason":str, ...}
     run.log       vllm serve 容器的 stdout/stderr（另附 bench 每次调用的标注与输出，便于排障）
     model_profile.json 就地校准 boot.measured_seconds / kv.measured_capacity_tokens / calibrated=true
@@ -147,6 +149,32 @@ def find_newest_json(d: str) -> str | None:
     except OSError:
         return None
     return max(cands, key=os.path.getmtime) if cands else None
+
+
+def parse_compute_apps(text: str | None) -> list[dict]:
+    """nvidia-smi --query-compute-apps=pid,process_name,used_memory →
+    [{"pid":int, "process_name":str|None, "used_memory_mib":int|None}]。
+    used_memory 形如 "512 MiB"（取首个整数）；[N/A]/空/坏行跳过（尽力而为）。"""
+    if not text:
+        return []
+    apps = []
+    for line in text.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3 or not parts[0].isdigit():
+            continue  # pid 列必须是数字；[N/A]/表头/坏行跳过
+        m = re.search(r"\d+", parts[2])
+        apps.append({
+            "pid": int(parts[0]),
+            "process_name": parts[1] if parts[1] not in ("", "[N/A]", "N/A") else None,
+            "used_memory_mib": int(m.group(0)) if m else None,
+        })
+    return apps
+
+
+def _repeats_stats(results: list[dict], key: str) -> float:
+    """repeats 样本标准差：n≥2 用 statistics.stdev；n<2 → 0.0（退化）。"""
+    vals = [r[key] for r in results if r[key] is not None]
+    return round(statistics.stdev(vals), 4) if len(vals) >= 2 else 0.0
 
 
 # ── 命令构建（单元测试目标）─────────────────────────────────────────────
@@ -542,6 +570,17 @@ def _vram_sampler(stop: threading.Event, interval: float, peak_mib: list[int]) -
             peak_mib.append(max(vals))
 
 
+def _detect_co_tenants() -> list[dict]:
+    """trial 开始前探测共租：nvidia-smi compute-apps 有输出 → 非独占主机。
+    无 nvidia-smi（如开发机 Mac）/ 空输出 → []（优雅跳过）。"""
+    rc, out, _ = _run_local(
+        ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
+         "--format=csv,noheader"])
+    if rc != 0 or not out.strip():
+        return []
+    return parse_compute_apps(out)
+
+
 def _wait_mem_freed(timeout: float = 30) -> None:
     """等待 nvidia-smi 显存释放；无 nvidia-smi → 立即返回（尽力而为）。"""
     end = time.monotonic() + timeout
@@ -640,6 +679,7 @@ def _print_summary(result: dict) -> None:
     print(f"status: {result['status']}")
     if result["status"] == "ok":
         print(f"goodput: {_fmt(result['goodput_req_s'])}")
+        print(f"goodput_std: {_fmt((result.get('stats') or {}).get('goodput_std'))}")
         print(f"output_tok_s: {_fmt(result['output_tok_s'])}")
         print(f"ttft_p99_ms: {_fmt(result['ttft_p99_ms'])}")
         print(f"tpot_p99_ms: {_fmt(result['tpot_p99_ms'])}")
@@ -685,7 +725,7 @@ def main(argv: list[str] | None = None) -> int:
     if not model:
         _err("config.yaml 与 target.yaml 都未提供模型 id。")
     assert model is not None  # _err 已 exit
-    repeats = int(bench_cfg.get("repeats", 2))
+    repeats = int(bench_cfg.get("repeats", 3))
     startup_timeout_s = float(bench_cfg.get("startup_timeout_s", 1200))
     trial_timeout_s = float(bench_cfg.get("trial_timeout_s", 2400))
     seed = int(bench_cfg.get("seed", DEFAULT_SEED))
@@ -734,6 +774,16 @@ def main(argv: list[str] | None = None) -> int:
         if _run_local([args.docker_cmd, "image", "inspect", img])[0] != 0:
             raise TrialCrash(f"镜像 {img} 未在主机预先准备（本模板不自动拉取，保持主机零新增；"
                              "请人工预先 docker pull 或改用已存在的镜像）")
+        # 先清残留同名容器（幂等）：硬杀遗留的同名容器不算外来共租，须在共租检测前清理
+        docker_clean_stale(args.docker_cmd)
+        # 共租检测（起 serve 之前）：非独占主机上其他 GPU 进程会污染测量
+        foreign_apps = _detect_co_tenants()
+        contention = None
+        if foreign_apps:
+            contention = {"foreign_gpu_apps": foreign_apps, "checked_at": _now_iso()}
+            if bool(bench_cfg.get("require_idle", False)):
+                raise TrialCrash("主机非空闲：检测到其他 GPU 进程 "
+                                 f"{[a['pid'] for a in foreign_apps]}（require_idle=true 要求独占）")
         # 起 serve（attach → run.log）并轮询 /health 就绪；与 --detect-gmu 共用同一 helper
         _start_serve_and_wait(args.docker_cmd, runtime, host_model_path, port, config,
                               log_fh, log_path, deadline, startup_timeout_s,
@@ -742,6 +792,9 @@ def main(argv: list[str] | None = None) -> int:
         kv_tokens = kv_sink[0]
         load_seconds = round(time.monotonic() - start_mono, 1)
         msg = f"就绪（load={load_seconds}s，runtime=docker），开始 bench（repeats={repeats}）"
+        if contention:
+            msg += (f"；⚠ 检测到其他 GPU 进程（共租，测量可能受扰）："
+                    f"{[a['pid'] for a in contention['foreign_gpu_apps']]}")
         if diff:
             msg += f"；环境指纹变化：{diff}"
         _write_status(out_dir, "running", "benching", msg, started_at)
@@ -772,6 +825,9 @@ def main(argv: list[str] | None = None) -> int:
             med = {k: (statistics.median([r[k] for r in results if r[k] is not None])
                       if any(r[k] is not None for r in results) else None)
                    for k in ("goodput", "output_tok_s", "ttft_p99_ms", "tpot_p99_ms")}
+            # σ：repeats 样本标准差（n<2 → 0.0），keep 判定用（noise_k_sigma×σ 显著性口径）
+            stats = {k: _repeats_stats(results, k)
+                     for k in ("goodput", "output_tok_s", "ttft_p99_ms", "tpot_p99_ms")}
         finally:
             stop.set()
             vram_thread.join(timeout=5)
@@ -788,12 +844,19 @@ def main(argv: list[str] | None = None) -> int:
             "output_tok_s": med["output_tok_s"],
             "ttft_p99_ms": med["ttft_p99_ms"],
             "tpot_p99_ms": med["tpot_p99_ms"],
+            "stats": {
+                "goodput_std": stats["goodput"],
+                "output_tok_s_std": stats["output_tok_s"],
+                "ttft_p99_std": stats["ttft_p99_ms"],
+                "tpot_p99_std": stats["tpot_p99_ms"],
+            },
             "peak_vram_gb": peak_gb,
             "dur_s": dur_s,
             "repeats": repeats,
             "env_fingerprint": fingerprint,
             "calibration": calibration,
             "started_at": started_at,
+            **({"contention": contention} if contention else {}),
         }
     except TrialCrash as c:
         kv_tokens = kv_sink[0]  # serve 死在启动期也可能已扫到 KV 行，保留进 calibration

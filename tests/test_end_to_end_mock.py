@@ -75,10 +75,11 @@ def test_full_pipeline(tmp_path):
     assert status["state"] == "done"
 
     # (c) 把本次 trial 追加进 results.tsv（status=keep，SLO 不达标 → 回退路径可被 report 展示）
-    header = "commit\tgoodput\toutput_tok_s\tttft_p99_ms\ttpot_p99_ms\tpeak_vram_gb\tdur_s\tstatus\tdescription"
+    header = "commit\tgoodput\tgoodput_std\toutput_tok_s\tttft_p99_ms\ttpot_p99_ms\tpeak_vram_gb\tdur_s\tstatus\tdescription"
     row = "\t".join([
         "deadbeef",
         str(result["goodput_req_s"]),
+        str((result.get("stats") or {}).get("goodput_std")),
         str(result["output_tok_s"]),
         str(result["ttft_p99_ms"]),
         str(result["tpot_p99_ms"]),

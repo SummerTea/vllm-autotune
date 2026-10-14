@@ -9,6 +9,8 @@
 ## 指标定义
 
 - **goodput** = 满足 SLO 的成功请求吞吐，来自 `vllm bench serve --goodput ttft:<slo.ttft_p99_ms> tpot:<slo.tpot_p99_ms>` 输出的 `request_goodput`（单位 **req/s**，只统计同时满足全部 SLO 的成功请求）。工具细节见 `docs/vllm-facts.md`。
+- **σ（goodput_std）** = 本次 trial `bench.repeats`（默认 3）次测量的**样本标准差**（`statistics.stdev`；n<2 时退化为 0.0），由 `bench.py` 写入 `result.json` 的 `stats.goodput_std` 与 `results.tsv` 的 `goodput_std` 列。显著性口径：keep 阈值 = `max(best × noise_band_pct/100, noise_k_sigma × σ)`（统一单位 req/s，见「决策规则」）。
+- **非独占主机（共租）**：`bench.py` 在起 serve 前检测 `nvidia-smi --query-compute-apps`；检测到其他 GPU 进程 → `result.json` 记录 `contention`（含 pid 列表）并在 status 告警；`bench.require_idle=true` 时直接判 crash（主机非空闲）。共租会污染吞吐/时延测量，建议尽量独占主机；无 nvidia-smi 的主机（如开发机 Mac）自动跳过检测。
 - SLO 取值：`target.yaml` 的 `metrics.slo`；缺省用 `harness.yaml` 的 `slo` 占位。
 - workload 与参考并发点固定：`target.yaml` 的 `workload`（**逐键覆盖**：target 未填的键回退 `harness.yaml` 默认）；缺省整块用 `harness.yaml` 的 `workload` 与 `bench.ref_concurrency`。
 - **参考并发点映射**：`vllm bench serve --request-rate inf --max-concurrency <ref_concurrency>`；覆盖路径：`target.yaml` 的 `workload.ref_concurrency` 覆盖 `harness.yaml` 的 `bench.ref_concurrency`。
@@ -16,8 +18,8 @@
 
 ## 决策规则
 
-- **keep**：goodput 相比当前最佳提升 > `bench.noise_band_pct`（默认 3%），且 SLO 达标 → 更新当前最佳。
-- **discard**：提升 ≤ 噪声带（含变差）→ 回退该配置。
+- **keep**：`(cand − best) > max(best × noise_band_pct/100, noise_k_sigma × σ)`——`best` = 当前最佳 goodput（req/s）、`σ` = 本次 trial 的 `goodput_std`（req/s）、`noise_band_pct` 为百分比（如 3.0 → 3%，乘 `best` 得绝对 req/s），两侧同为单位 req/s——且 SLO 达标 → 更新当前最佳。σ 不可用（n<2）时退化为仅 `best × noise_band_pct/100`。
+- **discard**：提升 ≤ 噪声阈值（含变差）→ 回退该配置。
 - **crash**：启动失败 / OOM / 超时（`startup_timeout_s` / `trial_timeout_s`）→ 记录 crash，按崩溃处理（见「崩溃处理」）。
 
 ## git 约定
@@ -32,11 +34,12 @@
 tab 分隔，每行一个实验：
 
 ```
-commit  goodput  output_tok_s  ttft_p99_ms  tpot_p99_ms  peak_vram_gb  dur_s  status  description
+commit  goodput  goodput_std  output_tok_s  ttft_p99_ms  tpot_p99_ms  peak_vram_gb  dur_s  status  description
 ```
 
 - `commit`：本次 config.yaml 的 git commit（短 hash）。
 - `goodput`：SLO 约束下的成功请求吞吐（**req/s**，vLLM 的 `request_goodput`），用于 keep/discard 判定。
+- `goodput_std`：本次 trial repeats 的 goodput 样本标准差（σ；n<2 时为 0），显著性判定的噪声基数（`noise_k_sigma`×σ，与 `best × noise_band_pct/100` 取较大者）。
 - `output_tok_s`：纯输出吞吐（tok/s），辅助诊断。
 - `ttft_p99_ms` / `tpot_p99_ms`：实测 P99 时延，用于核对 SLO。
 - `peak_vram_gb`：bench 期间 `nvidia-smi` 采样的峰值显存（GB）。

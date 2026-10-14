@@ -30,6 +30,14 @@ class TestDecide:
     def test_first_trial_becomes_best(self):
         assert ml.decide(10.0, None, noise_band_pct=3.0) == "keep"
 
+    def test_sigma_decides_when_larger_than_percent_band(self):
+        # 提升 +4%（> 3% 百分比带）但 σ 大：k×σ = 2×0.25 = 0.5（abs）> best×4% = 0.4 → σ 主导
+        assert ml.decide(10.4, 10.0, sigma=0.25, noise_band_pct=3.0) == "discard"
+        # 同 σ 下超过 k×σ（Δ=0.6 > 0.5）才 keep
+        assert ml.decide(10.6, 10.0, sigma=0.25, noise_band_pct=3.0) == "keep"
+        # 百分比带主导时（σ=0 → 纯百分比）行为不变
+        assert ml.decide(10.4, 10.0, sigma=0.0, noise_band_pct=3.0) == "keep"
+
 
 class TestLoopState:
     def test_keep_updates_best_and_resets_counters(self):

@@ -26,7 +26,7 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("缺少 pyyaml：请用 `uv run python report.py` 或 `pip install pyyaml`")
 
-HEADER = ["commit", "goodput", "output_tok_s", "ttft_p99_ms", "tpot_p99_ms",
+HEADER = ["commit", "goodput", "goodput_std", "output_tok_s", "ttft_p99_ms", "tpot_p99_ms",
           "peak_vram_gb", "dur_s", "status", "description"]
 NUM_COLS = set(HEADER) - {"commit", "status", "description"}
 DEFAULT_SLO = {"ttft_p99_ms": 500, "tpot_p99_ms": 50}
@@ -191,8 +191,8 @@ def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict
     lines.append("")
 
     lines += ["## 全部 trial 表", ""]
-    lines.append("| commit | goodput | output_tok_s | ttft_p99 | tpot_p99 | peak_vram | dur_s | SLO 达标 | status | description |")
-    lines.append("|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("| commit | goodput | goodput_std | output_tok_s | ttft_p99 | tpot_p99 | peak_vram | dur_s | SLO 达标 | status | description |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
     def _gp(r: dict) -> float:
         g = r.get("goodput")
         return g if isinstance(g, (int, float)) else -1.0
@@ -201,9 +201,10 @@ def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict
     for r in ordered:
         ok = slo_ok(r, sl)
         lines.append(f"| {r.get('commit') or '—'} | {_fmt(r.get('goodput'))} | "
-                     f"{_fmt(r.get('output_tok_s'))} | {_fmt(r.get('ttft_p99_ms'))} | "
-                     f"{_fmt(r.get('tpot_p99_ms'))} | {_fmt(r.get('peak_vram_gb'))} | "
-                     f"{_fmt(r.get('dur_s'))} | {'✅' if ok else '❌'} | {r.get('status') or '—'} | "
+                     f"{_fmt(r.get('goodput_std'))} | {_fmt(r.get('output_tok_s'))} | "
+                     f"{_fmt(r.get('ttft_p99_ms'))} | {_fmt(r.get('tpot_p99_ms'))} | "
+                     f"{_fmt(r.get('peak_vram_gb'))} | {_fmt(r.get('dur_s'))} | "
+                     f"{'✅' if ok else '❌'} | {r.get('status') or '—'} | "
                      f"{r.get('description') or ''} |")
     lines.append("")
 
