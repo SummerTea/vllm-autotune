@@ -91,6 +91,7 @@ commit  goodput  goodput_std  output_tok_s  ttft_p99_ms  tpot_p99_ms  peak_vram_
 
 ## 崩溃处理
 
+- **serve flag 预校验**：`bench.py` 在起 serve 前对照镜像的 `vllm serve --help`（按 image 缓存到 out-dir）校验 `config.yaml.serve` 的 flag 名——未知 flag 直接判 crash（fail fast，typo 不浪费一次模型加载）；镜像无法提供 help 时跳过校验（best-effort）。
 - 明显的 typo / 缺依赖：可修一次并重试该配置。
 - 构思本身有问题（如参数组合不合法）：记 crash 跳过，不反复重试。
 

@@ -45,6 +45,23 @@ for a in "$@"; do
 done
 
 if [ "$SUB" = "serve" ]; then
+  # serve --help：打印样例 help（serve flag 预校验测试用；真实 vllm 镜像同样应答 --help）
+  for a in "$@"; do
+    if [ "$a" = "--help" ]; then
+      echo "usage: vllm serve [options] MODEL"
+      echo "  --model MODEL"
+      echo "  --max-num-seqs MAX_NUM_SEQS"
+      echo "  --max-num-batched-tokens MAX_NUM_BATCHED_TOKENS"
+      echo "  --gpu-memory-utilization GPU_MEMORY_UTILIZATION"
+      echo "  --kv-cache-dtype KV_CACHE_DTYPE"
+      echo "  --load-format LOAD_FORMAT"
+      echo "  --port PORT"
+      echo "  --tensor-parallel-size TENSOR_PARALLEL_SIZE"
+      echo "  --enable-prefix-caching, --no-enable-prefix-caching"
+      echo "  --trust-remote-code, --no-trust-remote-code"
+      exit 0
+    fi
+  done
   if [ "${FAKE_DOCKER_CRASH:-0}" = "1" ]; then
     echo "fake docker serve crashing" >&2
     exit 1

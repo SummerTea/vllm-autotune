@@ -25,6 +25,7 @@ runtime: {}                     # 可选；覆盖 harness.yaml 的 runtime 默�
 #                                        #   不改变主机）；限定可见 GPU 用 env.CUDA_VISIBLE_DEVICES——勿经此传 --gpus，
 #                                        #   构建器已固定 --gpus all，再传会重复冲突
 serve: {}                       # vLLM serve 参数，kebab-case 作为 CLI flag。
+                                # flag 名会对照镜像 `vllm serve --help` 预校验（未知名直接 crash）；
                                 # 布尔约定：true → 裸 flag（--enable-x）；false → 省略（保持默认）；
                                 # 要关闭默认开启的开关，写 no-<flag>: true（原样透传为 --no-<flag>）。例如：
 # serve:

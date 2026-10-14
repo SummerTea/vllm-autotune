@@ -118,6 +118,40 @@ class TestParsers:
         assert bench.parse_compute_apps(None) == []
         assert bench.parse_compute_apps("") == []
 
+    def test_known_serve_flags_parses_help(self):
+        help_text = """usage: vllm serve [-h] MODEL
+options:
+  -h, --help
+  --model MODEL
+  --max-num-seqs MAX_NUM_SEQS
+  --enable-prefix-caching, --no-enable-prefix-caching
+  --trust-remote-code, --no-trust-remote-code
+"""
+        known = bench._known_serve_flags(help_text)
+        assert "--model" in known and "--max-num-seqs" in known
+        assert "--enable-prefix-caching" in known and "--no-enable-prefix-caching" in known
+        assert "--help" in known
+        assert "MAX_NUM_SEQS" not in known and "-h" not in known
+
+    def test_known_serve_flags_bracketed_usage_line(self):
+        # m2：usage 行的 [--flag N] 括号形式也要收集（否则合法 flag 被误报未知）
+        known = bench._known_serve_flags(
+            "usage: vllm serve [-h] [--max-num-seqs N] MODEL\n"
+            "  --enable-prefix-caching, --no-enable-prefix-caching\n")
+        assert "--max-num-seqs" in known
+        assert "--enable-prefix-caching" in known and "--no-enable-prefix-caching" in known
+
+    def test_unknown_serve_flags(self):
+        known = bench._known_serve_flags(
+            "--model MODEL\n--max-num-seqs MAX_NUM_SEQS\n"
+            "--enable-prefix-caching, --no-enable-prefix-caching\n")
+        serve = {"max-num-seqs": 1, "enable-prefix-caching": True,
+                 "no-enable-prefix-caching": True, "bogus-flag": 1}
+        assert bench._unknown_serve_flags(serve, known) == ["--bogus-flag"]
+        assert bench._unknown_serve_flags({"max-num-seqs": 1}, known) == []
+        # no-<flag> 键也按 known 校验
+        assert bench._unknown_serve_flags({"no-bogus-flag": True}, known) == ["--no-bogus-flag"]
+
 
 class TestDockerRuntime:
     RUNTIME = {"kind": "docker", "image": "vllm/vllm-openai:v0.31.0",
@@ -467,6 +501,28 @@ def test_gmu_probe_total_timeout(tmp_path, capsys, monkeypatch):
     assert "gmu_suggested: 无" in sout and "total_timeout" in sout
 
 
+def test_gmu_probe_unknown_flag_fails_fast(tmp_path, capsys, monkeypatch):
+    # m1：探测路径同样预校验 config.serve——typo 不伪装成"无可用 gmu"（不下降、不产 gmu_probe.json）
+    port = 18102
+    _write_docker_inputs(tmp_path, port, startup=10, trial=30, repeats=1)
+    (tmp_path / "config.yaml").write_text(json.dumps(
+        {"env": {"TEST_ENV": "1"}, "serve": {"bogus-flag": 1}}), encoding="utf-8")
+    out = tmp_path / "out"
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file) + ["--detect-gmu"])
+    assert rc == 1
+    status = json.loads((out / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "crash" and status["phase"] == "crash"
+    assert "未知 vllm serve 参数" in status["message"]
+    assert "--bogus-flag" in status["message"]
+    captured = capsys.readouterr()
+    assert "未知 vllm serve 参数" in captured.err
+    # 预校验失败即中止：无 gmu_probe.json（区别于 floor 耗尽/总超时的探测结果）
+    assert not (out / "gmu_probe.json").exists()
+
+
 
 # ── docker 运行时生命周期（stub docker，无真实 docker/GPU）─────────────────
 
@@ -573,5 +629,31 @@ def test_docker_missing_image_crash(tmp_path, capsys, monkeypatch):
     assert status["state"] == "crash" and status["phase"] == "crash"
     # 预检查失败：不进入 docker run（状态文件只有 image inspect 相关调用，无 rm/run）
     assert not state_file.exists() or "docker run" not in state_file.read_text(encoding="utf-8")
+    sout = capsys.readouterr().out
+    assert "status: crash" in sout
+
+
+def test_docker_unknown_serve_flag_crashes_before_serve(tmp_path, capsys, monkeypatch):
+    # serve flag 预校验：config.serve 含镜像 help 里没有的键 → 起 serve 前 fail-fast crash
+    port = 18101
+    _write_docker_inputs(tmp_path, port, startup=10, trial=30, repeats=1)
+    (tmp_path / "config.yaml").write_text(json.dumps(
+        {"env": {"TEST_ENV": "1"}, "serve": {"max-num-seqs": 8, "bogus-flag": 1}}),
+        encoding="utf-8")
+    out = tmp_path / "out"
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file))
+    assert rc != 0
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["status"] == "crash"
+    assert "--bogus-flag" in result["reason"]
+    status = json.loads((out / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "crash"
+    # 校验发生在起 serve 之前：状态文件有 help 校验的 run，但绝无真实 serve（serve /model 从未启动）
+    text = state_file.read_text(encoding="utf-8")
+    assert "serve --help" in text
+    assert "serve /model" not in text
     sout = capsys.readouterr().out
     assert "status: crash" in sout

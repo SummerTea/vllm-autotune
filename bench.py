@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -211,6 +212,57 @@ def _serve_flags(config: dict, port: int) -> list[str]:
     if "--port" not in args:
         args += ["--port", str(port)]
     return args
+
+
+def _known_serve_flags(help_text: str) -> set[str]:
+    """从 `vllm serve --help` 提取全部选项名。每个空白 token 先规范化：
+    剥首部 `[`/`(` 与尾部 `]`/`)`/`,`（覆盖 usage 行 `[--max-num-seqs N]` 等），再取 `--` 开头的。
+    自动覆盖 BooleanOptionalAction 的 `--enable-x, --no-enable-x` 对。"""
+    flags = set()
+    for tok in help_text.split():
+        norm = tok.lstrip("[(").rstrip("]),")
+        if norm.startswith("--") and len(norm) > 2:
+            flags.add(norm)
+    return flags
+
+
+def _unknown_serve_flags(serve: dict, known: set[str]) -> list[str]:
+    """config.serve 键 → `--<kebab>`（下划线→连字符）后不在 help 选项集里的列表（排序稳定）。
+    no-<flag> 键同规则：`--no-enable-x` 有效当且仅当它在 known 里。"""
+    return sorted(
+        "--" + str(k).replace("_", "-")
+        for k in serve
+        if "--" + str(k).replace("_", "-") not in known
+    )
+
+
+def _get_serve_help(docker_cmd: str, runtime: dict, cache_dir: str) -> str | None:
+    """镜像内 `vllm serve --help` 文本：docker run --pull=never --entrypoint vllm <image> serve --help
+    （stdout+stderr 都抓；部分 CLI 打到 stderr）。按 image 缓存到 <cache_dir>/.serve_help_<hash>.txt，
+    命中即复用不重跑。失败/空 → None（调用方跳过校验，不阻塞 trial）。"""
+    image = str(runtime.get("image"))
+    cache_path = os.path.join(cache_dir, f".serve_help_{hashlib.sha256(image.encode()).hexdigest()[:12]}.txt")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            if text.strip():
+                return text
+        except OSError:
+            pass
+    rc, out, err = _run_local(
+        [docker_cmd, "run", "--rm", "--pull=never", "--entrypoint", "vllm", image, "serve", "--help"],
+        timeout=60)
+    text = (out or "") + (err or "")
+    if rc == 0 and text.strip():
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except OSError:
+            pass
+        return text
+    return None
 
 
 def build_docker_run_cmd(docker_cmd: str, runtime: dict, model_path: str, port: int,
@@ -413,6 +465,22 @@ def _run_gmu_probe(docker_cmd: str, runtime: dict, config: dict, target: dict, p
     timed_out = False
     total_deadline = time.monotonic() + total_timeout_s
     with open(log_path, "ab") as log_fh:
+        # m1：探测路径也预校验 config.serve 的 flag 名（与 trial 同口径）——typo 不伪装成"无可用 gmu"
+        help_text = _get_serve_help(docker_cmd, runtime, out_dir)
+        if help_text is None:
+            log_fh.write(f"=== bench.py {_now_iso()} serve --help 不可用，跳过 flag 预校验\n".encode())
+            log_fh.flush()
+        else:
+            unknown = _unknown_serve_flags(config.get("serve") or {}, _known_serve_flags(help_text))
+            if unknown:
+                reason = (f"未知 vllm serve 参数：{unknown}"
+                          "（对照镜像 `vllm serve --help`；请修正 config.yaml.serve）")
+                log_fh.write(f"=== bench.py {_now_iso()} flag 预校验失败: {reason}\n".encode())
+                log_fh.flush()
+                msg = f"gmu 探测失败：{reason}"
+                _write_status(out_dir, "crash", "crash", msg, started_at)
+                print(f"bench.py: 错误: {reason}", file=sys.stderr)
+                return 1
         for gmu in cands:
             if time.monotonic() >= total_deadline:
                 timed_out = True
@@ -776,6 +844,16 @@ def main(argv: list[str] | None = None) -> int:
                              "请人工预先 docker pull 或改用已存在的镜像）")
         # 先清残留同名容器（幂等）：硬杀遗留的同名容器不算外来共租，须在共租检测前清理
         docker_clean_stale(args.docker_cmd)
+        # serve flag 预校验：对照镜像 `vllm serve --help`（按 image 缓存），未知名直接 fail-fast
+        help_text = _get_serve_help(args.docker_cmd, runtime, out_dir)
+        if help_text is None:
+            log_fh.write(f"=== bench.py {_now_iso()} serve --help 不可用，跳过 flag 预校验\n".encode())
+            log_fh.flush()
+        else:
+            unknown = _unknown_serve_flags(config.get("serve") or {}, _known_serve_flags(help_text))
+            if unknown:
+                raise TrialCrash(f"未知 vllm serve 参数：{unknown}"
+                                 "（对照镜像 `vllm serve --help`；请修正 config.yaml.serve）")
         # 共租检测（起 serve 之前）：非独占主机上其他 GPU 进程会污染测量
         foreign_apps = _detect_co_tenants()
         contention = None
