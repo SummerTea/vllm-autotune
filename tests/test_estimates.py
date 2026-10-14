@@ -214,6 +214,50 @@ class TestValidTpDivisors:
             assert mtp is None or mtp in tp["valid_divisors"]
 
 
+class TestTopoAffinity:
+    def test_parse_fixture_topo(self):
+        # fixture：2-NUMA、8 GPU（0-3→NUMA0 / 4-7→NUMA1），各带 CPU 亲和串
+        txt = (Path(__file__).parent / "fixtures" / "head" / "gpu_topo.txt").read_text(encoding="utf-8")
+        numa, cpu = probe.parse_topo_affinity(txt)
+        assert len(numa) == 8 and len(cpu) == 8
+        assert numa[0] == 0 and numa[3] == 0
+        assert numa[4] == 1 and numa[7] == 1
+        assert cpu[0] == "0-47,96-143"
+        assert cpu[4] == "48-95,144-191"
+
+    def test_na_row_yields_none(self):
+        # N/A 的 NUMA Affinity → None；CPU Affinity 有值仍保留；全 N/A 行 → 两列都 None
+        txt = "GPU0\tX\tN/A\tN/A\t0-95\tN/A\tN/A"
+        numa, cpu = probe.parse_topo_affinity(txt)
+        assert numa[0] is None
+        assert cpu[0] == "0-95"                       # CPU 亲和有值仍保留
+        txt2 = "GPU1\tX\tPXB\tN/A\tN/A\tN/A"
+        numa2, cpu2 = probe.parse_topo_affinity(txt2)
+        assert numa2[1] is None and cpu2[1] is None  # 全 N/A
+
+    def test_short_and_header_rows_skipped(self):
+        txt = "GPU0\tGPU1\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\n" \
+              "GPU2\tX\n"                              # <4 token 的坏行
+        numa, cpu = probe.parse_topo_affinity(txt)
+        assert numa == {} and cpu == {}
+        assert probe.parse_topo_affinity(None) == ({}, {})
+        assert probe.parse_topo_affinity("") == ({}, {})
+
+    def test_numa_groups_none_group_sorts_last(self):
+        # 数值节点组在前，None（N/A）组在最后（与 build_host_facts 注释一致）
+        raw = {
+            "gpu_topo": {"value": "GPU0\tX\tPXB\t0-95\t0\tN/A\n"
+                                  "GPU1\tX\tPXB\t0-95\tN/A\tN/A\n"},
+            "gpu_smi": {"value": "0, NVIDIA A100, 42234101760, 535, Enabled, 810, 1410, 28.63, 300.00\n"
+                                 "1, NVIDIA A100, 42234101760, 535, Enabled, 810, 1410, 28.63, 300.00\n"},
+        }
+        facts = probe.build_host_facts({"role": "head"}, raw)
+        assert facts["numa_groups"] == [{"numa_node": 0, "gpus": [0]},
+                                        {"numa_node": None, "gpus": [1]}]
+        assert facts["gpu"]["gpus"][0]["numa_node"] == 0
+        assert facts["gpu"]["gpus"][1]["numa_node"] is None
+
+
 def wb_is_ok(t: int, gpu_mem: int, gmu: float) -> bool:
     wb, _ = probe.weight_bytes(None, GQA_CONFIG)
     return wb is not None and wb / t <= gpu_mem * gmu

@@ -68,13 +68,24 @@ def test_fixture_probe_produces_artifacts(tmp_path):
     assert head["role"] == "head"                       # head 主机被识别
     assert head["hostname"] == "head"                   # 来自 fixture hostname.txt
     assert head["vllm_version"] == "0.31.0"
-    assert head["gpu"]["count"] == 2
-    assert head["gpu"]["topo"]["summary"] == "nvlink-full"
+    assert head["gpu"]["count"] == 8
+    assert head["gpu"]["topo"]["summary"] == "pcie"     # 新 fixture：全 PCIe 矩阵（PXB/NODE/SYS，无 NV）
+    assert head["gpu"]["gpus"][0]["numa_node"] == 0     # NUMA 放置合并进 GPU 事实
+    assert head["numa_groups"] == [
+        {"numa_node": 0, "gpus": [0, 1, 2, 3]},
+        {"numa_node": 1, "gpus": [4, 5, 6, 7]},
+    ]
+    # 8 卡与 topo/lscpu 一致（GPU0-7 → NUMA0/1，2 节点）——fixture 自洽
+    assert head["cpu"]["numa_nodes"] == 2
     assert head["cpu"]["governor"] == "performance"
     assert head["docker"]["version"]                    # docker 检测（fixture docker_version.txt）
     assert any("vllm/vllm-openai" in i for i in (head["docker"]["vllm_images"] or []))
     assert isinstance(head["checklist"], list) and head["checklist"]  # 检查清单存在
     assert any(i["status"] == "pass" for i in head["checklist"])
+    # NUMA 放置：2-NUMA 且每节点 >1 GPU → warn（仅建议，模板不自动绑定）
+    numa_item = next(i for i in head["checklist"] if i["name"] == "NUMA 放置")
+    assert numa_item["status"] == "warn"
+    assert "numa_groups" in numa_item["detail"]
     assert env["interconnect"]["covered"] is False      # 单主机 → 不执行跨机检查
 
     profile = json.loads(profile_p.read_text(encoding="utf-8"))
@@ -88,6 +99,7 @@ def test_fixture_probe_produces_artifacts(tmp_path):
 
     report = report_p.read_text(encoding="utf-8")
     assert "系统参数检查清单" in report
+    assert "NUMA 分组" in report                       # 关键事实含 numa_groups
     assert "下一步" in report
 
 

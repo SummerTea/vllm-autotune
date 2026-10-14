@@ -320,6 +320,31 @@ def parse_topo(text: str | None, gpu_count: int) -> tuple[str | None, str | None
     return text, summary
 
 
+def parse_topo_affinity(text: str | None) -> tuple[dict[int, int | None], dict[int, str | None]]:
+    """nvidia-smi topo -m 的 CPU Affinity / NUMA Affinity / GPU NUMA ID 三列 →
+    ({gpu_index: numa_node}, {gpu_index: cpu_affinity})。
+    假定每行末 3 个空白分隔 token 为 CPU Affinity / NUMA Affinity / GPU NUMA ID；
+    若驱动省略尾列则退化为无 NUMA（该信息静默丢弃）。
+    NUMA 列 N/A 或非数字 → None。跳过：token<4 的行、列标签头行（首 token 也是 GPU<d>
+    但 NUMA Affinity 列是单词而非数字/N/A）。"""
+    numa: dict[int, int | None] = {}
+    cpu: dict[int, str | None] = {}
+    if not text:
+        return numa, cpu
+    for line in text.splitlines():
+        toks = line.split()
+        if len(toks) < 4 or not re.match(r"GPU(\d+)$", toks[0]):
+            continue
+        numa_aff = toks[-2]
+        if numa_aff != "N/A" and not numa_aff.isdigit():
+            continue  # 头行等非数据行（NUMA Affinity 列不是数字/N/A）
+        gi = int(toks[0][3:])
+        cpu_aff = toks[-3]
+        numa[gi] = int(numa_aff) if numa_aff.isdigit() else None
+        cpu[gi] = cpu_aff if cpu_aff != "N/A" else None
+    return numa, cpu
+
+
 def parse_ip_link(text: str | None) -> list[dict]:
     """解析 `ip -o link show`（每行: `N: name: <flags> mtu M …`）；缺 mtu/坏行跳过。"""
     if not text:
@@ -511,6 +536,7 @@ def build_host_facts(host: dict, raw: dict) -> dict:
     gpus = parse_gpu_smi(raw.get("gpu_smi", {}).get("value"))
     lscpu = parse_lscpu(raw.get("lscpu", {}).get("value"))
     topo_raw, topo_summary = parse_topo(raw.get("gpu_topo", {}).get("value"), len(gpus or []))
+    numa_map, cpu_map = parse_topo_affinity(raw.get("gpu_topo", {}).get("value"))
     ifaces = parse_ip_link(raw.get("ip_link", {}).get("value"))
 
     numa = _first_int(lscpu.get("NUMA node(s)")) if lscpu.get("NUMA node(s)") is not None else None
@@ -546,6 +572,22 @@ def build_host_facts(host: dict, raw: dict) -> dict:
     docker_imgs_raw = raw.get("docker_images", {}).get("value") or ""
     docker_vllm = [l.strip() for l in docker_imgs_raw.splitlines() if "vllm" in l.lower()] or None
 
+    # NUMA 放置：numa_node 合并进每张 GPU；numa_groups 按 topo 的 GPU 索引分组
+    #（真实主机上 topo 与 gpu_smi 的 GPU 集合一致；None=N/A 的组放最后）
+    for g in gpus or []:
+        gi = g.get("index")
+        if gi is not None:
+            g["numa_node"] = numa_map.get(gi)
+    numa_groups: list[dict] = []
+    if numa_map:
+        by_node: dict[int | None, list[int]] = {}
+        for gi, nn in sorted(numa_map.items()):
+            by_node.setdefault(nn, []).append(gi)
+        numa_groups = [{"numa_node": k, "gpus": v}
+                       for k, v in sorted(by_node.items(),
+                                          key=lambda kv: (kv[0] is None,
+                                                          kv[0] if kv[0] is not None else 0))]
+
     return {
         "role": host.get("role"),
         "hostname": (raw.get("hostname", {}).get("value") or "").strip() or None,
@@ -556,6 +598,7 @@ def build_host_facts(host: dict, raw: dict) -> dict:
             "gpus": gpus,
             "topo": {"raw": topo_raw, "summary": topo_summary},
         },
+        "numa_groups": numa_groups,
         "cpu": {
             "model_name": lscpu.get("Model name"),
             "cores": _first_int(lscpu.get("CPU(s)")),
@@ -676,6 +719,29 @@ def _system_checklist(facts: dict, is_head: bool, weights_bytes: int | None) -> 
                           "fix": "无（负载时用 nvidia-smi -q -d CLOCK 复查）"})
     if gpus and not any(i["name"] == "GPU SM 时钟" for i in items):
         items.append({"name": "GPU SM 时钟", "status": "pass", "detail": "≥ 80% max（或无需复查）", "fix": "—"})
+
+    # NUMA 放置（advisory，仅建议——本模板从不自动绑定系统参数，人工应用）
+    ngroups = facts.get("numa_groups") or []
+    real = [g for g in ngroups if g["numa_node"] is not None]
+    if not real:
+        items.append({"name": "NUMA 放置", "status": "pass",
+                      "detail": "无有效 NUMA Affinity 数据（topo 未提供或全为 N/A）", "fix": "—"})
+    else:
+        desc = ", ".join(f"{g['numa_node']}:{g['gpus']}" for g in real)
+        if len(real) <= 1:
+            items.append({"name": "NUMA 放置", "status": "pass",
+                          "detail": f"单 NUMA 节点（numa_groups={{{desc}}}）", "fix": "—"})
+        elif any(len(g["gpus"]) > 1 for g in real):
+            items.append({
+                "name": "NUMA 放置", "status": "warn",
+                "detail": (f"多 NUMA（{desc}）：tp 组应限制在同一 NUMA 节点内的 GPU（依据 numa_groups）；"
+                           "worker/engine 进程的 CPU 亲和应 align 到该节点"
+                           "（numactl --cpunodebind/--membind；系统级绑定仅建议，人工应用）"),
+                "fix": "numactl --cpunodebind=<node> --membind=<node> 绑定到目标 NUMA 节点（人工应用，模板不自动改）",
+            })
+        else:
+            items.append({"name": "NUMA 放置", "status": "pass",
+                          "detail": f"多 NUMA 但每节点仅 1 GPU（numa_groups={{{desc}}}）", "fix": "—"})
 
     return items
 
@@ -808,6 +874,10 @@ def render_env_report(target: dict, facts: dict, interconnect: dict,
         gpus = f["gpu"]["gpus"] or []
         gpu_desc = ", ".join(f"{g.get('name')}" for g in gpus) or "（无 GPU）"
         lines.append(f"- GPU：{f['gpu']['count']} 张 — {gpu_desc}；拓扑摘要 `{f['gpu']['topo']['summary']}`")
+        ng = f.get("numa_groups") or []
+        if ng:
+            ng_desc = ", ".join(f"{g['numa_node']}:{g['gpus']}" for g in ng)
+            lines.append(f"- NUMA 分组：{{{ng_desc}}}")
         lines.append(f"- CPU：{f['cpu'].get('model_name') or '—'}，{f['cpu'].get('cores')} 核，"
                      f"NUMA {f['cpu'].get('numa_nodes')}，governor `{f['cpu'].get('governor')}`")
         lines.append(f"- 内存：THP=`{f['mem'].get('thp')}`，swappiness=`{f['mem'].get('swappiness')}`")
