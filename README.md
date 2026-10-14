@@ -54,6 +54,7 @@
 - **goodput 标量化**：以 `vllm bench serve --goodput` 的输出为唯一指标，SLO 来自 `target.yaml`（缺省用 `harness.yaml` 占位）。
 - **三层退出**：deadline 主退出（硬保证）+ 平台期（连续 N 次无 > 噪声带的改进）+ 崩溃连击（连续 N 次 crash）。每轮开头做 deadline 感知调度，来不及就不开新 trial；在途 trial 宽限跑完。
 - **系统参数只建议**：governor / hugepages / 锁频等系统级参数只探测并写入报告建议，不自动修改；v1 不提供自动修改开关。
+- **前缀缓存可测性**：`workload.prefix_hit_pct`（0-100，仅 random 数据集）按目标命中率拆共享前缀，让 `enable-prefix-caching` 成为可测维度；repeats 之间自动 `POST /reset_prefix_cache`，保证每次测量冷缓存独立。
 - **多机采集 + 单机执行**：v1 只在 `role=head` 的主机上跑实验，其余主机仅做采集探测；跨机调度留到 v2。
 - **运行时：docker-only**：vLLM 环境复杂，统一用镜像（如 `vllm/vllm-openai:v0.31.0`）——`config.yaml` 的 `runtime.image` 指定（逐键覆盖 `harness.yaml` 默认），**不支持**本机安装式 vLLM；`image` 本身是合法的搜索维度（如 CUDA 12/13 变体镜像）；模型目录经 `-v host:container:ro` 只读挂载进容器，serve/bench 都在容器内跑、本机无需安装 vllm。
 

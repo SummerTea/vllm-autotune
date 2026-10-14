@@ -52,7 +52,8 @@ except ImportError:  # pragma: no cover
 
 # 默认值（与 harness.yaml / docs/vllm-facts.md 保持一致）
 DEFAULT_SLO = {"ttft_p99_ms": 500, "tpot_p99_ms": 50}
-DEFAULT_WORKLOAD = {"dataset": "random", "isl": 1024, "osl": 128, "num_prompts": 1000}
+DEFAULT_WORKLOAD = {"dataset": "random", "isl": 1024, "osl": 128, "num_prompts": 1000,
+                    "prefix_hit_pct": 0}
 DEFAULT_REF_CONCURRENCY = 128
 DEFAULT_SEED = 0
 HEALTH_URL = "http://127.0.0.1:{port}/health"
@@ -209,19 +210,35 @@ def build_docker_run_cmd(docker_cmd: str, runtime: dict, model_path: str, port: 
 
 def _bench_args(model: str, workload: dict, slo: dict, ref_conc: int, seed: int,
                 result_dir: str, trust_remote_code: bool, port: int) -> list[str]:
-    """bench serve 参数（docs §1 CLI + --goodput + --save-result + 显式 --base-url）。"""
+    """bench serve 参数（docs §1 CLI + --goodput + --save-result + 显式 --base-url
+    + --percentile-metrics）。
+    prefix_hit_pct（仅 random 数据集）：把 isl 拆成共享前缀 + 余量（prefix_len=isl×pct/100，
+    adjusted=isl−prefix_len），让 enable-prefix-caching 成为可测维度；非 random 数据集忽略该维度。"""
     wl = {**DEFAULT_WORKLOAD, **workload}
     sl = {**DEFAULT_SLO, **slo}
+    dataset = wl.get("dataset", "random")
+    isl = int(wl.get("isl", 1024))
+    osl = int(wl.get("osl", 128))
+    prefix_pct = max(0, min(100, int(wl.get("prefix_hit_pct", 0) or 0)))  # 钳制 0-100，防 >100 产生负 --random-input-len
+    if dataset == "random" and prefix_pct > 0:
+        # 共享前缀 + 余量：总 prompt ≈ isl；不带 --input-len（避免与 --random-input-len 冲突）
+        prefix_len = isl * prefix_pct // 100
+        adjusted = isl - prefix_len
+        len_args = ["--random-input-len", str(adjusted), "--random-prefix-len", str(prefix_len)]
+    else:
+        # prefix_hit_pct=0 或非 random 数据集（无共享前缀语义，忽略该维度）→ 维持原样
+        len_args = ["--input-len", str(isl)]
     args = [
         "--model", model,
         "--base-url", f"http://127.0.0.1:{port}",   # 显式指向 serve 端口（≠8000 时也正确）
-        "--dataset-name", str(wl.get("dataset", "random")),
-        "--input-len", str(wl.get("isl", 1024)),
-        "--output-len", str(wl.get("osl", 128)),
+        "--dataset-name", str(dataset),
+        *len_args,
+        "--output-len", str(osl),
         "--num-prompts", str(wl.get("num_prompts", 1000)),
         "--request-rate", "inf",
         "--max-concurrency", str(ref_conc),
         "--goodput", f"ttft:{sl['ttft_p99_ms']}", f"tpot:{sl['tpot_p99_ms']}",
+        "--percentile-metrics", "ttft,tpot,itl,e2el",
         "--seed", str(seed),
         "--save-result", "--result-dir", result_dir,
     ]
@@ -482,6 +499,22 @@ def _health_code(port: int, timeout: float = 2.0) -> int | None:
         return None
 
 
+def _reset_prefix_cache(port: int, log_fh) -> None:
+    """尽力 POST /reset_prefix_cache（repeats≥2 前清缓存，保证每次测量是冷缓存独立）。
+    非 200 / 异常一律容忍：只写 run.log，绝不因重置失败中止 trial。"""
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/reset_prefix_cache", method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        log_fh.write(f"=== bench.py {_now_iso()} reset_prefix_cache 失败（容忍）: {e}\n".encode())
+        log_fh.flush()
+        return
+    if status != 200:
+        log_fh.write(f"=== bench.py {_now_iso()} reset_prefix_cache 返回 {status}（容忍，非 200）\n".encode())
+        log_fh.flush()
+
+
 def _scan_kv(log_path: str) -> int | None:
     try:
         with open(log_path, encoding="utf-8", errors="replace") as f:
@@ -729,6 +762,9 @@ def main(argv: list[str] | None = None) -> int:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TrialCrash("trial_timeout")
+                if i >= 1:
+                    # D：同实例的后续 repeat 前清前缀缓存 → 每次测量冷缓存独立（首 repeat 起服即冷）
+                    _reset_prefix_cache(port, log_fh)
                 parsed = _run_bench_once(bench_tokens, remaining, log_fh, out_dir)
                 if parsed["goodput"] is None:
                     raise TrialCrash(f"bench 第 {i + 1} 次无有效输出（goodput 缺失）")

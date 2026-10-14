@@ -34,6 +34,7 @@ workload:                       # 可选。缺省则用 harness.yaml 默认。
   osl: 256
   num_prompts: 1000
   ref_concurrency: 128         # 覆盖 harness.yaml 的 bench.ref_concurrency（参考并发点）
+  prefix_hit_pct: 0            # 可选。0 = 无共享前缀（默认）；>0 = 目标前缀缓存命中率（%，仅 random）
 
 budget:                         # 主退出条件（过夜场景必填；max_hours 与 stop_at 二选一，同时填写时 max_hours 优先）
   max_hours: 10                 # 运行满 N 小时后停止

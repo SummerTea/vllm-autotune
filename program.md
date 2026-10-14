@@ -74,6 +74,7 @@ commit  goodput  output_tok_s  ttft_p99_ms  tpot_p99_ms  peak_vram_gb  dur_s  st
 - **合法 tp 集合**：由 `num_attention_heads` / `num_key_value_heads` 的约数决定，非法 tp 值不试。
 - **系统级参数**：governor / hugepages / 锁频等只探测 + 建议（写进 report.md），不自动修改（v1 不提供自动修改开关）。
 - **布尔参数约定**：`true` → 裸 flag（`--enable-x`）；`false` → 省略（保持 vLLM 默认）；要关闭默认开启的开关，写 `no-<flag>: true`（原样透传为 `--no-<flag>`）。
+- **前缀缓存可测性**：`workload.prefix_hit_pct`（0-100，仅 random 数据集）让 `enable-prefix-caching` 成为可测维度——random 数据默认无共享前缀，prefix caching 测不出收益；`>0` 时 bench 按 `prefix_len = isl×pct/100` 拆共享前缀、`adjusted = isl−prefix_len`（总 prompt ≈ isl）。repeats 之间会 `POST /reset_prefix_cache` 保证每次测量是冷缓存独立（首 repeat 起服即冷缓存）。
 - **运行时与镜像（docker-only）**：`runtime.image` 是合法搜索维度（如 CUDA 12/13 变体镜像）；镜像须在主机**预先准备**（模板不自动拉取，保持主机零新增），先固定镜像再调参。
 - **执行主机**：`run.sh` / `bench.py` 仅作用于唯一 `role: head` 的主机；缺失或重复即报错。
 

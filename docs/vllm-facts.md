@@ -26,6 +26,8 @@ vllm bench serve \
 | `--burstiness` | 1.0 | 仅 request-rate≠inf 生效 |
 | `--save-result` / `--result-dir` | off / cwd | 结果 JSON（字段见 §2） |
 | `--seed` | 0 | 数据集/采样种子 |
+| `--random-input-len` / `--random-prefix-len` | — | random 数据集：`--random-input-len`=非前缀余量、`--random-prefix-len`=前置共享前缀；**总 prompt = 两者之和**（`datasets.py` RandomDataset 确证）。用于模拟目标前缀缓存命中率 |
+| `--percentile-metrics` | `ttft` | 逗号分隔；合法值 `ttft,tpot,itl,e2el`（控制输出哪些百分位） |
 | `--trust-remote-code` / `--tokenizer` | off / None | — |
 
 ### `--goodput`（关键）
@@ -94,6 +96,7 @@ Chunked prefill is enabled with max_num_batched_tokens=%d.
 - `GET /health` → **200** 健康 / **503** `EngineDeadError`。
 - 轮询：`curl -s -o /dev/null -w "%{http_code}" http://<host>:<port>/health`，或等 `/v1/models` 可用。
 - 其他：`/load`、`/version`、`/metrics`、`/kv_event_sources`。
+- `POST /reset_prefix_cache`：清空前缀缓存（bench.py 在 repeats 之间调用，保证每次测量为冷缓存独立）。
 
 ## 6. NCCL 环境变量（多 GPU / 跨节点）
 

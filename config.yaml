@@ -7,6 +7,10 @@
 # 产出 gmu_probe.json 的 gmu_suggested（共享主机易 OOM，先找安全上限再调参）。
 # 建议把它写进下方 serve.gpu-memory-utilization 后再跑正式 trial。
 
+# 前缀缓存测量：target/harness 的 workload.prefix_hit_pct（仅 random 数据集）>0 时，
+# bench 按 isl×pct/100 拆共享前缀（--random-prefix-len + --random-input-len 余量），
+# enable-prefix-caching 才可测出收益；repeats≥2 前会 POST /reset_prefix_cache 保证冷缓存独立测量。
+
 env: {}                         # 进程级环境变量，随每次 server 启动注入（如 NCCL_*、VLLM_*）
 
 model:                          # 可选：覆盖 target.yaml 的模型（如量化变体 repo id）。留空则不覆盖。

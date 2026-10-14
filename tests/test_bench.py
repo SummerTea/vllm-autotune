@@ -4,6 +4,8 @@
 - 解析器：stdout 表格 / --save-result JSON / 启动日志校准行
 - 命令构建（docker）：serve 的 kebab flag / 布尔（true→裸 flag，false→省略，no- 前缀关默认开关）
   / 端口；bench 的 --network host / --base-url / 结果目录挂载 / 模型只读挂载
+- workload 前缀缓存（C）：prefix_hit_pct 拆 isl → --random-prefix-len/--random-input-len；
+  repeats 间 reset_prefix_cache（D）；--percentile-metrics（G）
 - 生命周期：fake_docker.sh 全流程（status/result/校准/summary 块，docker rm 先于 run）
 - crash 路径：serve 容器立即退出（并验证清理被调用）
 - gmu 预检：候选序列（start/step/floor）/ 强制 --load-format dummy + --gpu-memory-utilization
@@ -14,6 +16,8 @@ import json
 import os
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -190,6 +194,78 @@ class TestDockerRuntime:
         cmd2 = bench.build_docker_bench_cmd("docker", self.RUNTIME, "/model", workload,
                                             slo, 8, 0, "/tmp/r", port=8000)
         assert "-v /host/models/m:/model:ro" not in " ".join(cmd2)
+
+
+# ── workload 前缀缓存（C）/ 测量卫生（D+G）──────────────────────────────
+
+class TestBenchArgs:
+    SLO = {"ttft_p99_ms": 500, "tpot_p99_ms": 50}
+
+    def test_prefix_pct_zero_keeps_input_len(self):
+        # (a) prefix_hit_pct=0（默认）→ 维持 --input-len，无 --random-prefix-len
+        wl = {"dataset": "random", "isl": 1000, "osl": 128, "num_prompts": 8}
+        args = bench._bench_args("Qwen/Qwen3-32B", wl, self.SLO, 8, 0, "/r", False, 8000)
+        joined = " ".join(args)
+        assert "--input-len 1000" in joined
+        assert "--random-prefix-len" not in joined
+        assert "--percentile-metrics ttft,tpot,itl,e2el" in joined   # (c)
+
+    def test_prefix_pct_splits_isl(self):
+        # (b) prefix_hit_pct=60, isl=1000 → 600 前缀 + 400 余量，总 prompt ≈ isl
+        wl = {"dataset": "random", "isl": 1000, "osl": 128, "num_prompts": 8,
+              "prefix_hit_pct": 60}
+        args = bench._bench_args("Qwen/Qwen3-32B", wl, self.SLO, 8, 0, "/r", False, 8000)
+        joined = " ".join(args)
+        assert "--random-input-len 400" in joined
+        assert "--random-prefix-len 600" in joined
+        assert "--input-len" not in joined
+        assert "--output-len 128" in joined
+        assert "--percentile-metrics ttft,tpot,itl,e2el" in joined   # (c)
+
+    def test_prefix_pct_ignored_for_non_random(self):
+        # 非 random 数据集：prefix_hit_pct 忽略，维持 --input-len，不产 --random-prefix-len
+        wl = {"dataset": "sharegpt", "isl": 1000, "osl": 128, "num_prompts": 8,
+              "prefix_hit_pct": 60}
+        args = bench._bench_args("Qwen/Qwen3-32B", wl, self.SLO, 8, 0, "/r", False, 8000)
+        joined = " ".join(args)
+        assert "--input-len 1000" in joined
+        assert "--random-prefix-len" not in joined
+        assert "--random-input-len" not in joined
+
+    def test_reset_prefix_cache_posts_url(self, tmp_path, monkeypatch):
+        # (D) 尽力 POST /reset_prefix_cache；断言方法/URL/超时，非 200 容忍
+        calls = []
+
+        class FakeResp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=0):
+            calls.append((req.full_url, req.get_method(), timeout))
+            return FakeResp()
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        log = tmp_path / "run.log"
+        with open(log, "wb") as fh:
+            bench._reset_prefix_cache(18090, fh)
+        assert calls == [("http://127.0.0.1:18090/reset_prefix_cache", "POST", 5)]
+        assert log.read_text(encoding="utf-8") == ""                 # 200 → 无日志
+
+    def test_reset_prefix_cache_tolerates_failure(self, tmp_path, monkeypatch):
+        # (D) 连接失败（模拟）→ 容忍：写 run.log，不抛异常
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            lambda req, timeout=0: (_ for _ in ()).throw(
+                                urllib.error.URLError("boom")))
+        log = tmp_path / "run.log"
+        with open(log, "wb") as fh:
+            bench._reset_prefix_cache(18090, fh)
+        text = log.read_text(encoding="utf-8")
+        assert "reset_prefix_cache 失败（容忍）" in text and "boom" in text
 
 
 # ── --detect-gmu 预检（候选序列 / serve 参数 / stub 探测降级）──────────────
