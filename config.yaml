@@ -11,7 +11,8 @@
 # bench 按 isl×pct/100 拆共享前缀（--random-prefix-len + --random-input-len 余量），
 # enable-prefix-caching 才可测出收益；repeats≥2 前会 POST /reset_prefix_cache 保证冷缓存独立测量。
 
-env: {}                         # 进程级环境变量，随每次 server 启动注入（如 NCCL_*、VLLM_*）
+env: {}                         # 进程级环境变量，随每次 server 启动注入（如 NCCL_*、VLLM_*）；
+                                # NUMA 限定可见 GPU 用 CUDA_VISIBLE_DEVICES（如 "0,1,2,3"，tp 按可见数设置）
 
 model:                          # 可选：覆盖 target.yaml 的模型（如量化变体 repo id）。留空则不覆盖。
 runtime: {}                     # 可选；覆盖 harness.yaml 的 runtime 默认（逐键合并）。docker-only 示例：
@@ -19,7 +20,10 @@ runtime: {}                     # 可选；覆盖 harness.yaml 的 runtime 默�
 #   image: vllm/vllm-openai:v0.31.0     # ★ 合法的搜索维度（如 CUDA 12/13 变体镜像）；默认不 pull，需预先准备
 #   container_model_path: /model        # 容器内模型挂载点（默认 /model）
 #   shm_size: 16g                       # --shm-size（默认 16g）
-#   extra_docker_args: []                # 附加 docker run 参数（--ipc=host/--shm-size 已含默认，无需重复）
+#   extra_docker_args: []                # 附加 docker run 参数（--ipc=host/--shm-size 已含默认，无需重复）；
+#                                        # NUMA 对齐可 opt-in 传 --cpuset-cpus/--cpuset-mems（仅影响本 trial 容器，
+#                                        #   不改变主机）；限定可见 GPU 用 env.CUDA_VISIBLE_DEVICES——勿经此传 --gpus，
+#                                        #   构建器已固定 --gpus all，再传会重复冲突
 serve: {}                       # vLLM serve 参数，kebab-case 作为 CLI flag。
                                 # 布尔约定：true → 裸 flag（--enable-x）；false → 省略（保持默认）；
                                 # 要关闭默认开启的开关，写 no-<flag>: true（原样透传为 --no-<flag>）。例如：

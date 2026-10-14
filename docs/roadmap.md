@@ -10,6 +10,7 @@
 - 零破坏契约不变：默认不 pull 镜像、不安装环境；v1.1 的监控/基准均为可选旁路，缺失不影响默认循环。
 - 真机已验证：**8×RTX6000D**（docker 运行时）跑通 probe → bench → report 全链路与校准。
 - 已随仓库交付工程级 skills（`.agents/skills/`：vllm-bench-serve / vllm-deploy-docker / vllm-prefix-cache-bench，见 `skills-lock.json`）。
+- **NUMA 采集/约束已实现**：`probe.py` 产出 `env.json` 的 `numa_groups`（每 GPU `numa_node`）+ 检查清单「NUMA 放置」建议（warn on 多 NUMA）+ `program.md` 剪枝规则（tp 组限同 NUMA 节点）；系统级绑定仍**只建议、不自动**（零破坏契约不变）。
 
 ## v1.1 — 低成本增强
 
@@ -42,6 +43,11 @@
 - **集成方式**：`vllm-tuner`（PyPI）作候选生成器，benchmark 提供方用 vLLM built-in；先小冒烟再接入（新项目 v0.1.0，需核 license/维护）。
 - **成本**：中。
 - **依据**：external-resources.md §6（vllm-tuner 行）、Top-8 #4。
+
+### (f) opt-in 自动 NUMA/cpuset 绑定（**明确未做**）
+- **现状**：NUMA 采集/约束已实现（`probe.py` `numa_groups` + 「NUMA 放置」检查清单建议 + `program.md` 剪枝规则）；系统级绑定仍只建议、不自动。
+- **目标**：把「NUMA 亲和」从只建议升级为可 opt-in 的自动绑定——容器 `--cpuset-cpus/--cpuset-mems` + `env.CUDA_VISIBLE_DEVICES` 限定可见 GPU、必要时宿主机 `numactl` 绑定（改动前记录原值、失败自动回滚）。**注意**：`build_docker_run_cmd` 已固定 `--gpus all`，若将来改用 `--gpus device=` 限卡，须先在构建器做 `--gpus` 去重（或统一走 `CUDA_VISIBLE_DEVICES`）。
+- **成本**：低-中；属 v2「系统级参数白名单自动调」的前置子项。
 
 ## v2 — 架构扩展
 

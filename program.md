@@ -70,9 +70,11 @@ commit  goodput  output_tok_s  ttft_p99_ms  tpot_p99_ms  peak_vram_gb  dur_s  st
 依据 `env.json` / `model_profile.json` 动态剪枝，避免试已知无效的配置：
 
 - **节点内互联**：NVLink / NVSwitch 全互联 → `tensor-parallel-size`（tp）可到 GPU 数；仅 PCIe → tp ≤ 4，优先并行数据（dp）。
+- **tp 优先序**：tp ≤ 4（PCIe）是**性能建议**；若单节点装不下模型（依据 `model_profile.json` 的权重量估算）则必须跨节点——此时以"可装下"为先，跨 NUMA 损耗须实测。
+- **NUMA 亲和**：tp 组应限定在**同一 NUMA 节点内**的 GPU（依据 `env.json` 的 `numa_groups`，如 8 卡两节点 → tp=4 选 `[0,1,2,3]` 或 `[4,5,6,7]`）；tp=8 跨两节点（走 SYS/跨 NUMA）仅在同节点方案不可行时才试，跨 NUMA 损耗需实测确认。GPU 选择经 `config.yaml` 的 `serve.tensor-parallel-size` + `env.CUDA_VISIBLE_DEVICES`（如 `"0,1,2,3"`，限定本 trial 容器可见的 GPU，随 `-e` 注入、零冲突）——`tp` 按可见 GPU 数设置。**主机级**绑定（`numactl --cpunodebind/--membind`）→ **只建议**（写进 `report.md`），不自动；**容器级** `--cpuset-cpus/--cpuset-mems`（经 `runtime.extra_docker_args`）→ **agent 可 opt-in**（仅影响本 trial 容器，零破坏，不改变主机）。
 - **RDMA**：有 RoCE / IB → NCCL 相关 env、NIXL / PD 分离进入搜索空间；无 → 移出搜索空间（NCCL env 名见 `docs/vllm-facts.md` §6；NIXL / PD 相关 env 需 agent 自行查证后使用）。
 - **合法 tp 集合**：由 `num_attention_heads` / `num_key_value_heads` 的约数决定，非法 tp 值不试。
-- **系统级参数**：governor / hugepages / 锁频等只探测 + 建议（写进 report.md），不自动修改（v1 不提供自动修改开关）。
+- **系统级参数**：governor / hugepages / 锁频 / **主机级 NUMA 亲和绑定**等只探测 + 建议（写进 report.md），不自动修改（v1 不提供自动修改开关）。
 - **布尔参数约定**：`true` → 裸 flag（`--enable-x`）；`false` → 省略（保持 vLLM 默认）；要关闭默认开启的开关，写 `no-<flag>: true`（原样透传为 `--no-<flag>`）。
 - **前缀缓存可测性**：`workload.prefix_hit_pct`（0-100，仅 random 数据集）让 `enable-prefix-caching` 成为可测维度——random 数据默认无共享前缀，prefix caching 测不出收益；`>0` 时 bench 按 `prefix_len = isl×pct/100` 拆共享前缀、`adjusted = isl−prefix_len`（总 prompt ≈ isl）。repeats 之间会 `POST /reset_prefix_cache` 保证每次测量是冷缓存独立（首 repeat 起服即冷缓存）。
 - **运行时与镜像（docker-only）**：`runtime.image` 是合法搜索维度（如 CUDA 12/13 变体镜像）；镜像须在主机**预先准备**（模板不自动拉取，保持主机零新增），先固定镜像再调参。
