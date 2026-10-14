@@ -2,6 +2,11 @@
 # 每次实验只改这里，然后 commit + 运行 run.sh。
 # 基线状态：serve 为空，即除必要参数外不加任何调优项。
 
+# 可选预检（Phase 1/2 之间）：`bash run.sh --detect-gmu` 再轮询 `bash run.sh --poll`
+# 用 --load-format dummy 快速起服，从高到低探测最大可用 gpu-memory-utilization，
+# 产出 gmu_probe.json 的 gmu_suggested（共享主机易 OOM，先找安全上限再调参）。
+# 建议把它写进下方 serve.gpu-memory-utilization 后再跑正式 trial。
+
 env: {}                         # 进程级环境变量，随每次 server 启动注入（如 NCCL_*、VLLM_*）
 
 model:                          # 可选：覆盖 target.yaml 的模型（如量化变体 repo id）。留空则不覆盖。

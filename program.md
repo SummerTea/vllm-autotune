@@ -79,6 +79,7 @@ commit  goodput  output_tok_s  ttft_p99_ms  tpot_p99_ms  peak_vram_gb  dur_s  st
 
 ## 成本梯度
 
+- 廉价起服/内存适配预检用 `run.sh --detect-gmu` → `bash run.sh --poll` 循环：远端 `bench.py --detect-gmu` 用 `--load-format dummy` 从高到低探测安全 `gpu-memory-utilization`，结果回传本机 `gmu_probe.json`（`gmu_suggested` 建议用进后续 config）。dummy 生成**同 shape/dtype** 的张量，显存占用与稠密模型调度有代表性；**MoE 模型不适用**（router 依赖门控权重，dummy 下各 expert 负载/显存/吞吐失真）——dummy 仅用于起服/内存适配探测，**吞吐 keep/discard 实验一律用真实权重**。
 - 先穷尽廉价的调度 / 内存类旋钮（`max-num-seqs`、`max-num-batched-tokens`、`gpu-memory-utilization`、KV 缓存相关等，flag 名称见 `config.yaml` 示例与 vLLM 文档）。
 - 再做结构性改动：tp / 量化 / 投机解码会重新加载权重甚至重新下载，成本高，只在廉价旋钮耗尽后考虑。
 

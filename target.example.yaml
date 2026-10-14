@@ -2,6 +2,9 @@
 # 缺项时编码 agent 会向你提问，不会自行假设。
 # 注：每个主机的 work_dir 是该主机上模板唯一允许写入的目录，必须由用户确认
 #（Phase 0 缺项时 agent 必须询问确认，不得自行假设或写入其他路径）。
+# 可选预检（Phase 1/2 之间）：`bash run.sh --detect-gmu` 再轮询 `bash run.sh --poll`
+#（--load-format dummy 快速起服，探测最大可用 gpu-memory-utilization；结果回传本机 gmu_probe.json）→
+# gmu_suggested 建议用进后续 config.yaml 的 serve.gpu-memory-utilization。
 
 hosts:                          # 1..N 台。v1 只在 role=head 的主机上跑实验，其余仅做采集探测。
   - name: head

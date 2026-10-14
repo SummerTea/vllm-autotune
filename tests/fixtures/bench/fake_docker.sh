@@ -6,6 +6,8 @@
 #   run … serve …  → 打印 KV 校准行并起 /health=200 的服务常驻（docker run attach 语义）
 #   run … bench …  → 打印样例 bench 表格并把 saved JSON 写进 -v host:container 的宿主侧目录
 #   FAKE_DOCKER_CRASH=1 时 serve 立即 exit 1（crash 路径）
+#   FAKE_DOCKER_OOM_ABOVE=<g> 时，serve 的 --gpu-memory-utilization > g 则 exit 1（模拟 HBM OOM，
+#   --detect-gmu 降级探测路径）；≤ g 正常起服。
 
 STATE_FILE="${FAKE_DOCKER_STATE_FILE:-/tmp/fake_docker_state.txt}"
 mkdir -p "$(dirname "$STATE_FILE")"
@@ -22,11 +24,13 @@ if [ "$1" = "rm" ]; then
   exit 0
 fi
 
-# 解析：--port <n>、-v <host>:<container>（取宿主侧）、--entrypoint vllm <image> <serve|bench>
-SUB=""; PORT=""; RDIR_HOST=""; prev=""; entry_seen=""; entry_tok=0
+# 解析：--port <n>、-v <host>:<container>（取宿主侧）、--gpu-memory-utilization <g>、
+#   --entrypoint vllm <image> <serve|bench>
+SUB=""; PORT=""; RDIR_HOST=""; GMU=""; prev=""; entry_seen=""; entry_tok=0
 for a in "$@"; do
   if [ "$prev" = "--port" ]; then PORT=$a; fi
   if [ "$prev" = "-v" ]; then RDIR_HOST="${a%%:*}"; fi
+  if [ "$prev" = "--gpu-memory-utilization" ]; then GMU=$a; fi
   if [ "$a" = "--entrypoint" ]; then
     entry_seen=1
     entry_tok=0
@@ -43,6 +47,12 @@ done
 if [ "$SUB" = "serve" ]; then
   if [ "${FAKE_DOCKER_CRASH:-0}" = "1" ]; then
     echo "fake docker serve crashing" >&2
+    exit 1
+  fi
+  # FAKE_DOCKER_OOM_ABOVE=<g>：gmu > g → 模拟 HBM OOM 退出（--detect-gmu 降级路径）
+  if [ -n "${FAKE_DOCKER_OOM_ABOVE:-}" ] && [ -n "$GMU" ] \
+     && awk -v g="$GMU" -v o="$FAKE_DOCKER_OOM_ABOVE" 'BEGIN{exit !(g>o)}'; then
+    echo "fake docker serve OOM (gmu=$GMU > $FAKE_DOCKER_OOM_ABOVE)" >&2
     exit 1
   fi
   exec python3 - "$PORT" <<'EOF'

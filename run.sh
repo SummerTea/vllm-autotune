@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # run.sh — 两段式远程执行驱动器（启动 / 轮询 / 取结果），本机 shell 永不阻塞于 trial。
 #   无参数  : 启动一轮 trial（rsync → 远端 nohup 后台跑 → 秒回）
+#   --detect-gmu : 启动 gmu 预检（同 start；远端 bench.py --detect-gmu，结果回传 gmu_probe.json）
 #   --poll  : 单次状态检查；退出码 3=仍在运行 0=done 1=crash（无 status.json 也按 3）
 #   --fetch : 打印本机最新 result.json（来自上次 done 的回传副本）
 set -euo pipefail
@@ -137,7 +138,9 @@ rsync_back() {  # $1 = head_ssh  $2 = 远端文件名（相对 REMOTE_DIR）
 }
 
 # ── 动作 ───────────────────────────────────────────────────────────────
-cmd_start() {
+cmd_start() {  # $1 = 可选 "--detect-gmu"：启动 gmu 预检而非正式 trial
+  local mode="${1:-}" bench_extra=""
+  if [ "$mode" = "--detect-gmu" ]; then bench_extra=" --detect-gmu"; fi
   local f
   for f in config.yaml harness.yaml target.yaml bench.py; do
     if [ ! -f "$f" ]; then
@@ -177,16 +180,17 @@ cmd_start() {
     for kv in "${config_env[@]}"; do env_str+=" $(sh_quote "$kv")"; done
   fi
   if ! ssh "${SSH_OPTS[@]}" -n "$head_ssh" \
-      "mkdir -p $p && cd $p && nohup env$env_str $(path_for_remote "$vllm_python") bench.py --config config.yaml --harness harness.yaml --target target.yaml --out-dir . </dev/null > bench.stdout 2>&1 & echo \$! > bench.pid"; then
+      "mkdir -p $p && cd $p && nohup env$env_str $(path_for_remote "$vllm_python") bench.py --config config.yaml --harness harness.yaml --target target.yaml --out-dir .$bench_extra </dev/null > bench.stdout 2>&1 & echo \$! > bench.pid"; then
     echo "远端启动失败（请查 $head_ssh:$p/bench.stdout）" >&2
     return 1
   fi
 
   # 抓一次远端 PID / 状态（status.json 可能还没生成，属于正常）
-  local pid st
+  local pid st started_tag
   pid="$(ssh "${SSH_OPTS[@]}" "$head_ssh" "cat $p/bench.pid 2>/dev/null || true")" || true
   st="$(ssh "${SSH_OPTS[@]}" "$head_ssh" "cat $p/status.json 2>/dev/null || true")" || true
-  echo "started; pid=${pid:-?}; poll with: bash run.sh --poll"
+  if [ "$mode" = "--detect-gmu" ]; then started_tag=" (detect-gmu)"; else started_tag=""; fi
+  echo "started${started_tag}; pid=${pid:-?}; poll with: bash run.sh --poll"
   if [ -n "$st" ]; then echo "initial status: $st"; fi
   return 0
 }
@@ -247,19 +251,27 @@ cmd_poll() {
     done)
       rsync_back "$head_ssh" result.json
       rsync_back "$head_ssh" model_profile.json
+      rsync_back "$head_ssh" gmu_probe.json
       echo "=== remote summary ==="
-      local blk
-      blk="$(ssh "${SSH_OPTS[@]}" "$head_ssh" \
-        "awk '/^status:/{start=last} /^---/{last=NR} start&&NR>=start{print}' $p/bench.stdout 2>/dev/null || true")" || true
-      if [ -z "${blk:-}" ]; then
-        blk="$(ssh "${SSH_OPTS[@]}" "$head_ssh" "sed -n '/^---/,\$p' $p/bench.stdout 2>/dev/null || true")" || true
+      local gmu_line blk
+      gmu_line="$(ssh "${SSH_OPTS[@]}" "$head_ssh" \
+        "grep '^gmu_suggested:' $p/bench.stdout 2>/dev/null || true")" || true
+      if [ -n "$gmu_line" ]; then
+        printf '%s\n' "$gmu_line"    # 探测模式：结果已回传本机 gmu_probe.json
+      else
+        blk="$(ssh "${SSH_OPTS[@]}" "$head_ssh" \
+          "awk '/^status:/{start=last} /^---/{last=NR} start&&NR>=start{print}' $p/bench.stdout 2>/dev/null || true")" || true
+        if [ -z "${blk:-}" ]; then
+          blk="$(ssh "${SSH_OPTS[@]}" "$head_ssh" "sed -n '/^---/,\$p' $p/bench.stdout 2>/dev/null || true")" || true
+        fi
+        printf '%s\n' "$blk"
       fi
-      printf '%s\n' "$blk"
       echo "=== end summary ==="
       return 0
       ;;
     crash)
       rsync_back "$head_ssh" result.json
+      rsync_back "$head_ssh" gmu_probe.json
       echo "crash：${message:-详见远端 status.json / bench.stdout}"
       return 1
       ;;
@@ -282,14 +294,16 @@ cmd_fetch() {
 
 usage() {
   cat <<'EOF'
-用法: bash run.sh [--poll|--fetch|--help]
+用法: bash run.sh [--poll|--fetch|--detect-gmu|--help]
   无参数   启动一轮 trial（rsync → 远端 nohup 后台运行 → 秒回）
+  --detect-gmu  启动 gmu 预检（同 start：远端 bench.py --detect-gmu，结果回传 gmu_probe.json）
   --poll   单次状态检查；退出码: 0=done 1=crash 3=仍在运行
   --fetch  打印本机最新 result.json（来自上次 done 的回传副本）
 EOF
 }
 
 case "${1:-}" in
+  --detect-gmu) cmd_start --detect-gmu ;;
   --poll) cmd_poll ;;
   --fetch) cmd_fetch ;;
   --help | -h) usage ;;

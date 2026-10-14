@@ -9,6 +9,12 @@ bench:
   startup_timeout_s: 1200       # 服务器启动就绪超时（大模型加载可能很慢）
   trial_timeout_s: 2400         # 单次实验硬超时
   ref_concurrency: 128          # 参考并发点
+  gmu_detect:                   # --detect-gmu 预检（--load-format dummy 快速起服，从高到低探测
+    start: 0.98                 #   最大可用 gpu-memory-utilization，避免共享主机 OOM）
+    step: 0.02                  # 每级下降步长
+    floor: 0.10                 # 最低尝试值（再低视为无法起服）
+    ready_timeout_s: 120        # 每级等待 /health 就绪超时（dummy 权重秒级起服）
+    total_timeout_s: 900        # 整个探测的总预算（防止 45 级全失败时耗时失控）
 
 slo:                            # goodput 约束；可被 target.yaml 的 metrics.slo 覆盖
   ttft_p99_ms: 500

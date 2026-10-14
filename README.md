@@ -36,7 +36,7 @@
 | `program.md` | 调优循环细则：决策规则、退出机制、剪枝策略 | 只读 |
 | `README.md` | 本文件 | 只读 |
 | `probe.py` | 多机环境探测（并行）→ env.json / env_report.md / model_profile.json | 只读 |
-| `bench.py` | 远端起服 + `vllm bench serve --goodput` 度量 + 僵尸清理 | 只读 |
+| `bench.py` | 远端起服 + `vllm bench serve --goodput` 度量 + 僵尸清理 + 可选 `--detect-gmu` 预检 | 只读 |
 | `report.py` | 收尾汇总 → report.md（基线 vs 最佳 + 全部 trial + 系统级建议） | 只读 |
 | `run.sh` | 两段式执行：rsync + 远端 nohup 启动 + 轮询状态 | 只读 |
 | `setup_remote.sh` | 主机环境校验（docker-only：校验 docker 可用 + 镜像就绪；零 pull、零安装） | 只读 |
@@ -68,6 +68,7 @@
 
 1. 跑 `python probe.py`，检查生成的 `env_report.md`（系统参数清单 pass / warn / fail）。
 2. 用初始 `config.yaml`（基线）跑 `bash run.sh` 并轮询 `bash run.sh --poll` 至退出 0，确认 bench 出数正常。
+2.5 可选预检（共享主机防 OOM）：`bash run.sh --detect-gmu`，然后循环 `bash run.sh --poll` 至退出 0，结果回传本机 `gmu_probe.json`（`gmu_suggested` 为安全 `gpu-memory-utilization` 起点）。
 3. 跑一次短预算循环，确认 keep / discard 判定与三层退出逻辑正确。
 
 > 注：全部脚本均已交付（清单 1/2/3 条均可执行）。离线排练：`uv run pytest -q` 无需 GPU/网络即可跑通 probe → bench → report 的 mock 全链路与循环规则核对。

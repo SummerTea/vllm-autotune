@@ -6,6 +6,8 @@
   / 端口；bench 的 --network host / --base-url / 结果目录挂载 / 模型只读挂载
 - 生命周期：fake_docker.sh 全流程（status/result/校准/summary 块，docker rm 先于 run）
 - crash 路径：serve 容器立即退出（并验证清理被调用）
+- gmu 预检：候选序列（start/step/floor）/ 强制 --load-format dummy + --gpu-memory-utilization
+  / stub OOM 降级（FAKE_DOCKER_OOM_ABOVE）→ gmu_probe.json + model_profile 就地补 gmu_suggested
 """
 
 import json
@@ -188,6 +190,178 @@ class TestDockerRuntime:
         cmd2 = bench.build_docker_bench_cmd("docker", self.RUNTIME, "/model", workload,
                                             slo, 8, 0, "/tmp/r", port=8000)
         assert "-v /host/models/m:/model:ro" not in " ".join(cmd2)
+
+
+# ── --detect-gmu 预检（候选序列 / serve 参数 / stub 探测降级）──────────────
+
+class TestGmuDetect:
+    RUNTIME = {"kind": "docker", "image": "vllm/vllm-openai:v0.31.0",
+               "container_model_path": "/model", "shm_size": "16g"}
+
+    def test_gmu_candidates_defaults(self):
+        cands = bench.gmu_candidates({})
+        assert cands[:3] == [0.98, 0.96, 0.94]
+        assert cands[-1] == 0.10
+        assert len(cands) == 45                      # (0.98-0.10)/0.02 + 1
+
+    def test_gmu_candidates_custom_start_step_floor(self):
+        cfg = {"gmu_detect": {"start": 0.5, "step": 0.05, "floor": 0.35}}
+        assert bench.gmu_candidates(cfg) == [0.5, 0.45, 0.4, 0.35]
+
+    def test_gmu_probe_config_overrides_and_flags(self):
+        # 覆盖 config 已有的 gmu/load-format（含下划线变体），强制 dummy + 候选 gmu
+        cfg = bench._gmu_probe_config({"serve": {"max-num-seqs": 8,
+                                                 "gpu_memory_utilization": 0.5,
+                                                 "load_format": "safetensors"}}, 0.9)
+        serve = cfg["serve"]
+        assert serve["load-format"] == "dummy" and serve["gpu-memory-utilization"] == 0.9
+        assert "gpu_memory_utilization" not in serve and "load_format" not in serve
+        cmd = bench.build_docker_run_cmd("docker", self.RUNTIME, "/m", 8000, cfg)
+        joined = " ".join(cmd)
+        assert "--load-format dummy" in joined
+        assert "--gpu-memory-utilization 0.9" in joined
+        assert "0.5" not in joined and "safetensors" not in joined
+
+
+def test_gmu_probe_stub_docker(tmp_path, capsys, monkeypatch):
+    # FAKE_DOCKER_OOM_ABOVE=0.95：0.98/0.96 起服即 OOM 退出，0.94 起服成功
+    port = 18095
+    _write_docker_inputs(tmp_path, port, startup=10, trial=30, repeats=1)
+    out = tmp_path / "out"
+    out.mkdir()
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+    monkeypatch.setenv("FAKE_DOCKER_OOM_ABOVE", "0.95")
+    # 预置 model_profile.json：探测后应就地补 gmu_suggested（保留其余字段）
+    (out / "model_profile.json").write_text(
+        json.dumps({"model": "Qwen/Qwen3-32B", "calibrated": False,
+                    "kv": {"bytes_per_token": 262144}}), encoding="utf-8")
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file) + ["--detect-gmu"])
+    assert rc == 0
+    probe = json.loads((out / "gmu_probe.json").read_text(encoding="utf-8"))
+    assert probe["gmu_suggested"] == pytest.approx(0.94)          # ≤ 0.95（首个不 OOM 的值）
+    assert probe["tried"] == [0.98, 0.96, 0.94]
+    assert probe["load_format"] == "dummy"
+    assert "serve 在 gmu=0.94 就绪" in probe["reason"]
+    sout = capsys.readouterr().out
+    assert "gmu_suggested: 0.94" in sout
+    # run.log：各级 serve cmd 都带 --load-format dummy 与候选 gmu；失败级留痕
+    log = (out / "run.log").read_text(encoding="utf-8")
+    assert "--load-format dummy" in log
+    assert "--gpu-memory-utilization 0.98" in log
+    assert "gmu=0.98 失败" in log and "gmu=0.96 失败" in log
+    # model_profile.json 就地补 gmu_suggested，其余字段保留
+    p2 = json.loads((out / "model_profile.json").read_text(encoding="utf-8"))
+    assert p2["gmu_suggested"] == pytest.approx(0.94)
+    assert p2["calibrated"] is False and p2["kv"]["bytes_per_token"] == 262144
+    # (c) 探测写 status.json（done），run.sh --poll 可直接轮询
+    status = json.loads((out / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "done" and status["phase"] == "done"
+    assert "gmu_suggested=0.94" in status["message"]
+
+
+def test_gmu_probe_missing_image_crash(tmp_path, capsys, monkeypatch):
+    # (a) 镜像预检失败 → 探测不开始，status.json crash + 明确消息 + 无 gmu_probe.json
+    port = 18096
+    _write_docker_inputs(tmp_path, port, startup=10, trial=30, repeats=1)
+    out = tmp_path / "out"
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+    monkeypatch.setenv("FAKE_DOCKER_NO_IMAGE", "1")
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file) + ["--detect-gmu"])
+    assert rc == 1
+    status = json.loads((out / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "crash" and status["phase"] == "crash"
+    assert "未在主机预先准备" in status["message"]
+    assert not (out / "gmu_probe.json").exists()
+    captured = capsys.readouterr()
+    assert "未在主机预先准备" in captured.err
+
+
+def test_gmu_probe_floor_exhausted(tmp_path, capsys, monkeypatch):
+    # (b) 全部候选 OOM（FAKE_DOCKER_OOM_ABOVE=0）→ gmu_suggested null + rc=1 + status crash
+    port = 18097
+    _write_docker_inputs(tmp_path, port, startup=10, trial=30, repeats=1)
+    out = tmp_path / "out"
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+    monkeypatch.setenv("FAKE_DOCKER_OOM_ABOVE", "0")
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file) + ["--detect-gmu"])
+    assert rc == 1
+    probe = json.loads((out / "gmu_probe.json").read_text(encoding="utf-8"))
+    assert probe["gmu_suggested"] is None
+    assert probe["tried"][0] == 0.98 and probe["tried"][-1] == 0.10   # 试满到 floor
+    status = json.loads((out / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "crash" and status["phase"] == "crash"
+    sout = capsys.readouterr().out
+    assert "gmu_suggested: 无" in sout
+
+
+def test_gmu_probe_status_running_then_done(tmp_path, monkeypatch):
+    # (c) 探测期间 status.json 为 running/probing，成功后转为 done
+    import threading
+    # 放慢 /health 探测（每级 0.5s），让 running 状态有可观测窗口；不动 fixture
+    real_health = bench._health_code
+
+    def slow_health(port, timeout=2.0):
+        time.sleep(0.5)
+        return real_health(port, timeout)
+
+    monkeypatch.setattr(bench, "_health_code", slow_health)
+    port = 18098
+    _write_docker_inputs(tmp_path, port, startup=10, trial=30, repeats=1)
+    out = tmp_path / "out"
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+
+    res: dict = {}
+
+    def _run():
+        res["rc"] = bench.main(_docker_args(tmp_path, out, state_file) + ["--detect-gmu"])
+
+    t = threading.Thread(target=_run)
+    t.start()
+    seen_running = False
+    end = time.time() + 10
+    while time.time() < end and t.is_alive():
+        sp = out / "status.json"
+        if sp.exists():
+            st = json.loads(sp.read_text(encoding="utf-8"))
+            if st["state"] == "running" and st["phase"] == "probing":
+                seen_running = True
+                break
+        time.sleep(0.05)
+    t.join(timeout=10)
+    assert seen_running, "探测期间应能看到 running/probing 状态"
+    assert res["rc"] == 0
+    final = json.loads((out / "status.json").read_text(encoding="utf-8"))
+    assert final["state"] == "done" and final["phase"] == "done"
+
+
+def test_gmu_probe_total_timeout(tmp_path, capsys, monkeypatch):
+    # minor 2：总预算耗尽（total_timeout_s=0）→ 中止探测，gmu_suggested null + reason 含 total_timeout
+    monkeypatch.setattr(bench, "DEFAULT_GMU_DETECT",
+                        {**bench.DEFAULT_GMU_DETECT, "total_timeout_s": 0})
+    port = 18099
+    _write_docker_inputs(tmp_path, port, startup=10, trial=30, repeats=1)
+    out = tmp_path / "out"
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file) + ["--detect-gmu"])
+    assert rc == 1
+    probe = json.loads((out / "gmu_probe.json").read_text(encoding="utf-8"))
+    assert probe["gmu_suggested"] is None
+    assert probe["tried"] == []
+    assert "total_timeout" in probe["reason"]
+    status = json.loads((out / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "crash" and status["phase"] == "crash"
+    sout = capsys.readouterr().out
+    assert "gmu_suggested: 无" in sout and "total_timeout" in sout
+
 
 
 # ── docker 运行时生命周期（stub docker，无真实 docker/GPU）─────────────────

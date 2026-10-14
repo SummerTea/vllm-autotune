@@ -8,10 +8,12 @@ run.log，并用启动日志实测值就地校准 model_profile.json，最后 do
 
 对仓库只读（绝不改 config.yaml）；只写 --out-dir。
 
-冻结接口（run.sh / 编码 agent 依赖，勿改）：
-  CLI: python bench.py --config config.yaml --harness harness.yaml --target target.yaml --out-dir .
-       测试钩子：--docker-cmd（指向 stub docker 客户端）；
-       轮询间隔 --poll-interval、显存采样间隔 --vram-interval 亦可调参（保证测试可跑）。
+  冻结接口（run.sh / 编码 agent 依赖，勿改）：
+    CLI: python bench.py --config config.yaml --harness harness.yaml --target target.yaml --out-dir .
+        测试钩子：--docker-cmd（指向 stub docker 客户端）；
+        轮询间隔 --poll-interval、显存采样间隔 --vram-interval 亦可调参（保证测试可跑）。
+        --detect-gmu：可选预检——用 --load-format dummy 从高到低探测最大可用
+                     gpu-memory-utilization，写 gmu_probe.json 后退出（不跑 trial）。
   产物:
     status.json   {"state":"running|done|crash","phase":"loading|benching|done|crash",
                    "started_at":ISO,"updated_at":ISO,"message":str}
@@ -20,6 +22,7 @@ run.log，并用启动日志实测值就地校准 model_profile.json，最后 do
                    失败 {"status":"crash","reason":str, ...}
     run.log       vllm serve 容器的 stdout/stderr（另附 bench 每次调用的标注与输出，便于排障）
     model_profile.json 就地校准 boot.measured_seconds / kv.measured_capacity_tokens / calibrated=true
+    gmu_probe.json 仅 --detect-gmu：{"gmu_suggested":X|None,"tried":[..],"load_format":"dummy","reason":str}
   stdout 末尾固定输出 "---\nstatus: ...\n..." 块，供 agent grep。
 """
 
@@ -54,6 +57,9 @@ DEFAULT_REF_CONCURRENCY = 128
 DEFAULT_SEED = 0
 HEALTH_URL = "http://127.0.0.1:{port}/health"
 KV_LINE_RE = re.compile(r"GPU KV cache size:\s*([\d,]+)\s*tokens")
+# --detect-gmu 预检（借鉴 vLLM auto_tune.sh:252-272 + :95，见 docs/auto-tune-notes.md A/B）
+DEFAULT_GMU_DETECT = {"start": 0.98, "step": 0.02, "floor": 0.10,
+                      "ready_timeout_s": 120, "total_timeout_s": 900}
 
 
 def _now_iso() -> str:
@@ -246,6 +252,159 @@ def build_docker_bench_cmd(docker_cmd: str, runtime: dict, model: str, workload:
     base += ["--entrypoint", "vllm", image, "bench", "serve"]
     return base + _bench_args(model, workload, slo, ref_conc, seed, container_result_dir,
                               trust_remote_code, port)
+
+
+def _start_serve_and_wait(docker_cmd: str, runtime: dict, model_path: str, port: int,
+                          config: dict, log_fh, log_path: str, deadline: float,
+                          startup_timeout_s: float, poll_interval: float,
+                          kv_sink: list[int | None], procs: list[subprocess.Popen]) -> None:
+    """docker 起 serve（attach → log_fh）并轮询 /health 至就绪；失败 raise TrialCrash。
+    普通 trial 与 --detect-gmu 探测共用。KV 校准行写入 kv_sink[0]；serve 进程追加到
+    procs（由调用方负责清理——探测模式每级尝试后须清理）。"""
+    docker_clean_stale(docker_cmd)  # 先清残留同名容器（幂等），再 run
+    serve_tokens = build_docker_run_cmd(docker_cmd, runtime, model_path, port, config)
+    log_fh.write(f"=== bench.py {_now_iso()} serve(docker): {shlex.join(serve_tokens)}\n".encode())
+    log_fh.flush()
+    # docker run 前台/attach 模式：容器 stdout 即 serve 日志，直接落入 run.log（含 KV 校准行）
+    procs.append(subprocess.Popen(serve_tokens, stdout=log_fh, stderr=subprocess.STDOUT,
+                                  env=os.environ, start_new_session=True))
+    # 就绪轮询：/health 200；503(EngineDeadError)/进程退出/超时 → crash
+    ready_deadline = time.monotonic() + min(startup_timeout_s, max(0.0, deadline - time.monotonic()))
+    ready = False
+    while time.monotonic() < ready_deadline:
+        if procs[0].poll() is not None:
+            raise TrialCrash(f"serve 提前退出（rc={procs[0].poll()}）")
+        code = _health_code(port)
+        if code == 200:
+            ready = True
+            break
+        if code == 503:
+            raise TrialCrash("EngineDeadError（/health 返回 503）")
+        kv = _scan_kv(log_path)
+        if kv:
+            kv_sink[0] = kv
+        time.sleep(poll_interval)
+    if not ready:
+        if time.monotonic() >= deadline:
+            raise TrialCrash("trial_timeout")
+        raise TrialCrash("startup_timeout")
+    kv = _scan_kv(log_path)  # 日志可能晚刷新，就绪后再扫一次
+    if kv:
+        kv_sink[0] = kv
+
+
+# ── --detect-gmu 预检（最大可用 gpu-memory-utilization，--load-format dummy）────────
+
+def gmu_candidates(bench_cfg: dict) -> list[float]:
+    """候选 gpu-memory-utilization：从 start 按 step 递减到 >= floor。"""
+    d = {**DEFAULT_GMU_DETECT, **((bench_cfg.get("gmu_detect") or {}))}
+    start, step, floor = float(d["start"]), float(d["step"]), float(d["floor"])
+    cands = []
+    v = start
+    while v >= floor - 1e-9:
+        cands.append(round(v, 4))
+        v -= step
+    return cands
+
+
+def _gmu_probe_config(config: dict, gmu: float) -> dict:
+    """探测用 serve 配置：强制 --load-format dummy + --gpu-memory-utilization <gmu>
+    （覆盖 config 中已有的 gmu/load-format 写法，含下划线变体）。"""
+    serve = dict(config.get("serve") or {})
+    for k in [k for k in serve if k.replace("_", "-") in ("gpu-memory-utilization", "load-format")]:
+        del serve[k]
+    serve["gpu-memory-utilization"] = gmu
+    serve["load-format"] = "dummy"
+    return {**config, "serve": serve}
+
+
+def _set_profile_gmu_suggested(out_dir: str, gmu: float | None) -> None:
+    """out_dir 已有 model_profile.json 时，就地补 gmu_suggested（保留其余字段）。"""
+    prof_path = os.path.join(out_dir, "model_profile.json")
+    if not os.path.exists(prof_path):
+        return
+    try:
+        with open(prof_path, encoding="utf-8") as f:
+            profile = json.load(f)
+    except (OSError, ValueError):
+        return
+    profile["gmu_suggested"] = gmu
+    with open(prof_path, "w", encoding="utf-8") as f:
+        json.dump(profile, f, ensure_ascii=False, indent=2)
+
+
+def _run_gmu_probe(docker_cmd: str, runtime: dict, config: dict, target: dict, port: int,
+                   bench_cfg: dict, out_dir: str, poll_interval: float) -> int:
+    """--detect-gmu：从高到低起服（--load-format dummy）探测最大可用 gpu-memory-utilization。
+    产出 gmu_probe.json 与 status.json（running→done/crash，run.sh --poll 可直接轮询）；
+    out_dir 已有 model_profile.json 则就地补 gmu_suggested。
+    返回 0=找到建议值 / 1=失败（floor 耗尽 / total_timeout / 预检不通过）。"""
+    os.makedirs(out_dir, exist_ok=True)
+    started_at = _now_iso()
+    host_model_path = (target.get("model") or {}).get("path")
+    if not host_model_path:
+        msg = "需要 target.yaml 的 model.path（宿主上的模型目录，将只读挂载进容器）"
+        print(f"bench.py: 错误: {msg}", file=sys.stderr)
+        _write_status(out_dir, "crash", "crash", f"gmu 探测失败：{msg}", started_at)
+        return 1
+    img = str(runtime.get("image"))  # main 已保证 image 非空
+    if _run_local([docker_cmd, "image", "inspect", img])[0] != 0:
+        msg = (f"镜像 {img} 未在主机预先准备（本模板不自动拉取，保持主机零新增；"
+               "请人工预先 docker pull 或改用已存在的镜像）")
+        print(f"bench.py: 错误: {msg}", file=sys.stderr)
+        _write_status(out_dir, "crash", "crash", f"gmu 探测失败：{msg}", started_at)
+        return 1
+    detect = {**DEFAULT_GMU_DETECT, **((bench_cfg.get("gmu_detect") or {}))}
+    ready_timeout_s = float(detect["ready_timeout_s"])
+    total_timeout_s = float(detect["total_timeout_s"])
+    cands = gmu_candidates(bench_cfg)
+    _write_status(out_dir, "running", "probing",
+                  f"gmu 探测（--load-format dummy；{len(cands)} 级候选，预算 {total_timeout_s:.0f}s）",
+                  started_at)
+    log_path = os.path.join(out_dir, "run.log")
+    tried: list[float] = []
+    suggested: float | None = None
+    reason = ""
+    timed_out = False
+    total_deadline = time.monotonic() + total_timeout_s
+    with open(log_path, "ab") as log_fh:
+        for gmu in cands:
+            if time.monotonic() >= total_deadline:
+                timed_out = True
+                reason = f"total_timeout（预算 {total_timeout_s:.0f}s 耗尽，尚未有候选成功）"
+                log_fh.write(f"=== bench.py {_now_iso()} total_timeout 中止探测\n".encode())
+                log_fh.flush()
+                break
+            tried.append(gmu)
+            procs: list[subprocess.Popen] = []
+            try:
+                _start_serve_and_wait(docker_cmd, runtime, host_model_path, port,
+                                      _gmu_probe_config(config, gmu), log_fh, log_path,
+                                      float("inf"), ready_timeout_s, poll_interval,
+                                      [None], procs)
+                suggested = gmu
+                reason = f"serve 在 gmu={gmu} 就绪（--load-format dummy）"
+                break
+            except TrialCrash as c:
+                reason = c.reason
+                log_fh.write(f"=== bench.py {_now_iso()} gmu={gmu} 失败: {c.reason}\n".encode())
+                log_fh.flush()
+            finally:
+                _cleanup(procs, docker_cmd)  # 每级尝试后必清理（rm -f 幂等）
+    with open(os.path.join(out_dir, "gmu_probe.json"), "w", encoding="utf-8") as f:
+        json.dump({"gmu_suggested": suggested, "tried": tried, "load_format": "dummy",
+                   "reason": reason}, f, ensure_ascii=False, indent=2)
+    _set_profile_gmu_suggested(out_dir, suggested)
+    if suggested is not None:
+        _write_status(out_dir, "done", "done", f"gmu_suggested={suggested}", started_at)
+        print(f"gmu_suggested: {suggested}")
+        return 0
+    _write_status(out_dir, "crash", "crash", f"gmu 探测失败：{reason}", started_at)
+    if timed_out:
+        print(f"gmu_suggested: 无（{reason}；已尝试 {len(tried)} 级，未到 floor）")
+    else:
+        print(f"gmu_suggested: 无（floor={detect['floor']} 以下仍无法起服；已尝试 {len(tried)} 级）")
+    return 1
 
 
 # ── 环境指纹与校准 ──────────────────────────────────────────────────────
@@ -462,6 +621,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--target", default="target.yaml")
     ap.add_argument("--out-dir", default=".")
     ap.add_argument("--docker-cmd", default="docker", help="docker 客户端命令（测试可指向 stub）")
+    ap.add_argument("--detect-gmu", action="store_true",
+                    help="预检模式：--load-format dummy 从高到低探测最大可用 "
+                         "gpu-memory-utilization，写 gmu_probe.json 后退出（不跑 trial）")
     ap.add_argument("--poll-interval", type=float, default=2.0, help="/health 轮询间隔（秒）")
     ap.add_argument("--vram-interval", type=float, default=2.0, help="显存采样间隔（秒）")
     args = ap.parse_args(argv)
@@ -478,11 +640,18 @@ def main(argv: list[str] | None = None) -> int:
 
     bench_cfg = harness.get("bench") or {}
     remote = harness.get("remote") or {}
+    port = int(remote.get("vllm_port", 8000))
+    out_dir = args.out_dir
+
+    # 预检模式：探测最大可用 gpu-memory-utilization（--load-format dummy）后退出，不跑 trial
+    if args.detect_gmu:
+        return _run_gmu_probe(args.docker_cmd, runtime, config, target, port,
+                              bench_cfg, out_dir, args.poll_interval)
+
     model = config.get("model") or (target.get("model") or {}).get("id")
     if not model:
         _err("config.yaml 与 target.yaml 都未提供模型 id。")
     assert model is not None  # _err 已 exit
-    port = int(remote.get("vllm_port", 8000))
     repeats = int(bench_cfg.get("repeats", 2))
     startup_timeout_s = float(bench_cfg.get("startup_timeout_s", 1200))
     trial_timeout_s = float(bench_cfg.get("trial_timeout_s", 2400))
@@ -494,7 +663,6 @@ def main(argv: list[str] | None = None) -> int:
     slo = {**harness.get("slo", {}), **((target.get("metrics") or {}).get("slo") or {})}
     ref_conc = int(workload.get("ref_concurrency") or bench_cfg.get("ref_concurrency", DEFAULT_REF_CONCURRENCY))
 
-    out_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
     started_at = _now_iso()
     start_mono = time.monotonic()
@@ -518,7 +686,8 @@ def main(argv: list[str] | None = None) -> int:
     kv_tokens: int | None = None
     load_seconds: float | None = None
     result: dict | None = None
-    host_model_path: str | None = None
+    # 启动 helper 在轮询中把 KV 校准行写入 kv_sink[0]；serve 死在启动期也要读回（crash 路径保留）
+    kv_sink: list[int | None] = [None]
 
     try:
         log_path = os.path.join(out_dir, "run.log")
@@ -532,41 +701,13 @@ def main(argv: list[str] | None = None) -> int:
         if _run_local([args.docker_cmd, "image", "inspect", img])[0] != 0:
             raise TrialCrash(f"镜像 {img} 未在主机预先准备（本模板不自动拉取，保持主机零新增；"
                              "请人工预先 docker pull 或改用已存在的镜像）")
-        docker_clean_stale(args.docker_cmd)  # 先清残留同名容器（幂等），再 run
-        serve_tokens = build_docker_run_cmd(args.docker_cmd, runtime, host_model_path, port, config)
-        cpath = container_model_path(runtime)
-        log_fh.write(f"=== bench.py {_now_iso()} serve(docker): {shlex.join(serve_tokens)}\n".encode())
-        log_fh.flush()
-        # docker run 前台/attach 模式：容器 stdout 即 serve 日志，直接落入 run.log（含 KV 校准行）
-        procs.append(subprocess.Popen(serve_tokens, stdout=log_fh, stderr=subprocess.STDOUT,
-                                      env=os.environ, start_new_session=True))
-        model = cpath  # docker 下 serve/bench 的模型位都用容器挂载点
-
-        # 就绪轮询：/health 200；503(EngineDeadError)/进程退出/超时 → crash
-        budget = max(0.0, deadline - time.monotonic())
-        ready_deadline = time.monotonic() + min(startup_timeout_s, budget)
-        ready = False
-        while time.monotonic() < ready_deadline:
-            if procs[0].poll() is not None:
-                raise TrialCrash(f"serve 提前退出（rc={procs[0].poll()}）")
-            code = _health_code(port)
-            if code == 200:
-                ready = True
-                break
-            if code == 503:
-                raise TrialCrash("EngineDeadError（/health 返回 503）")
-            kv = _scan_kv(log_path)
-            if kv:
-                kv_tokens = kv
-            time.sleep(args.poll_interval)
-        if not ready:
-            if time.monotonic() >= deadline:
-                raise TrialCrash("trial_timeout")
-            raise TrialCrash("startup_timeout")
+        # 起 serve（attach → run.log）并轮询 /health 就绪；与 --detect-gmu 共用同一 helper
+        _start_serve_and_wait(args.docker_cmd, runtime, host_model_path, port, config,
+                              log_fh, log_path, deadline, startup_timeout_s,
+                              args.poll_interval, kv_sink, procs)
+        model = container_model_path(runtime)  # docker 下 serve/bench 的模型位都用容器挂载点
+        kv_tokens = kv_sink[0]
         load_seconds = round(time.monotonic() - start_mono, 1)
-        kv = _scan_kv(log_path)
-        if kv:
-            kv_tokens = kv
         msg = f"就绪（load={load_seconds}s，runtime=docker），开始 bench（repeats={repeats}）"
         if diff:
             msg += f"；环境指纹变化：{diff}"
@@ -619,9 +760,11 @@ def main(argv: list[str] | None = None) -> int:
             "started_at": started_at,
         }
     except TrialCrash as c:
+        kv_tokens = kv_sink[0]  # serve 死在启动期也可能已扫到 KV 行，保留进 calibration
         result = {"status": "crash", "reason": c.reason, "started_at": started_at,
                   "calibration": {"measured_kv_tokens": kv_tokens, "load_seconds": load_seconds}}
     except Exception as e:  # 兜底：任何异常都记为 crash，绝不让进程挂起
+        kv_tokens = kv_sink[0]
         result = {"status": "crash", "reason": f"{type(e).__name__}: {e}",
                   "started_at": started_at,
                   "calibration": {"measured_kv_tokens": kv_tokens, "load_seconds": load_seconds}}
