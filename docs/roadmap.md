@@ -74,3 +74,7 @@
 - **集成方式**：借鉴 gpu-host-tuning skill 清单（NUMA/PCIe/IRQ/NCCL env）建白名单；改动前记录原值、失败自动回滚。
 - **成本**：中。
 - **依据**：external-resources.md §1（air-gapped/skills 的 gpu-host-tuning 行）。
+
+## 暂缓（明确暂不做）
+
+- **并行实验（单机多 GPU 子集并发跑多配置）**：暂不做（决定见 loop 加固会话）。当前为单 trial 串行 + 三层退出；并行需唯一容器名/端口、每 lane 独立产物与聚合，收益大但改动面广，后续再评估。
