@@ -35,8 +35,9 @@
 | `AGENTS.md` | agent 的入口：权限边界 + 四阶段流程 | 只读 |
 | `program.md` | 调优循环细则：决策规则、退出机制、剪枝策略 | 只读 |
 | `README.md` | 本文件 | 只读 |
-| `probe.py` | 多机环境探测（并行）→ env.json / env_report.md / model_profile.json | 只读 |
-| `bench.py` | 远端起服 + `vllm bench serve --goodput` 度量 + 僵尸清理 + 可选 `--detect-gmu` 预检 | 只读 |
+| `probe.py` | 多机环境探测（并行）→ env.json / env_report.md / model_profile.json / search_space.json | 只读 |
+| `search_space.json` | Phase 1 探测产物：机器可读候选池（tp / placement / NCCL env / cheap knobs + `pruned` 剪枝清单，均带 reason） | 生成物（agent 据此选候选） |
+| `bench.py` | 远端起服 + `vllm bench serve --goodput` 度量 + 僵尸清理 + 可选 `--detect-gmu` 预检；crash 时在 result.json 写机器可读 `crash_kind` | 只读 |
 | `report.py` | 收尾汇总 → report.md（基线 vs 最佳 + 全部 trial + 系统级建议） | 只读 |
 | `run.sh` | 两段式执行：rsync + 远端 nohup 启动 + 轮询状态 | 只读 |
 | `setup_remote.sh` | 主机环境校验（docker-only：校验 docker 可用 + 镜像就绪；零 pull、零安装） | 只读 |

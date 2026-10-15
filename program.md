@@ -107,6 +107,11 @@ commit  trial_id  config_hash  workload_hash  slo  repeats  contention  goodput 
 
 搜索空间与剪枝由**四类环境维度**（主机 / NUMA / 网络 / 存储）共同决定，综合 `env.json` / `env_report.md` / `model_profile.json` 的具体事实，**不是单一指标**（如仅凭「有无 RDMA」）。每条剪枝/纳入都须引用上述文件的具体事实；环境事实变化（NIC/RDMA 状态、拓扑、时钟等）→ 重新评估相关维度；环境相关决策（含「放弃某维度」）写进 `results.tsv.description` 或 `report.md`。
 
+### 搜索空间初值（机器可读候选池）
+
+- Phase 1 探测产出 **`search_space.json`**（与 env.json / model_profile.json 同目录）：tp 候选（合法约数 ∩ 显存）、placement 候选（NUMA 分组 / 全 GPU）、NCCL env 候选（按拓扑与 RDMA 判据）、cheap knobs 提示与 `pruned` 剪枝清单——每条都带 `reason`（引用本节规则）。
+- **agent 应从 `search_space.json` 选候选**，并在 `results.tsv.description` 引用所选条目的 `reason`；`pruned` 条目在事实（env.json / model_profile.json / gmu_probe.json）不变前**不得重试**；环境事实变化 → 重新跑 Phase 1 刷新候选池。
+
 ### 主机（GPU / 拓扑 / 时钟 / 系统参数）
 - **探测依据**：`env.json`——`gpu.count` / `gpu.topo`（NVLink/NVSwitch vs 仅 PCIe）、`gpu.gpus`（时钟 / 持久模式）、`cpu.governor`、`mem.thp`。
 - **剪枝/纳入**：NVLink/NVSwitch 全互联 → tp 可到 GPU 数；**仅 PCIe → tp ≤ 4 仅是性能建议**（优先并行数据 dp）——**容量优先**：若 `model_profile.json` 的 `tp.min_tp_for_weights` > 4，则必须超出该建议（跨 NUMA 判定见「NUMA 与划分」节，不因该建议排除可行的 tp）。合法 tp 集合由 `num_attention_heads` / `num_key_value_heads` 的约数决定，非法 tp 值不试（例外：`num_key_value_heads`≤1（MLA / MQA）时 vLLM 复制 KV heads，合法 tp 只受 attention heads 约数约束）。governor / hugepages / 锁频 / 主机级 NUMA 亲和绑定等只探测 + 建议（写进 `report.md`），不自动修改（v1 不提供自动修改开关）。
@@ -126,6 +131,7 @@ commit  trial_id  config_hash  workload_hash  slo  repeats  contention  goodput 
 - **探测依据**：`env.json` 的 `net.rdma`——`ib_devices` 非空即有 RDMA（如 `mlx5_0`），IB / RoCE 按设备 link_layer 区分（RoCE=Ethernet，IB=InfiniBand）；**不要仅凭 `ibstat_present` 判无**（ibstat 缺席 ≠ 无 RDMA）。结合 NIC↔GPU 亲和（同 NUMA / PCIe 拓扑）与链路速率（来自 probe）。
 - **剪枝/纳入**：三分 InfiniBand / RoCE / 无——「无」→ NCCL/RDMA 相关 env 移出搜索空间；「IB / RoCE 存在」→ NCCL/RDMA env **进入搜索空间**（如 `NCCL_P2P_LEVEL`、`NCCL_IB_HCA`、`NCCL_IB_GID_INDEX`、`NCCL_NET_GDR_LEVEL`、`NCCL_SHM_DISABLE`，名单见 `docs/vllm-facts.md` §6），并按 NIC↔GPU 亲和选 HCA 与 GDR 等级。**NCCL 事实**（口径见 vllm-facts §6）：`NCCL_P2P_LEVEL` 是距离 cutoff（官方文档口径 LOC/NVL/PIX/PXB/PHB/SYS，无 NODE），Intel x86 默认 PXB——**PHB 及以上**默认关 P2P、回落 SHM（主机内存/UPI 中转），**不走网络**（注：`PHB` 是同 NUMA 穿 CPU，`SYS` 才跨 NUMA）；NCCL 仅当 P2P 与 SHM 双双不可用才把该对标 PATH_NET（走 RoCE/IB）——「域内 PCIe P2P + 跨域 RoCE」的配方是 `NCCL_P2P_LEVEL=PXB` + `NCCL_SHM_DISABLE=1`（+ `NCCL_IB_HCA="=<dev>:1"` 精确匹配）。NIXL / PD 分离相关 env 需 agent 自行查证后使用。
 - **留痕**：放弃 RDMA 维度 / HCA 与 GDR 选择写 `results.tsv.description` / `report.md`；RDMA 状态变化 → 重新评估。
+- **单节点多 NUMA PCIe 门控**：单节点内 GPU-GPU 通信**不走 NET**（IB/RoCE 仅跨节点），只涉及 P2P / SHM / `NCCL_P2P_LEVEL`；`NCCL_SHM_DISABLE` / `NCCL_P2P_DISABLE` 在单节点上会砍掉节点内最快路径（P2P 直连或主机内存中转），**通常负优化**——search_space.json 对单节点默认把 `NCCL_P2P_DISABLE` / `NCCL_SHM_DISABLE` / `NCCL_IB_HCA` 置空并给出 reason。老配方 `NCCL_P2P_LEVEL=PXB + NCCL_SHM_DISABLE=1` 只用于**多节点** PCIe+RoCE（域内 P2P + 跨域走 RoCE），单节点不要套用。
 
 ### 存储 / 加载
 - **探测依据**：`env.json` 的 `disk.avail_bytes`（模型盘可用空间）+ 校准后 `model_profile.json` 的 `boot.measured_seconds`（真实加载耗时）与权重量。
@@ -156,9 +162,28 @@ isl / osl / ref_concurrency 定义负载身份，单次 run 内绝不改动（�
 
 ## 崩溃处理
 
-- **serve flag 预校验**：`bench.py` 在起 serve 前对照镜像的 `vllm serve --help=all`（按 image 缓存到 out-dir；bare `--help` 在现代 vLLM 只给配置组索引，不可用则退回并最终 fail-open 跳过）校验 `config.yaml.serve` 的 flag 名——未知 flag 直接判 crash（fail fast，typo 不浪费一次模型加载）；镜像无法提供 help 时跳过校验（best-effort）。
-- 明显的 typo / 缺依赖：可修一次并重试该配置。
-- 构思本身有问题（如参数组合不合法）：记 crash 跳过，不反复重试。
+`bench.py` 在 crash 时把机器可读分类写入 `result.json` 的 **`crash_kind`**（保留人类可读 `reason`）。
+处置按表执行（是否重试 / 是否改 config / 是否进 crash streak / 是否重新 probe）：
+
+| crash_kind | 含义 | 是否重试 | 是否改 config | 进 crash streak | 重新 probe |
+|---|---|---|---|---|---|
+| `missing_image` | 镜像未预先准备（零 pull 契约） | 否（仅人工预先准备镜像，harness 不 pull——零-pull 契约） | 是（`runtime.image`） | 是 | 否 |
+| `model_path_missing` | target.model.path 缺失/不可读 | 否（需人类修 target.yaml） | 否 | 是 | 否（§环境失效 3：模型路径消失 → 停止循环、诊断写入 report.md；未修好 target 重跑 probe 无意义） |
+| `unknown_flag` | serve 键不在镜像 help | 修一次后重试该配置 | 是（`serve`） | 是 | 否 |
+| `contention` | 主机非空闲 / require_idle 拒绝 | 按「环境失效与共租处置」 | 是（GPU 子集等） | 否（自愈成功才不计；未愈仍计） | 可（`--check-gpus`） |
+| `oom` | 显存不足（含共租 OOM） | 按自愈序列（缩子集 → 降 gmu → 换机） | 是 | 否（自愈成功才不计；未愈仍计） | 否 |
+| `startup_timeout` | 起服就绪超时 | 重试一次（可能慢加载） | 可（`bench.startup_timeout_s`） | 是 | 否 |
+| `trial_timeout` | 单 trial 硬超时 | 重试 / 降 num_prompts | 可（timeouts / workload） | 是 | 否 |
+| `engine_dead` | /health 503（EngineDeadError） | 重试一次；持续则怀疑配置/镜像 | 可 | 是 | 否 |
+| `serve_exit` | serve 提前退出 | 看 run.log 段；明显 typo 修一次 | 视原因 | 是 | 否 |
+| `bench_failure` | bench 客户端失败 / 无有效输出 / 缓存重置失败 | 重试一次 | 可 | 是 | 否 |
+| `unknown` | 兜底（未归类） | 否（停止并写诊断） | 否 | 是 | 是 |
+
+**自愈 vs 崩溃连击**：`oom` / `contention` 若经「环境失效与共租处置」在权限范围内自愈重试（缩 GPU 子集 / 降 gmu / 换机 / 有限重探）后成功，该次**不计入 `exit.crash_streak`**（禁问窗口内自愈优先）；仅**未愈或结构性崩溃**（如 missing_image、unknown_flag 修后仍失败、unknown）计入连击并可能触发硬停。
+
+**记账约定（与机制一致）**：`exit.crash_streak` 由 `results.tsv` 的 `crash` 行推进（见 `scripts/mock_loop.py` 的 `crash_count`）。因此**自愈成功的尝试不得记为 `crash` 行**——按 `discard` 记录（或不计入该行），否则连击会照常推进并与上面的自愈意图矛盾。只有**未愈/结构性**的失败才以 `crash` 行落账。
+
+另：**serve flag 预校验**——`bench.py` 在起 serve 前对照镜像的 `vllm serve --help=all`（按 image 缓存到 out-dir；bare `--help` 在现代 vLLM 只给配置组索引，不可用则退回并最终 fail-open 跳过）校验 `config.yaml.serve` 的 flag 名——未知 flag 直接判 crash（fail fast，typo 不浪费一次模型加载）；镜像无法提供 help 时跳过校验（best-effort）。
 
 ## 子 agent 分派
 

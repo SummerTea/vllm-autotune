@@ -1138,6 +1138,160 @@ def build_model_profile(model: dict, head_facts: dict, gmu: float) -> dict:
     }
 
 
+# ── 搜索空间（机器可读候选池：search_space.json）────────────────────────
+
+def _gpu_set_str(gpus: list[int]) -> str:
+    """GPU 索引子集 → CUDA_VISIBLE_DEVICES 串：连续区间 `0-3`，否则逗号 `0,2,4`。"""
+    if not gpus:
+        return ""
+    if gpus == list(range(gpus[0], gpus[0] + len(gpus))):
+        return f"{gpus[0]}-{gpus[-1]}"
+    return ",".join(str(g) for g in gpus)
+
+
+def build_search_space(model_profile: dict, head_facts: dict,
+                       gmu_suggested: float | None = None,
+                       host_count: int = 1) -> dict:
+    """从 Phase 1 采集事实派生「机器可读候选池」（写 <out-dir>/search_space.json）。
+
+    只产出事实可推导的项（合法 tp 约数 ∩ 显存 ∩ 主机 GPU 数上限、NUMA 分组、RDMA 判据），
+    不猜魔法值；每条候选/剪枝都带 reason（引用 program.md 剪枝规则）。gating 规则：
+    - tp：valid_divisors 按 min_tp_for_weights 过滤且**受主机 GPU 数上限**（tp ≤ gpu_count
+      才可执行；min_tp 缺失 → 装不下，记 pruned；上限滤空 → 本机无法起服，记 pruned）；
+    - placement：每个 NUMA 节点整组 + 全 GPU 候选（仅 tp 在（已截断的）合法集内）；
+    - NCCL_P2P_LEVEL 仅 tp>1 且拓扑 pcie/mixed；单节点：P2P/SHM/IB 一律排除（节点内不走 NET）；
+    - 多节点 + RDMA：NCCL_IB_HCA / NCCL_NET_GDR_LEVEL 启用；多节点 PCIe+RoCE 附 SHM_DISABLE 配方。
+    """
+    tp_info = model_profile.get("tp") or {}
+    divisors = [int(t) for t in (tp_info.get("valid_divisors") or [])]
+    min_tp = tp_info.get("min_tp_for_weights")
+    gpu_count = int((head_facts.get("gpu") or {}).get("count") or 0)
+    topo_summary = ((head_facts.get("gpu") or {}).get("topo") or {}).get("summary")
+    numa_groups = [g["gpus"] for g in (head_facts.get("numa_groups") or []) if g.get("gpus")]
+    rdma = (head_facts.get("net") or {}).get("rdma") or {}
+    rdma_kind = rdma.get("kind")
+    single_node = int(host_count or 1) == 1
+
+    tp_values: list[int] = []
+    pruned: list[dict] = []
+    if not divisors:
+        pruned.append({"item": "tensor-parallel-size",
+                       "reason": "无合法 tp 约数（num_attention_heads 缺失或未采集）"})
+    elif min_tp is None:
+        pruned.append({"item": "tensor-parallel-size",
+                       "reason": "min_tp_for_weights=None：合法 tp 集合内装不下权重（显存不足）"})
+    else:
+        too_small = [t for t in divisors if t < min_tp]
+        too_many = [t for t in divisors if gpu_count > 0 and t > gpu_count]
+        feasible = [t for t in divisors if t >= min_tp]
+        if gpu_count > 0:                      # 主机 GPU 数上限（不可执行的 tp 不产出）
+            feasible = [t for t in feasible if t <= gpu_count]
+        tp_values = feasible
+        if too_small:
+            pruned.append({"item": f"tensor-parallel-size < {min_tp}（{too_small}）",
+                           "reason": f"单卡权重装不下：min_tp_for_weights={min_tp}"})
+        if too_many:
+            pruned.append({"item": f"tensor-parallel-size > {gpu_count}（{too_many}）",
+                           "reason": f"超出本主机 GPU 数（gpu.count={gpu_count}）：不可执行"})
+        if not tp_values:
+            pruned.append({"item": "tensor-parallel-size",
+                           "reason": f"模型无法在本主机 GPU 数上起服：min_tp_for_weights={min_tp} "
+                                      f"> 可见 GPU 数 {gpu_count}（合法约数 {divisors}）"})
+
+    placement: list[dict] = []
+    for grp in numa_groups:
+        if len(grp) in tp_values:
+            placement.append({"cuda_visible_devices": _gpu_set_str(grp), "tp": len(grp),
+                              "reason": f"同一 NUMA 节点内的 GPU 子集 {grp}（numa_groups）"})
+    if gpu_count in tp_values:
+        cross = "；跨 NUMA" if len(numa_groups) > 1 else ""
+        placement.append({"cuda_visible_devices": _gpu_set_str(list(range(gpu_count))),
+                          "tp": gpu_count,
+                          "reason": f"全部 {gpu_count} 卡：最大并行度{cross}"})
+    # M2：单 NUMA 组覆盖全部 GPU 时节点候选与全卡候选相同 → 按 (devices, tp) 去重（保持首见顺序）
+    placement_dedup: list[dict] = []
+    seen_pairs: set[tuple[str, int]] = set()
+    for p in placement:
+        key = (p["cuda_visible_devices"], p["tp"])
+        if key not in seen_pairs:
+            seen_pairs.add(key)
+            placement_dedup.append(p)
+    placement = placement_dedup
+
+    env: dict[str, dict] = {}
+    # B1：P2P_LEVEL 的门控是「存在 tp>1 的多卡候选」，不是「候选个数 >1」
+    if topo_summary in ("pcie", "mixed") and any(t > 1 for t in tp_values):
+        env["NCCL_P2P_LEVEL"] = {
+            "values": ["PXB", "SYS"],
+            "requires": "tp>1 且拓扑存在 P2P 梯度（pcie/mixed）",
+            "reason": "PCIe 域内 P2P cutoff 候选（docs/vllm-facts.md §6：PXB=同 PCIe switch、"
+                      "SYS=跨 NUMA；PHB 及以上默认关 P2P 回落 SHM）"}
+    elif topo_summary == "nvlink-full":
+        env["NCCL_P2P_LEVEL"] = {
+            "values": [],
+            "reason": "拓扑 nvlink-full：NVLink 全互联，P2P 已是最快路径，无需距离 cutoff"}
+    elif topo_summary is None:
+        env["NCCL_P2P_LEVEL"] = {
+            "values": [],
+            "reason": "拓扑未采集：P2P cutoff 待定（先补全 gpu_topo 再评估），不得假设单卡"}
+    else:
+        env["NCCL_P2P_LEVEL"] = {
+            "values": [],
+            "reason": "单卡或无需 NCCL cutoff"}
+    if single_node:
+        # 单节点多 NUMA PCIe 门控：节点内 GPU-GPU 不走 NET；禁 P2P/SHM 反而砍掉节点内最快路径
+        env["NCCL_P2P_DISABLE"] = {"values": [], "reason": "单节点：砍掉节点内最快路径（P2P），通常负优化"}
+        env["NCCL_SHM_DISABLE"] = {"values": [], "reason": "单节点：无 NET 语义，强制绕主机内存回环，通常负优化"}
+        env["NCCL_IB_HCA"] = {"values": [], "reason": "单节点：节点内 GPU-GPU 不走 NET（IB/RoCE 仅跨节点用）"}
+    elif rdma_kind in ("roce", "infiniband"):
+        hcas = [f"={d.get('name')}:1" for d in (rdma.get("devices") or [])
+                if d.get("state") == "ACTIVE"]
+        env["NCCL_IB_HCA"] = {"values": hcas, "requires": "跨节点多机 + RDMA 已就绪",
+                              "reason": f"跨节点走 RDMA（{rdma_kind}）：HCA 精确匹配候选（docs §6 `=` 前缀）"}
+        env["NCCL_NET_GDR_LEVEL"] = {"values": ["2", "3"], "requires": "跨节点多机 + RDMA",
+                                      "reason": "GPU Direct RDMA 等级候选（docs §6：2/3 直通/中间缓冲；0 禁用）"}
+        if topo_summary in ("pcie", "mixed"):
+            env["NCCL_SHM_DISABLE"] = {"values": ["1"], "requires": "跨节点 + PCIe 域内 P2P",
+                                        "reason": "跨节点 PCIe+RoCE 配方（program.md §网络）："
+                                                  "域内 P2P 直连 + 跨域走 RoCE，防回落主机内存/SHM"}
+    else:
+        env["NCCL_IB_HCA"] = {"values": [], "reason": f"无 RDMA（kind={rdma_kind}）：跨节点网络不可用"}
+        env["NCCL_NET_GDR_LEVEL"] = {"values": [], "reason": "无 RDMA：GDR 无意义"}
+
+    gmu_block: dict = {}
+    if gmu_suggested is not None:
+        gmu_block["gpu-memory-utilization"] = {
+            "values": [round(gmu_suggested, 4)],
+            "reason": "gmu 预检建议值（--detect-gmu / --load-format dummy 实测最大可用）"}
+
+    return {
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "host": "head",
+        "gates": {"topology": topo_summary, "single_node": single_node,
+                  "numa_groups": numa_groups, "rdma_kind": rdma_kind},
+        "serve": {
+            "tensor-parallel-size": {
+                "values": tp_values,
+                "reason": (f"合法 tp 约数 ∩ 装得下 ∩ 主机 GPU 数上限"
+                           f"（min_tp_for_weights={min_tp}, gpu_count={gpu_count}）"),
+                "phase": "structural"},
+            **gmu_block,
+        },
+        "placement": placement,
+        "env": env,
+        "cheap_knobs": [
+            {"name": "max-num-seqs", "phase": "cheap"},
+            {"name": "max-num-batched-tokens", "phase": "cheap"},
+            {"name": "gpu-memory-utilization", "phase": "cheap"},
+            {"name": "kv-cache-dtype", "phase": "cheap"},
+            {"name": "enable-prefix-caching", "phase": "cheap"},
+            {"name": "tensor-parallel-size", "phase": "structural"},
+            {"name": "quantization", "phase": "structural"},
+        ],
+        "pruned": pruned,
+    }
+
+
 # ── 跨机互联（仅 >1 台主机时尽力而为）──────────────────────────────────
 
 def interconnect_check(target: dict, mode: str, fixture_dir: str | None) -> dict:
@@ -1175,7 +1329,8 @@ def interconnect_check(target: dict, mode: str, fixture_dir: str | None) -> dict
 # ── 报告渲染（env_report.md）───────────────────────────────────────────
 
 def render_env_report(target: dict, facts: dict, interconnect: dict,
-                      model_profile: dict, gmu: float) -> str:
+                      model_profile: dict, gmu: float,
+                      search_space: dict | None = None) -> str:
     head_name = next(h["name"] for h in target["hosts"] if h.get("role") == "head")
     total = {"pass": 0, "warn": 0, "fail": 0}
     lines = ["# 环境探测报告（env_report.md）", ""]
@@ -1229,6 +1384,24 @@ def render_env_report(target: dict, facts: dict, interconnect: dict,
     lines.append("")
     lines.append(f"## 汇总：pass={total['pass']} warn={total['warn']} fail={total['fail']}")
     lines.append("")
+    lines.append("## 搜索空间（初值）")
+    lines.append("")
+    if not search_space:
+        lines.append("未生成 search_space.json（事实缺失，需修复后重跑 Phase 1）。")
+    else:
+        lines.append("- 机器可读候选池见 `search_space.json`（本目录）；agent 据此选候选并引用各条目的 `reason`，"
+                     "`pruned` 条目在事实不变前不得重试。")
+        ss_tp = (search_space.get("serve") or {}).get("tensor-parallel-size") or {}
+        lines.append(f"- serve.tensor-parallel-size 候选：`{ss_tp.get('values') or '[]'}`（{ss_tp.get('reason')}）")
+        pl = search_space.get("placement") or []
+        if pl:
+            desc = "、".join(f"`{p['cuda_visible_devices']}`(tp={p['tp']})" for p in pl)
+            lines.append(f"- placement 候选：{desc}")
+        env_ss = search_space.get("env") or {}
+        nccl = [f"`{k}`: {v.get('values')}" for k, v in env_ss.items() if v.get("values")]
+        if nccl:
+            lines.append(f"- env（NCCL）候选：{'；'.join(nccl)}")
+    lines.append("")
     lines.append("## 下一步（Phase 1.5 门禁）")
     lines.append("")
     if total["fail"]:
@@ -1278,6 +1451,18 @@ def main(argv: list[str] | None = None) -> int:
 
     gmu = read_gmu_default()
     model_profile = build_model_profile(target.get("model") or {}, facts[head["name"]], gmu)
+    # gmu 建议值：out-dir 已有 gmu_probe.json 时并入搜索空间（Phase 1.5/2 探测产物）
+    gmu_suggested = None
+    gmu_probe_path = os.path.join(args.out_dir, "gmu_probe.json")
+    if os.path.exists(gmu_probe_path):
+        try:
+            with open(gmu_probe_path, encoding="utf-8") as f:
+                gmu_suggested = (json.load(f)).get("gmu_suggested")
+        except (OSError, ValueError):
+            gmu_suggested = None
+    search_space = build_search_space(model_profile, facts[head["name"]],
+                                      gmu_suggested=gmu_suggested,
+                                      host_count=len(target["hosts"]))
     wb = model_profile["weights"]["bytes"]
     for h in target["hosts"]:
         facts[h["name"]]["checklist"] = _system_checklist(
@@ -1305,12 +1490,16 @@ def main(argv: list[str] | None = None) -> int:
     env_path = os.path.join(args.out_dir, "env.json")
     profile_path = os.path.join(args.out_dir, "model_profile.json")
     report_path = os.path.join(args.out_dir, "env_report.md")
+    search_space_path = os.path.join(args.out_dir, "search_space.json")
     with open(env_path, "w", encoding="utf-8") as f:
         json.dump(env, f, ensure_ascii=False, indent=2)
     with open(profile_path, "w", encoding="utf-8") as f:
         json.dump(model_profile, f, ensure_ascii=False, indent=2)
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write(render_env_report(target, facts, interconnect, model_profile, gmu))
+        f.write(render_env_report(target, facts, interconnect, model_profile, gmu,
+                                  search_space=search_space))
+    with open(search_space_path, "w", encoding="utf-8") as f:
+        json.dump(search_space, f, ensure_ascii=False, indent=2)
 
     print(f"探测完成：{len(target['hosts'])} 台主机（并行采集，mode={mode}）")
     for name, f in facts.items():
@@ -1318,7 +1507,7 @@ def main(argv: list[str] | None = None) -> int:
         n = {s: sum(1 for i in ck if i["status"] == s) for s in ("pass", "warn", "fail")}
         print(f"  {name} ({f['role']}): pass={n['pass']} warn={n['warn']} fail={n['fail']}")
     print(f"模型配置：{model_profile.get('model')} → weights.source={model_profile['weights']['source']}")
-    print(f"产物：env.json / env_report.md / model_profile.json（{args.out_dir}）")
+    print(f"产物：env.json / env_report.md / model_profile.json / search_space.json（{args.out_dir}）")
     return 0
 
 

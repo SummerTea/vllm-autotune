@@ -115,6 +115,7 @@ Chunked prefill is enabled with max_num_batched_tokens=%d.
 | `NCCL_IB_GID_INDEX` | RoCE GID 索引 | 默认 0；RoCEv2 常用 3 |
 | `NCCL_NET_GDR_LEVEL` | GPU Direct RDMA 等级 | 0 禁用；2/3 直通/中间缓冲 |
 | `NCCL_P2P_LEVEL` | P2P 距离 cutoff（**官方文档口径**合法值 `LOC`/`NVL`/`PIX`/`PXB`/`PHB`/`SYS`，**无 `NODE`**；源码另接受内部值） | cutoff 达 `PXB` 时：同 PCIe switch（PIX/PXB）走 P2P；**`PHB` 及以上**默认关 P2P → 回落 SHM（主机内存/UPI 中转），**不走 NET**。注：`PHB` = **同 NUMA**（穿 CPU host bridge），`SYS` 才是跨 NUMA |
+| `NCCL_P2P_DISABLE` | 禁用 GPUDirect P2P | 1。注意：`P2P_DISABLE` 会覆盖 / 使 `NCCL_P2P_LEVEL` 失效（不再按距离 cutoff 判 P2P，一律回落 SHM/NET）；**单节点通常为负优化**（砍掉节点内最快路径），search_space.json 对单节点默认置空 |
 | `NCCL_SHM_DISABLE` | 禁用 SHM 传输（该 pair 回落到 NET/网络） | 1 |
 | `NCCL_DEBUG` | 调试输出 | VERSION / WARN（默认）/ INFO / TRACE |
 | `NCCL_IB_DISABLE` | 禁用 IB/RoCE，回退 socket | 1 |

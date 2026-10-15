@@ -791,6 +791,7 @@ def test_docker_crash_serve_exits(tmp_path, capsys, monkeypatch):
     result = json.loads((out / "result.json").read_text(encoding="utf-8"))
     assert result["status"] == "crash"
     assert "rc=1" in result["reason"]                            # stub serve exit 1
+    assert result["crash_kind"] == "serve_exit"
     sout = capsys.readouterr().out
     assert "status: crash" in sout
 
@@ -815,6 +816,7 @@ def test_docker_serve_oom_crash_classified(tmp_path, capsys, monkeypatch):
     assert "1234(torchrun)" in result["reason"]                  # foreign pid + process_name
     assert "rc=1" not in result["reason"]                        # 命中 OOM → 不再保留泛化原因
     assert result["contention"]["foreign_gpu_apps"][0]["pid"] == 1234
+    assert result["crash_kind"] == "oom"
     status = json.loads((out / "status.json").read_text(encoding="utf-8"))
     assert "serve OOM" in status["message"]
     sout = capsys.readouterr().out
@@ -835,6 +837,7 @@ def test_docker_missing_image_crash(tmp_path, capsys, monkeypatch):
     result = json.loads((out / "result.json").read_text(encoding="utf-8"))
     assert result["status"] == "crash"
     assert "未在主机预先准备" in result["reason"]
+    assert result["crash_kind"] == "missing_image"
     status = json.loads((out / "status.json").read_text(encoding="utf-8"))
     assert status["state"] == "crash" and status["phase"] == "crash"
     # 预检查失败：不进入 docker run（状态文件只有 image inspect 相关调用，无 rm/run）
@@ -859,6 +862,7 @@ def test_docker_unknown_serve_flag_crashes_before_serve(tmp_path, capsys, monkey
     result = json.loads((out / "result.json").read_text(encoding="utf-8"))
     assert result["status"] == "crash"
     assert "--bogus-flag" in result["reason"]
+    assert result["crash_kind"] == "unknown_flag"               # 崩溃分类机器可读
     status = json.loads((out / "status.json").read_text(encoding="utf-8"))
     assert status["state"] == "crash"
     # 校验发生在起 serve 之前：状态文件有 help 校验的 run，但绝无真实 serve（serve /model 从未启动）
@@ -867,6 +871,37 @@ def test_docker_unknown_serve_flag_crashes_before_serve(tmp_path, capsys, monkey
     assert "serve /model" not in text
     sout = capsys.readouterr().out
     assert "status: crash" in sout
+
+
+# ── 崩溃分类（crash_kind：机器可读枚举）──────────────────────────────────
+
+class TestClassifyCrashKind:
+    def test_maps_canonical_reasons(self):
+        assert bench._classify_crash_kind(
+            "镜像 vllm/vllm-openai:v0.31.0 未在主机预先准备（本模板不自动拉取，保持主机零新增）") == "missing_image"
+        assert bench._classify_crash_kind(
+            "需要 target.yaml 的 model.path（宿主上的模型目录，将只读挂载进容器）") == "model_path_missing"
+        assert bench._classify_crash_kind(
+            "未知 vllm serve 参数：['--bogus-flag']（对照镜像 `vllm serve --help=all`；请修正 config.yaml.serve）") == "unknown_flag"
+        assert bench._classify_crash_kind(
+            "主机非空闲：检测到其他 GPU 进程 [123]（require_idle=true 要求独占）") == "contention"
+        assert bench._classify_crash_kind("serve OOM：显存不足（疑似外部共租占用）") == "oom"
+        assert bench._classify_crash_kind("startup_timeout") == "startup_timeout"
+        assert bench._classify_crash_kind("trial_timeout") == "trial_timeout"
+        assert bench._classify_crash_kind("EngineDeadError（/health 返回 503）") == "engine_dead"
+        assert bench._classify_crash_kind("serve 提前退出（rc=1）") == "serve_exit"
+        assert bench._classify_crash_kind("bench 失败（rc=1）") == "bench_failure"
+        assert bench._classify_crash_kind("bench 第 1 次无有效输出（goodput 缺失）") == "bench_failure"
+        assert bench._classify_crash_kind(
+            "预热后重置前缀缓存失败：无法保证冷缓存测量（prefix caching 口径失真）") == "bench_failure"
+        assert bench._classify_crash_kind("trial 未完成（占位：正常结束时会被覆盖）") == "unknown"
+        assert bench._classify_crash_kind("") == "unknown"
+
+    def test_oom_via_log_text(self):
+        # OOM 特征只出现在日志、reason 是通用退出 → 也归 oom（复用 _serve_crash_is_oom）
+        text = ("ValueError: Free memory on device cuda:0 (2.0 GiB / 22.0 GiB) on startup "
+                "is less than desired GPU memory utilization (gmu=0.98)")
+        assert bench._classify_crash_kind("serve 提前退出（rc=1）", text) == "oom"
 
 
 # ── P0：trial 身份写入产物 + 陈旧 bench JSON 隔离（stub docker）────────────

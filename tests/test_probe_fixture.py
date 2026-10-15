@@ -65,7 +65,8 @@ def test_fixture_probe_produces_artifacts(tmp_path):
     env_p = tmp_path / "out" / "env.json"
     report_p = tmp_path / "out" / "env_report.md"
     profile_p = tmp_path / "out" / "model_profile.json"
-    for p in (env_p, report_p, profile_p):
+    ss_p = tmp_path / "out" / "search_space.json"
+    for p in (env_p, report_p, profile_p, ss_p):
         assert p.exists(), f"缺产物: {p.name}"
 
     env = json.loads(env_p.read_text(encoding="utf-8"))
@@ -132,6 +133,19 @@ def test_fixture_probe_produces_artifacts(tmp_path):
     assert "互联带宽：" in report                      # 主机小节读到互联带宽（host 级事实）
     assert "GPU P2P 带宽（容器实测）" not in report    # 跨机小节不再承载带宽数值
     assert "下一步" in report
+
+    # 搜索空间（机器可读候选池）
+    ss = json.loads(ss_p.read_text(encoding="utf-8"))
+    assert ss["host"] == "head"
+    assert ss["gates"]["single_node"] is True          # 单主机
+    assert ss["gates"]["topology"] == "pcie"
+    assert ss["gates"]["numa_groups"] == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    assert ss["serve"]["tensor-parallel-size"]["values"] == [1, 2, 4, 8]
+    assert {p["cuda_visible_devices"] for p in ss["placement"]} == {"0-3", "4-7", "0-7"}
+    assert ss["env"]["NCCL_P2P_LEVEL"]["values"] == ["PXB", "SYS"]   # pcie + tp>1 → 启用
+    assert ss["env"]["NCCL_IB_HCA"]["values"] == []                  # 单节点排除 NET
+    assert "单节点" in ss["env"]["NCCL_SHM_DISABLE"]["reason"]
+    assert "搜索空间（初值）" in report                # env_report 指针节
 
 
 def test_fixture_report_has_head_summary(tmp_path):
@@ -462,3 +476,107 @@ def test_rdma_cmd_client_single_ip_with_hca():
     assert "timeout 15" in cmd
     assert 'kill "$spid"' in cmd
     assert "pkill" not in cmd
+
+
+# ── 搜索空间（search_space.json 纯函数）────────────────────────────────
+
+class TestBuildSearchSpace:
+    HEAD = {
+        "gpu": {"count": 8, "topo": {"summary": "pcie"}},
+        "numa_groups": [{"numa_node": 0, "gpus": [0, 1, 2, 3]},
+                        {"numa_node": 1, "gpus": [4, 5, 6, 7]}],
+        "net": {"rdma": {"kind": "roce", "devices": []}},
+    }
+    PROFILE = {"tp": {"valid_divisors": [1, 2, 4, 8], "min_tp_for_weights": 1}}
+
+    def test_fixture_derived_candidates(self):
+        ss = probe.build_search_space(self.PROFILE, self.HEAD)
+        assert ss["gates"] == {"topology": "pcie", "single_node": True,
+                               "numa_groups": [[0, 1, 2, 3], [4, 5, 6, 7]],
+                               "rdma_kind": "roce"}
+        assert ss["serve"]["tensor-parallel-size"]["values"] == [1, 2, 4, 8]
+        assert "min_tp_for_weights=1" in ss["serve"]["tensor-parallel-size"]["reason"]
+        # placement：两个 NUMA 节点各 4 卡 + 全 8 卡
+        assert {p["cuda_visible_devices"]: p["tp"] for p in ss["placement"]} == \
+            {"0-3": 4, "4-7": 4, "0-7": 8}
+        # 单节点门控：P2P_LEVEL 启用（pcie+tp>1）；P2P/SHM/IB 置空且带「单节点」理由
+        env = ss["env"]
+        assert env["NCCL_P2P_LEVEL"]["values"] == ["PXB", "SYS"]
+        assert env["NCCL_P2P_LEVEL"]["requires"] == "tp>1 且拓扑存在 P2P 梯度（pcie/mixed）"
+        assert env["NCCL_P2P_DISABLE"]["values"] == []
+        assert "单节点" in env["NCCL_P2P_DISABLE"]["reason"]
+        assert env["NCCL_SHM_DISABLE"]["values"] == []
+        assert "单节点" in env["NCCL_SHM_DISABLE"]["reason"]
+        assert env["NCCL_IB_HCA"]["values"] == []
+        assert "不走 NET" in env["NCCL_IB_HCA"]["reason"]
+
+    def test_single_node_nvlink_full_no_p2p_level(self):
+        head = dict(self.HEAD)
+        head["gpu"] = {"count": 8, "topo": {"summary": "nvlink-full"}}
+        head["net"] = {"rdma": {"kind": "none", "devices": []}}
+        ss = probe.build_search_space(self.PROFILE, head)
+        assert ss["env"]["NCCL_P2P_LEVEL"]["values"] == []
+        assert "nvlink-full" in ss["env"]["NCCL_P2P_LEVEL"]["reason"]
+
+    def test_multi_node_rdma_enables_ib_hca_and_gdr(self):
+        # 多节点 + RoCE：IB_HCA / GDR 启用；PCIe 拓扑附 SHM_DISABLE 跨节点配方
+        head = {"gpu": {"count": 4, "topo": {"summary": "pcie"}},
+                "numa_groups": [{"numa_node": 0, "gpus": [0, 1, 2, 3]}],
+                "net": {"rdma": {"kind": "roce", "devices": [
+                    {"name": "mlx5_0", "state": "ACTIVE"},
+                    {"name": "mlx5_1", "state": "ACTIVE"}]}}}
+        ss = probe.build_search_space(
+            {"tp": {"valid_divisors": [1, 2, 4], "min_tp_for_weights": 1}}, head, host_count=2)
+        assert ss["gates"]["single_node"] is False
+        assert ss["env"]["NCCL_IB_HCA"]["values"] == ["=mlx5_0:1", "=mlx5_1:1"]
+        assert ss["env"]["NCCL_NET_GDR_LEVEL"]["values"] == ["2", "3"]
+        assert ss["env"]["NCCL_SHM_DISABLE"]["values"] == ["1"]     # 跨节点 PCIe+RoCE 配方
+        assert "NCCL_P2P_DISABLE" not in ss["env"]                   # 单节点专属排除项
+
+    def test_min_tp_none_pruned(self):
+        head = dict(self.HEAD)
+        head["gpu"] = {"count": 4, "topo": {"summary": "nvlink-full"}}
+        head["numa_groups"] = [{"numa_node": 0, "gpus": [0, 1, 2, 3]}]
+        head["net"] = {"rdma": {"kind": "none", "devices": []}}
+        ss = probe.build_search_space(
+            {"tp": {"valid_divisors": [1, 2, 4], "min_tp_for_weights": None}}, head)
+        assert ss["serve"]["tensor-parallel-size"]["values"] == []
+        assert any("装不下权重" in p["reason"] for p in ss["pruned"])
+
+    def test_gmu_suggested_included_only_when_present(self):
+        ss = probe.build_search_space(self.PROFILE, self.HEAD, gmu_suggested=0.94)
+        assert ss["serve"]["gpu-memory-utilization"]["values"] == [0.94]
+        assert "gmu 预检建议值" in ss["serve"]["gpu-memory-utilization"]["reason"]
+        ss2 = probe.build_search_space(self.PROFILE, self.HEAD)
+        assert "gpu-memory-utilization" not in ss2["serve"]
+
+    def test_tp_capped_by_host_gpu_count(self):
+        # 真实教训：tp 除受显存约束外还受主机 GPU 数上限——8 卡主机上 tp=16/32/64 不可执行
+        prof = {"tp": {"valid_divisors": [8, 16, 32, 64], "min_tp_for_weights": 8}}
+        ss = probe.build_search_space(prof, self.HEAD)           # 8 GPU，numa [0-3]/[4-7]
+        assert ss["serve"]["tensor-parallel-size"]["values"] == [8]
+        assert "主机 GPU 数上限" in ss["serve"]["tensor-parallel-size"]["reason"]
+        # placement：NUMA 子集 tp=4 不在（截断后）合法集 → 只剩全卡 0-7(tp=8)
+        assert [(p["cuda_visible_devices"], p["tp"]) for p in ss["placement"]] == [("0-7", 8)]
+        # 超出的 tp 记入 pruned
+        assert any("超出本主机 GPU 数" in p["reason"] for p in ss["pruned"])
+        # B1：唯一可行 tp=8（>1）仍启用 P2P_LEVEL——门控是「存在 tp>1」，不是「候选个数 >1」
+        assert ss["env"]["NCCL_P2P_LEVEL"]["values"] == ["PXB", "SYS"]
+        assert ss["env"]["NCCL_P2P_DISABLE"]["values"] == []     # 单节点排除
+        assert ss["env"]["NCCL_IB_HCA"]["values"] == []
+
+    def test_placement_no_duplicate_on_single_numa_group(self):
+        # M2：单 NUMA 组覆盖全部 GPU → 节点候选与全卡候选相同，须去重（保持首见顺序）
+        head = dict(self.HEAD)
+        head["gpu"] = {"count": 8, "topo": {"summary": "pcie"}}
+        head["numa_groups"] = [{"numa_node": 0, "gpus": [0, 1, 2, 3, 4, 5, 6, 7]}]
+        ss = probe.build_search_space(self.PROFILE, head)
+        assert [(p["cuda_visible_devices"], p["tp"]) for p in ss["placement"]] == [("0-7", 8)]
+
+    def test_tp_unservable_on_host_gpu_count(self):
+        # min_tp_for_weights > 主机 GPU 数 → 空候选 + pruned（模型在本机 GPU 数上无法起服）
+        prof = {"tp": {"valid_divisors": [8, 16, 32, 64], "min_tp_for_weights": 16}}
+        ss = probe.build_search_space(prof, self.HEAD)
+        assert ss["serve"]["tensor-parallel-size"]["values"] == []
+        assert any("无法在本主机 GPU 数上起服" in p["reason"] for p in ss["pruned"])
+        assert ss["placement"] == []

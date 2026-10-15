@@ -20,7 +20,7 @@
 ### Phase 1 — 环境探测
 - **读**：`target.yaml`（hosts / model）。
 - **跑**：`python probe.py`（多机并行采集）。
-- **产出**：`env.json`（原始采集）+ `env_report.md`（系统参数检查清单 pass / warn / fail）+ `model_profile.json`（权重规模估算）。
+- **产出**：`env.json`（原始采集）+ `env_report.md`（系统参数检查清单 pass / warn / fail）+ `model_profile.json`（权重规模估算）+ `search_space.json`（机器可读候选池：tp / placement / NCCL env / cheap knobs + `pruned` 剪枝清单，均带 reason）。
 - **判断依据**：后续搜索空间与剪枝综合**主机 / NUMA / 网络 / 存储**四类环境事实（依据 `env.json` / `env_report.md` / `model_profile.json`），不是单一指标；**NUMA 划分与 GPU 子集 / 并行方案（placement）属于可评估维度**，主机级（BIOS）NUMA 划分只建议、不自动改。
 
 ### Phase 1.5 — 环境就绪门禁

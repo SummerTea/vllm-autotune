@@ -808,6 +808,35 @@ def _serve_crash_is_oom(text: str) -> bool:
             or "torch.outofmemoryerror" in low)
 
 
+def _classify_crash_kind(reason: str, log_text: str | None = None) -> str:
+    """崩溃分类（机器可读枚举，写入 crash result.json 的 crash_kind）。
+    命中顺序 = 特异性从高到低；reason 为本文件既有字面量，子串匹配稳定。
+    枚举：missing_image | model_path_missing | unknown_flag | contention | oom |
+    startup_timeout | trial_timeout | engine_dead | serve_exit | bench_failure | unknown。"""
+    r = reason or ""
+    if "未在主机预先准备" in r:
+        return "missing_image"
+    if "需要 target.yaml 的 model.path" in r:
+        return "model_path_missing"
+    if "未知 vllm serve 参数" in r:
+        return "unknown_flag"
+    if "serve OOM" in r or (log_text and _serve_crash_is_oom(log_text)):
+        return "oom"
+    if "主机非空闲" in r:
+        return "contention"
+    if "trial_timeout" in r:
+        return "trial_timeout"
+    if "startup_timeout" in r:
+        return "startup_timeout"
+    if "EngineDeadError" in r:
+        return "engine_dead"
+    if "serve 提前退出" in r:
+        return "serve_exit"
+    if "bench 失败" in r or "无有效输出" in r or "前缀缓存重置失败" in r or "重置前缀缓存失败" in r:
+        return "bench_failure"
+    return "unknown"
+
+
 def _classify_oom_crash(reason: str, log_path: str, since: int | None) -> tuple[str, dict | None]:
     """serve 崩溃原因分类（trial 与 --detect-gmu 共用）：本次段 run.log 命中 OOM 特征 →
     换成可执行口径 reason（含崩溃当时重新共租检测出的 foreign pid）并返回 contention；
@@ -960,6 +989,7 @@ def main(argv: list[str] | None = None) -> int:
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "result.json"), "w", encoding="utf-8") as f:
         json.dump({"status": "crash", "reason": "trial 未完成（占位：正常结束时会被覆盖）",
+                   "crash_kind": "unknown",
                    "trial_id": trial_id, "config_hash": config_hash,
                    "started_at": _now_iso()}, f, ensure_ascii=False, indent=2)
 
@@ -1178,18 +1208,23 @@ def main(argv: list[str] | None = None) -> int:
     except TrialCrash as c:
         kv_tokens = kv_sink[0]  # serve 死在启动期也可能已扫到 KV 行，保留进 calibration
         # F10：OOM 特征 → 可执行口径 + 崩溃当时重新共租检测（写入 contention）；未命中保持原原因
+        crash_text = _scan_log_since(log_path, log_start)
         crash_reason, oom_cont = _classify_oom_crash(c.reason, log_path, log_start)
         result = {"status": "crash", "reason": crash_reason, "started_at": started_at,
                   "calibration": {"measured_kv_tokens": kv_tokens, "load_seconds": load_seconds},
-                  "trial_id": trial_id, "config_hash": config_hash, "slo": slo}
+                  "trial_id": trial_id, "config_hash": config_hash, "slo": slo,
+                  "crash_kind": _classify_crash_kind(crash_reason, crash_text)}
         if oom_cont:
             result["contention"] = oom_cont
     except Exception as e:  # 兜底：任何异常都记为 crash，绝不让进程挂起
         kv_tokens = kv_sink[0]
-        result = {"status": "crash", "reason": f"{type(e).__name__}: {e}",
+        exc_reason = f"{type(e).__name__}: {e}"
+        result = {"status": "crash", "reason": exc_reason,
                   "started_at": started_at,
                   "calibration": {"measured_kv_tokens": kv_tokens, "load_seconds": load_seconds},
-                  "trial_id": trial_id, "config_hash": config_hash, "slo": slo}
+                  "trial_id": trial_id, "config_hash": config_hash, "slo": slo,
+                  "crash_kind": _classify_crash_kind(
+                      exc_reason, _scan_log_since(log_path, log_start))}
     finally:
         _cleanup(procs, args.docker_cmd)
         if log_fh is not None:
