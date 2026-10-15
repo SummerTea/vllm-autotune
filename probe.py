@@ -320,10 +320,11 @@ def _collect_plan(target: dict, harness: dict, config: dict | None = None) -> di
                          f"for f in {glob}/*.safetensors.index.json; do [ -f \"$f\" ] && cat \"$f\" && exit 0; done; exit 0",
                          "safetensors.index.json"),
                 ]
-            # 互联带宽实测（head）：GPU P2P 需镜像（容器测例）；RDMA 脚本自含选卡/起停
-            if image:
-                cmds += [_cmd("gpu_p2p_bw", _docker_p2p_cmd(image), "gpu_p2p_bw.txt")]
-            cmds += [_cmd("rdma_bw", _RDMA_BW_CMD, "rdma_bw.txt")]
+        # 本机互联带宽实测（每台主机都尽量采集；不可得 → null+note，不阻塞）：GPU P2P 需镜像
+        #（容器测例）；RDMA 脚本自含选卡/起停。属 host 级事实，见 env.json hosts.<name>.interconnect
+        if image:
+            cmds += [_cmd("gpu_p2p_bw", _docker_p2p_cmd(image), "gpu_p2p_bw.txt")]
+        cmds += [_cmd("rdma_bw", _RDMA_BW_CMD, "rdma_bw.txt")]
         plan[name] = cmds
     return plan
 
@@ -1213,17 +1214,18 @@ def render_env_report(target: dict, facts: dict, interconnect: dict,
         dk = f.get("docker") or {}
         lines.append(f"- docker：{dk.get('version') or '不可用'}；本地 vllm 镜像："
                      f"{', '.join(dk.get('vllm_images') or []) or '无'}")
+        icb = f.get("interconnect") or {}
+        p2p = icb.get("gpu_p2p_bw_gbps") or {}
+        rdma = icb.get("rdma_bw_gbps") or {}
+        lines.append(f"- 互联带宽：GPU P2P intra_numa={p2p.get('intra_numa')} GB/s / "
+                     f"cross_numa={p2p.get('cross_numa')} GB/s；RDMA={rdma.get('bw_gbps')} Gb/s"
+                     f"（容器/ib_write_bw 实测；不可得见 env.json note）")
         lines.append("")
     lines.append("## 跨机互联")
     lines.append("")
     lines.append(f"- covered：{interconnect['covered']}；{interconnect.get('reason') or '（见 checks）'}")
     for c in interconnect.get("checks", []):
         lines.append(f"  - {c['check']}: `{c.get('result') or '—'}` {c.get('note') or ''}".rstrip())
-    p2p = interconnect.get("gpu_p2p_bw_gbps") or {}
-    rdma = interconnect.get("rdma_bw_gbps") or {}
-    lines.append(f"- GPU P2P 带宽（容器实测）：intra_numa={p2p.get('intra_numa')} GB/s，"
-                 f"cross_numa={p2p.get('cross_numa')} GB/s")
-    lines.append(f"- RDMA 带宽（ib_write_bw 实测）：{rdma.get('bw_gbps')} Gb/s")
     lines.append("")
     lines.append(f"## 汇总：pass={total['pass']} warn={total['warn']} fail={total['fail']}")
     lines.append("")
@@ -1281,10 +1283,14 @@ def main(argv: list[str] | None = None) -> int:
         facts[h["name"]]["checklist"] = _system_checklist(
             facts[h["name"]], is_head=(h is head), weights_bytes=wb)
     interconnect = interconnect_check(target, mode, args.fixtures)
-    # 互联带宽实测（head）：fixtures 模式从 <key>.txt 读；live 模式由 plan 命令短时实测。
-    # 不可得 → null + note，绝不阻塞其它采集。
-    interconnect["gpu_p2p_bw_gbps"] = parse_gpu_p2p_bw(raw[head["name"]].get("gpu_p2p_bw"))
-    interconnect["rdma_bw_gbps"] = parse_rdma_bw(raw[head["name"]].get("rdma_bw"))
+    # 本机互联带宽：host 级事实（hosts.<name>.interconnect）——fixtures 模式从 <key>.txt 读、
+    # live 模式由 plan 命令短时实测；每台主机都产出该键，不可得 → null + note，绝不阻塞。
+    # 顶层 interconnect 只保留「跨机互联检查」（covered/reason/checks），不再承载带宽数值。
+    for h in target["hosts"]:
+        facts[h["name"]]["interconnect"] = {
+            "gpu_p2p_bw_gbps": parse_gpu_p2p_bw(raw[h["name"]].get("gpu_p2p_bw")),
+            "rdma_bw_gbps": parse_rdma_bw(raw[h["name"]].get("rdma_bw")),
+        }
 
     env = {
         "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),

@@ -109,9 +109,12 @@ def test_fixture_probe_produces_artifacts(tmp_path):
     assert numa_item["status"] == "warn"
     assert "numa_groups" in numa_item["detail"]
     assert env["interconnect"]["covered"] is False      # 单主机 → 不执行跨机检查
-    # 互联带宽实测（fixture 逐字样例 → 解析出数值）
-    assert env["interconnect"]["gpu_p2p_bw_gbps"] == {"intra_numa": 43.35, "cross_numa": 33.87}
-    assert env["interconnect"]["rdma_bw_gbps"] == {"bw_gbps": 341.7}
+    # 顶层 interconnect 只保留「跨机互联检查」语义（covered/reason/checks），不再承载带宽
+    assert set(env["interconnect"]) == {"covered", "reason", "checks"}
+    # 本机互联带宽 = host 级事实（hosts.head.interconnect；fixture 逐字样例 → 解析出数值）
+    hic = head["interconnect"]
+    assert hic["gpu_p2p_bw_gbps"] == {"intra_numa": 43.35, "cross_numa": 33.87}
+    assert hic["rdma_bw_gbps"] == {"bw_gbps": 341.7}
 
     profile = json.loads(profile_p.read_text(encoding="utf-8"))
     assert profile["model"] == "Qwen/Qwen3-32B"
@@ -126,6 +129,8 @@ def test_fixture_probe_produces_artifacts(tmp_path):
     assert "系统参数检查清单" in report
     assert "NUMA 分组" in report                       # 关键事实含 numa_groups
     assert "RDMA：RoCE(Ethernet) ×2（400 Gb/s）" in report  # 报告显示 RoCE 而非「无」（假阴性回归）
+    assert "互联带宽：" in report                      # 主机小节读到互联带宽（host 级事实）
+    assert "GPU P2P 带宽（容器实测）" not in report    # 跨机小节不再承载带宽数值
     assert "下一步" in report
 
 
@@ -178,12 +183,23 @@ def test_multihost_interconnect_emitted(tmp_path):
     assert env["hosts"]["worker1"]["hostname"] == "worker1"  # worker fixture 生效
     # worker1 无任何 RDMA fixture → kind=none（无 RDMA 判 none 回归）
     assert env["hosts"]["worker1"]["net"]["rdma"]["kind"] == "none"
+    # 本机互联带宽：每台主机都产出该键（host 级事实）；worker 无 fixture → null + note
+    for name in ("head", "worker1"):
+        hic = env["hosts"][name]["interconnect"]
+        assert set(hic) == {"gpu_p2p_bw_gbps", "rdma_bw_gbps"}
+    wic = env["hosts"]["worker1"]["interconnect"]
+    assert wic["gpu_p2p_bw_gbps"]["intra_numa"] is None
+    assert "note" in wic["gpu_p2p_bw_gbps"]
+    assert wic["rdma_bw_gbps"]["bw_gbps"] is None
+    assert "note" in wic["rdma_bw_gbps"]
 
     ic = env["interconnect"]
     assert "checks" in ic
     assert ic["covered"] is True                 # ping_worker1.txt fixture 存在
     assert any("ping worker1" in c["check"] and c["result"] for c in ic["checks"])
     assert ic["reason"] is None
+    # 顶层 interconnect 只承载跨机检查语义，不再放带宽数值
+    assert set(ic) == {"covered", "reason", "checks"}
 
 
 # ── docker-only 模型探测（_collect_plan 命令串选择）─────────────────────
@@ -257,6 +273,24 @@ def test_collect_plan_hf_source_unchanged_with_image():
     entries = {e["key"]: e for e in plan["head"]}
     assert "docker run" not in entries["model_config_json"]["cmd"]
     assert "huggingface/hub" in entries["model_config_json"]["cmd"]
+
+
+def test_collect_plan_interconnect_cmds_for_all_hosts():
+    """本机互联带宽是 host 级事实：每台主机（含 worker）都产 gpu_p2p_bw/rdma_bw 采集项；
+    无镜像 → 无 gpu_p2p_bw（容器测例不跑），rdma_bw 恒在。"""
+    target = {"hosts": [
+        {"name": "head", "ssh": "user@10.0.0.1", "role": "head"},
+        {"name": "worker1", "ssh": "user@10.0.0.2", "role": "worker"},
+    ], "model": {"id": "m", "source": "local", "path": "/models/m"}}
+    plan = probe._collect_plan(target, {"runtime": {}}, config={})
+    for name in ("head", "worker1"):
+        keys = {e["key"] for e in plan[name]}
+        assert "rdma_bw" in keys                      # 脚本自含守卫，恒采集
+        assert "gpu_p2p_bw" not in keys               # 无镜像 → 不跑容器测例
+    plan2 = probe._collect_plan(target, {"runtime": {"image": "img"}}, config={})
+    for name in ("head", "worker1"):
+        keys = {e["key"] for e in plan2[name]}
+        assert "gpu_p2p_bw" in keys and "rdma_bw" in keys
 
 
 def test_checklist_gpu_persistence_mode_is_warn_not_fail():
