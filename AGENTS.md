@@ -88,5 +88,7 @@
 `.slim/clonedeps/repos/` 下有只读依赖源码可供查阅，请勿编辑这些克隆。
 
 - `.slim/clonedeps/repos/vllm-project__vllm/` — `vllm-project/vllm` @ `v0.31.0`（sparse 仅 `benchmarks/auto_tune`）；官方 vLLM serve 参数自动调优脚本（网格 + `--goodput` SLO 搜索），是本模板循环的同构先例，用于借鉴其 gmu 自动探测、`--load-format dummy` 快速扫描、`--random-prefix-len` 前缀缓存工作负载等做法。
+- `.slim/clonedeps/repos/NVIDIA__nccl/` — `NVIDIA/nccl` @ `v2.32.3-1`；NCCL 源码，用于核实 `NCCL_*` 环境变量语义与多 GPU 通信调优项，作为 `search_space.json` 中 NCCL env 候选的依据。
+- `.slim/clonedeps/repos/vllm-project__guidellm/` — `vllm-project/guidellm` @ `v0.8.1`；第二基准/验收层（roadmap v1.1(b)）的源码依据：`sweep` profile 格式与 `--constraint max_error_rate` 语义。
 
 结构化清单见 `.slim/clonedeps.json`（无需为基本仓库列表阅读它）。

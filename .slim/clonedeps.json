@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "updatedAt": "2026-10-14T00:27:00.000Z",
+  "updatedAt": "2026-10-15T00:00:00.000Z",
   "dependencies": [
     {
       "name": "vllm auto_tune (benchmarks/auto_tune)",
@@ -10,6 +10,22 @@
       "path": ".slim/clonedeps/repos/vllm-project__vllm",
       "packagePath": "benchmarks/auto_tune",
       "reason": "官方 vLLM serve 参数自动调优脚本（网格 + --goodput SLO 搜索），是本模板循环的同构先例，用于借鉴"
+    },
+    {
+      "name": "NCCL",
+      "resolvedVersion": "2.32.3",
+      "repoUrl": "https://github.com/NVIDIA/nccl.git",
+      "ref": "v2.32.3-1",
+      "path": ".slim/clonedeps/repos/NVIDIA__nccl",
+      "reason": "NCCL 源码，用于核实 NCCL_* 环境变量语义与多 GPU 通信调优项（search_space 的 NCCL env 候选依据）"
+    },
+    {
+      "name": "GuideLLM",
+      "resolvedVersion": "0.8.1",
+      "repoUrl": "https://github.com/vllm-project/guidellm.git",
+      "ref": "v0.8.1",
+      "path": ".slim/clonedeps/repos/vllm-project__guidellm",
+      "reason": "第二基准/验收层（roadmap v1.1(b)）的源码依据：sweep profile 格式与 --constraint max_error_rate 语义"
     }
   ]
 }
