@@ -40,15 +40,22 @@ TARGET_MULTI = {
 }
 
 
-def _run_probe(tmp_path: Path, target: dict = TARGET) -> subprocess.CompletedProcess:
+def _run_probe(tmp_path: Path, target: dict = TARGET,
+               config: dict | None = None) -> subprocess.CompletedProcess:
     target_p = tmp_path / "target.yaml"
     harness = tmp_path / "harness.yaml"
     target_p.write_text(yaml.safe_dump(target), encoding="utf-8")
     shutil.copy(REPO / "harness.yaml", harness)
+    # config.yaml 由测试自带并以其为 cwd：probe 从 cwd 读取 config.yaml（决定 runtime.image →
+    # 是否采集 docker 路径的键）。若不自带，测试会隐式耦合「仓库实例的 config.yaml」——
+    # 模板仓库 config.yaml 无 runtime 时会导致 docker 相关键「未采集」。
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(config if config is not None else {"runtime": {"image": "vllm/vllm-openai:v0.31.0"}}),
+        encoding="utf-8")
     out = tmp_path / "out"
     cmd = [sys.executable, str(PROBE), "--fixtures", str(FIXTURES),
            "--target", str(target_p), "--harness", str(harness), "--out-dir", str(out)]
-    return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(cmd, capture_output=True, text=True, cwd=tmp_path)
 
 
 def test_fixture_probe_produces_artifacts(tmp_path):
