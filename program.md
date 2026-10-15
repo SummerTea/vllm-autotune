@@ -44,7 +44,7 @@ commit  goodput  goodput_std  output_tok_s  ttft_p99_ms  tpot_p99_ms  peak_vram_
 - `ttft_p99_ms` / `tpot_p99_ms`：实测 P99 时延，用于核对 SLO。
 - `peak_vram_gb`：bench 期间 `nvidia-smi` 采样的峰值显存（GB）。
 - `dur_s`：本次 trial 的墙钟耗时（秒），用于 deadline 感知调度的历史中位数估算。
-- `status`：`keep` / `discard` / `crash` / `best`（当前最佳行）。
+- `status`：`keep` / `discard` / `crash` / `best`（当前最佳行）/ `confirm`（收尾对 best 的回归确认行；**不参与** best 选择，只作核对）。
 - `description`：本次改了什么（自由文本，便于复盘）。
 
 ## 退出机制（三层 + 调度细节）
@@ -97,4 +97,9 @@ commit  goodput  goodput_std  output_tok_s  ttft_p99_ms  tpot_p99_ms  peak_vram_
 
 ## 收尾
 
-满足任一退出条件（主退出 / 平台期 / 崩溃连击）→ 进 Phase 4，运行 `python report.py` 产出 `report.md`。循环结束后不要再开新 trial。
+满足任一退出条件（主退出 / 平台期 / 崩溃连击）→ 进 Phase 4：
+
+1. **确认 best 回归**：`git checkout <best_commit> -- config.yaml` → `bash run.sh` → 轮询 `bash run.sh --poll` 至退出 0（done）→ 在 `results.tsv` 追加一行 `status=confirm`（description 如 `confirm best`）。目的：排除夜间爬山产生的「噪声最优」。
+2. 运行 `python report.py` 产出 `report.md`（含「确认（best 回归）」判定节）。
+
+循环结束后不要再开新 trial。

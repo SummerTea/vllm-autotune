@@ -98,17 +98,20 @@ def pick_baseline(rows: list[dict]) -> dict | None:
 
 
 def pick_best(rows: list[dict], slo: dict | None = None) -> tuple[dict | None, bool]:
-    """最佳：状态 ∈ {keep, best} 且 SLO 达标的最高 goodput 行。
+    """最佳：状态恰为 {keep, best} 且 SLO 达标的最高 goodput 行——confirm 行绝不参与
+    best 选择（只作回归核对，见「确认（best 回归）」节）。
     无达标行时：先取 {keep, best} 中最高 goodput（即便不达标）；仅当 keep/best 行
-    不存在时，才回退全部已测量（非 crash）行的最高 goodput。
+    不存在时，才回退全部已测量（非 crash、非 confirm）行的最高 goodput。
     两种情况均置 flagged=True（报告中提示 ⚠ 人工复核）。"""
-    eligible = [r for r in rows if r.get("status") in ("keep", "best")]
+    eligible = [r for r in rows if r.get("status") in ("keep", "best")]  # 明确排除 confirm
     met = [r for r in eligible if slo_ok(r, slo)]
     if met:
         return max(met, key=lambda r: r.get("goodput") or 0), False
     if eligible:
         return max(eligible, key=lambda r: r.get("goodput") or 0), True
-    measured = [r for r in rows if r.get("goodput") is not None and r.get("status") != "crash"]
+    # 回退：已测量行中最高 goodput；confirm/crash 均不参与 best 选择
+    measured = [r for r in rows
+                if r.get("goodput") is not None and r.get("status") not in ("crash", "confirm")]
     if measured:
         return max(measured, key=lambda r: r.get("goodput") or 0), True
     return None, True
@@ -214,7 +217,8 @@ def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict
            best_flagged: bool, improvement: float | None, *, model: str = "（未知）",
            workload: dict | None = None, config_snapshot: str | None = None,
            system_advice: list[dict] | None = None,
-           deploy_cmd: list[str] | None = None) -> str:
+           deploy_cmd: list[str] | None = None,
+           noise_band_pct: float = 3.0, noise_k_sigma: float = 2.0) -> str:
     sl = {**DEFAULT_SLO, **(slo or {})}
     wl = workload or {}
     counts = Counter(r.get("status") for r in rows)
@@ -229,7 +233,7 @@ def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict
     lines.append(f"- SLO：ttft_p99 ≤ {sl['ttft_p99_ms']} ms；tpot_p99 ≤ {sl['tpot_p99_ms']} ms")
     lines.append(f"- trial 数：{len(rows)}（keep={counts.get('keep', 0)}，"
                  f"discard={counts.get('discard', 0)}，crash={counts.get('crash', 0)}，"
-                 f"best={counts.get('best', 0)}）")
+                 f"best={counts.get('best', 0)}，confirm={counts.get('confirm', 0)}）")
     lines.append(f"- 生成时间：{datetime.datetime.now().isoformat(timespec='seconds')}")
     lines.append("")
 
@@ -291,6 +295,35 @@ def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict
                      "最佳配置见上节，可手动起服。")
     lines.append("")
 
+    lines += ["## 确认（best 回归）", ""]
+    confirm_rows = [r for r in rows if r.get("status") == "confirm"]
+    latest = confirm_rows[-1] if confirm_rows else None
+    if latest is not None and best is not None and best.get("goodput"):
+        bg, cg = best["goodput"], latest.get("goodput")
+        bs = best.get("goodput_std") or 0.0
+        # 复用 keep 规则公式：阈值 = max(best × noise_band_pct/100, noise_k_sigma × σ)
+        threshold = max(bg * noise_band_pct / 100.0, noise_k_sigma * bs)
+        delta = abs((cg or 0.0) - bg)
+        if delta <= threshold:
+            verdict = "确认（噪声带内一致）"
+        else:
+            verdict = f"未确认（差异 {_fmt(delta)} 超噪声带 {_fmt(threshold)}）"
+        lines += [
+            "| 指标 | best | confirm（最新） |",
+            "|---|---|---|",
+            f"| goodput（req/s） | {_fmt(bg)} | {_fmt(cg)} |",
+            f"| goodput_std（σ） | {_fmt(bs)} | {_fmt(latest.get('goodput_std'))} |",
+            f"| Δ（|confirm−best|） | — | {_fmt(delta)} |",
+            "",
+        ]
+        lines.append(f"- 判定：**{verdict}**（阈值 = max(best × {noise_band_pct}/100, "
+                     f"{noise_k_sigma} × σ) = {_fmt(threshold)} req/s；σ=best 行的 goodput_std）。")
+    elif latest is not None:
+        lines.append("存在 confirm 行，但无 best（keep/best）行可核对——best 回退选择见「基线 vs 最佳」。")
+    else:
+        lines.append("未做确认 run（建议收尾对 best 再跑一次，results.tsv 记 `status=confirm`）。")
+    lines.append("")
+
     lines += ["## 系统级建议（附录）", ""]
     advice = system_advice or []
     if advice:
@@ -337,6 +370,10 @@ def main(argv: list[str] | None = None) -> int:
             target = yaml.safe_load(f) or {}
     slo = {**harness.get("slo", {}), **((target.get("metrics") or {}).get("slo") or {})}
     workload = {**harness.get("workload", {}), **(target.get("workload") or {})}
+    # 确认回归的噪声参数（harness.bench；缺省与 harness.yaml 一致）
+    bench_cfg = harness.get("bench") or {}
+    noise_band_pct = float(bench_cfg.get("noise_band_pct", 3.0))
+    noise_k_sigma = float(bench_cfg.get("noise_k_sigma", 2.0))
 
     model = "（未知）"
     if os.path.exists(args.model_profile):
@@ -359,7 +396,7 @@ def main(argv: list[str] | None = None) -> int:
     deploy_cmd = build_deploy_cmd(snapshot, target, harness, best, slo) if (best is not None and snapshot) else None
     md = render(rows, slo, baseline, best, flagged, imp, model=model, workload=workload,
                 config_snapshot=snapshot, system_advice=extract_system_advice(env_report),
-                deploy_cmd=deploy_cmd)
+                deploy_cmd=deploy_cmd, noise_band_pct=noise_band_pct, noise_k_sigma=noise_k_sigma)
 
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(md)
@@ -372,7 +409,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"trial 数: {len(rows)}（keep={sum(1 for r in rows if r['status'] == 'keep')}，"
           f"discard={sum(1 for r in rows if r['status'] == 'discard')}，"
-          f"crash={sum(1 for r in rows if r['status'] == 'crash')}）")
+          f"crash={sum(1 for r in rows if r['status'] == 'crash')}，"
+          f"confirm={sum(1 for r in rows if r['status'] == 'confirm')}）")
     if best is not None:
         print(f"best: {best.get('commit')} goodput={_fmt(best.get('goodput'))}"
               f"（提升 {_fmt(imp)}%）"

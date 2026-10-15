@@ -300,3 +300,46 @@ class TestDeploy:
         assert "-p 127.0.0.1:8000" not in text
         md = (tmp_path / "report.md").read_text(encoding="utf-8")
         assert "http://127.0.0.1:9999" in md
+
+
+# ── 确认（best 回归）────────────────────────────────────────────────────
+
+CONFIRM_TSV = TSV + (
+    "eeee555\t10.9\t0.4\t9700.0\t455.0\t20.5\t72.0\t900.0\tconfirm\tconfirm best\n")
+
+
+class TestConfirm:
+    def test_pick_best_ignores_confirm(self):
+        # confirm 行绝不参与 best 选择：best 仍为 keep 的 cccc333
+        rows = report.parse_tsv(CONFIRM_TSV)
+        best, flagged = report.pick_best(rows, SLO)
+        assert best is not None
+        assert best["status"] == "keep" and best["commit"] == "cccc333"
+        assert best["goodput"] == 11.0
+        assert flagged is False
+
+    def test_confirm_within_band(self):
+        # confirm 10.9 vs best 11.0：Δ=0.1 ≤ max(11×3%, 2×0.5)=1.0 → 确认
+        rows = report.parse_tsv(CONFIRM_TSV)
+        best, _ = report.pick_best(rows, SLO)
+        md = report.render(rows, SLO, None, best, False, None,
+                           noise_band_pct=3.0, noise_k_sigma=2.0)
+        assert "## 确认（best 回归）" in md
+        assert "确认（噪声带内一致）" in md
+        assert "confirm（最新）" in md
+
+    def test_confirm_outside_band(self):
+        # 构造 Δ=2.0 > 1.0 → 未确认
+        tsv = CONFIRM_TSV.replace("10.9\t0.4", "9.0\t0.4")
+        rows = report.parse_tsv(tsv)
+        best, _ = report.pick_best(rows, SLO)
+        md = report.render(rows, SLO, None, best, False, None,
+                           noise_band_pct=3.0, noise_k_sigma=2.0)
+        assert "未确认（差异" in md
+
+    def test_confirm_missing_shows_note(self):
+        rows = _rows()                     # 无 confirm 行
+        best, _ = report.pick_best(rows, SLO)
+        md = report.render(rows, SLO, None, best, False, None,
+                           noise_band_pct=3.0, noise_k_sigma=2.0)
+        assert "未做确认 run" in md

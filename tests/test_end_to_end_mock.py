@@ -95,7 +95,8 @@ def test_full_pipeline(tmp_path):
     assert r.returncode == 0, f"report 失败:\n{r.stdout}\n{r.stderr}"
     md = (tmp_path / "report.md").read_text(encoding="utf-8")
     for sec in ("# 调优报告", "## 概览", "## 基线 vs 最佳", "## 全部 trial 表",
-                "## 最佳配置", "## 系统级建议", "## 适用范围"):
+                "## 最佳配置", "## 部署（best 配置）", "## 确认（best 回归）",
+                "## 系统级建议", "## 适用范围"):
         assert sec in md, f"report.md 缺小节 {sec}"
     assert "Qwen/Qwen3-32B" in md                 # 模型来自 model_profile.json
     assert "无满足 SLO 的 trial" in md            # ttft 620.1 > 500 → 回退标注
