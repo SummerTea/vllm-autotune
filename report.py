@@ -231,6 +231,7 @@ def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict
                  f"isl=`{wl.get('isl', 1024)}`，osl=`{wl.get('osl', 128)}`，"
                  f"num_prompts=`{wl.get('num_prompts', 1000)}`"
                  + (f"，ref_concurrency=`{wl.get('ref_concurrency')}`" if wl.get("ref_concurrency") else ""))
+    lines.append("- 各 trial 实际生效 workload 以 `result.json` 的 `workload` 字段为准（跨 workload 的行不可混比）。")
     lines.append(f"- SLO：ttft_p99 ≤ {sl['ttft_p99_ms']} ms；tpot_p99 ≤ {sl['tpot_p99_ms']} ms")
     if slo_calibrated:
         ref = {**DEFAULT_SLO, **slo_calibrated}

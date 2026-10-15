@@ -63,6 +63,11 @@ if [ "$SUB" = "serve" ]; then
       exit 0
     fi
   done
+  if [ "${FAKE_DOCKER_CRASH_OOM:-0}" = "1" ]; then
+    # 模拟 vLLM 启动期显存不足（F10 崩溃原因分类测试；run.log 含 OOM 特征行）
+    echo "ValueError: Free memory on device cuda:0 (2.0 GiB / 22.0 GiB) on startup is less than desired GPU memory utilization" >&2
+    exit 1
+  fi
   if [ "${FAKE_DOCKER_CRASH:-0}" = "1" ]; then
     echo "fake docker serve crashing" >&2
     exit 1
@@ -70,7 +75,7 @@ if [ "$SUB" = "serve" ]; then
   # FAKE_DOCKER_OOM_ABOVE=<g>：gmu > g → 模拟 HBM OOM 退出（--detect-gmu 降级路径）
   if [ -n "${FAKE_DOCKER_OOM_ABOVE:-}" ] && [ -n "$GMU" ] \
      && awk -v g="$GMU" -v o="$FAKE_DOCKER_OOM_ABOVE" 'BEGIN{exit !(g>o)}'; then
-    echo "fake docker serve OOM (gmu=$GMU > $FAKE_DOCKER_OOM_ABOVE)" >&2
+    echo "ValueError: Free memory on device cuda:0 (2.0 GiB / 22.0 GiB) on startup is less than desired GPU memory utilization (gmu=$GMU)" >&2
     exit 1
   fi
   exec python3 - "$PORT" <<'EOF'

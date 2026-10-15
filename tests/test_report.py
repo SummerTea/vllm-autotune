@@ -185,6 +185,7 @@ class TestRender:
         assert "commit=cccc333" in md    # 最佳 commit
         assert "max-num-seqs: 256" in md   # 配置快照内嵌
         assert "GPU SM 时钟" in md   # 系统级建议
+        assert "跨 workload 的行不可混比" in md   # 概览 workload 来源备注
 
     def test_render_fallback_note(self):
         rows = [dict(_rows()[0], ttft_p99_ms=999.0),

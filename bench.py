@@ -194,6 +194,14 @@ def resolve_slo(harness: dict, target: dict, config: dict) -> dict:
             **(config.get("slo") or {})}
 
 
+def _resolved_workload(workload: dict, ref_conc: int) -> dict:
+    """本次 bench 实际生效的 workload（DEFAULT_WORKLOAD ⊕ harness/target + 解析后的
+    ref_concurrency），写入 result.json 供逐行比较（跨 workload 的行不可混比）。"""
+    eff = {**DEFAULT_WORKLOAD, **workload, "ref_concurrency": ref_conc}
+    return {k: eff.get(k) for k in
+            ("dataset", "isl", "osl", "num_prompts", "ref_concurrency", "prefix_hit_pct")}
+
+
 def container_model_path(runtime: dict) -> str:
     """容器内模型挂载点，默认 /model。"""
     return str(runtime.get("container_model_path") or "/model")
@@ -526,6 +534,7 @@ def _run_gmu_probe(docker_cmd: str, runtime: dict, config: dict, target: dict, p
                 break
             tried.append(gmu)
             procs: list[subprocess.Popen] = []
+            log_start = _log_size(log_path)
             try:
                 _start_serve_and_wait(docker_cmd, runtime, host_model_path, port,
                                       _gmu_probe_config(config, gmu), log_fh, log_path,
@@ -535,8 +544,9 @@ def _run_gmu_probe(docker_cmd: str, runtime: dict, config: dict, target: dict, p
                 reason = f"serve 在 gmu={gmu} 就绪（--load-format dummy）"
                 break
             except TrialCrash as c:
-                reason = c.reason
-                log_fh.write(f"=== bench.py {_now_iso()} gmu={gmu} 失败: {c.reason}\n".encode())
+                # F10：OOM 特征 → 可执行口径（含共租 pid）；未命中保持原原因（不回归）
+                reason, _ = _classify_oom_crash(c.reason, log_path, log_start)
+                log_fh.write(f"=== bench.py {_now_iso()} gmu={gmu} 失败: {reason}\n".encode())
                 log_fh.flush()
             finally:
                 _cleanup(procs, docker_cmd)  # 每级尝试后必清理（rm -f 幂等）
@@ -683,6 +693,54 @@ def _detect_co_tenants() -> list[dict]:
     if rc != 0 or not out.strip():
         return []
     return parse_compute_apps(out)
+
+
+def _log_size(log_path: str) -> int | None:
+    """run.log 当前字节数（作为本次段起点）；不可读 → None。"""
+    try:
+        return os.path.getsize(log_path)
+    except OSError:
+        return None
+
+
+def _scan_log_since(log_path: str, since: int | None) -> str:
+    """读 run.log 自 since 起的追加段文本；since=None / 不可读 → ""（宽容）。"""
+    if since is None:
+        return ""
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            f.seek(since)
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _serve_crash_is_oom(text: str) -> bool:
+    """serve 崩溃日志是否 OOM 特征（大小写/换行宽容）：`Free memory on device` +
+    `less than desired GPU memory utilization`（跨行也命中），或 `CUDA out of memory` /
+    `torch.OutOfMemoryError`。"""
+    if not text:
+        return False
+    low = text.lower()
+    return (("free memory on device" in low and "less than desired gpu memory utilization" in low)
+            or "cuda out of memory" in low
+            or "torch.outofmemoryerror" in low)
+
+
+def _classify_oom_crash(reason: str, log_path: str, since: int | None) -> tuple[str, dict | None]:
+    """serve 崩溃原因分类（trial 与 --detect-gmu 共用）：本次段 run.log 命中 OOM 特征 →
+    换成可执行口径 reason（含崩溃当时重新共租检测出的 foreign pid）并返回 contention；
+    未命中 → 原样 reason + None（不回归既有通用崩溃原因）。"""
+    if not _serve_crash_is_oom(_scan_log_since(log_path, since)):
+        return reason, None
+    apps = _detect_co_tenants()
+    if apps:
+        names = ", ".join(str(a.get("pid"))
+                          + (f"({a.get('process_name')})" if a.get("process_name") else "")
+                          for a in apps)
+        return (f"serve OOM：显存不足（疑似外部共租占用）；外部 GPU 进程：{names}",
+                {"foreign_gpu_apps": apps, "checked_at": _now_iso()})
+    return "serve OOM：显存不足（疑似外部共租占用）", None
 
 
 def _wait_mem_freed(timeout: float = 30) -> None:
@@ -865,9 +923,11 @@ def main(argv: list[str] | None = None) -> int:
     result: dict | None = None
     # 启动 helper 在轮询中把 KV 校准行写入 kv_sink[0]；serve 死在启动期也要读回（crash 路径保留）
     kv_sink: list[int | None] = [None]
+    # F10：serve 崩溃原因分类用——本次段 run.log 的起点（起 serve 前记录）
+    log_start: int | None = None
+    log_path = os.path.join(out_dir, "run.log")
 
     try:
-        log_path = os.path.join(out_dir, "run.log")
         log_fh = open(log_path, "ab")
         # docker：serve/bench 都在容器内跑；本机只跑 docker 客户端
         host_model_path = (target.get("model") or {}).get("path")
@@ -899,6 +959,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise TrialCrash("主机非空闲：检测到其他 GPU 进程 "
                                  f"{[a['pid'] for a in foreign_apps]}（require_idle=true 要求独占）")
         # 起 serve（attach → run.log）并轮询 /health 就绪；与 --detect-gmu 共用同一 helper
+        log_start = _log_size(log_path)
         _start_serve_and_wait(args.docker_cmd, runtime, host_model_path, port, config,
                               log_fh, log_path, deadline, startup_timeout_s,
                               args.poll_interval, kv_sink, procs)
@@ -969,13 +1030,18 @@ def main(argv: list[str] | None = None) -> int:
             "repeats": repeats,
             "env_fingerprint": fingerprint,
             "calibration": calibration,
+            "workload": _resolved_workload(workload, ref_conc),
             "started_at": started_at,
             **({"contention": contention} if contention else {}),
         }
     except TrialCrash as c:
         kv_tokens = kv_sink[0]  # serve 死在启动期也可能已扫到 KV 行，保留进 calibration
-        result = {"status": "crash", "reason": c.reason, "started_at": started_at,
+        # F10：OOM 特征 → 可执行口径 + 崩溃当时重新共租检测（写入 contention）；未命中保持原原因
+        crash_reason, oom_cont = _classify_oom_crash(c.reason, log_path, log_start)
+        result = {"status": "crash", "reason": crash_reason, "started_at": started_at,
                   "calibration": {"measured_kv_tokens": kv_tokens, "load_seconds": load_seconds}}
+        if oom_cont:
+            result["contention"] = oom_cont
     except Exception as e:  # 兜底：任何异常都记为 crash，绝不让进程挂起
         kv_tokens = kv_sink[0]
         result = {"status": "crash", "reason": f"{type(e).__name__}: {e}",

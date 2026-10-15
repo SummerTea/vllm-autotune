@@ -214,6 +214,52 @@ options:
         # 全缺省 → 空（DEFAULT_SLO 由调用方合并，语义不变）
         assert bench.resolve_slo({}, {}, {}) == {}
 
+    def test_resolved_workload(self):
+        # 实际生效 workload = DEFAULT_WORKLOAD ⊕ harness/target + 解析后的 ref_concurrency
+        wl = {"dataset": "random", "isl": 2048, "osl": 256, "num_prompts": 500}
+        assert bench._resolved_workload(wl, 128) == {
+            "dataset": "random", "isl": 2048, "osl": 256, "num_prompts": 500,
+            "ref_concurrency": 128, "prefix_hit_pct": 0}
+        # 缺省键回 DEFAULT_WORKLOAD
+        assert bench._resolved_workload({}, 64) == {
+            "dataset": "random", "isl": 1024, "osl": 128, "num_prompts": 1000,
+            "ref_concurrency": 64, "prefix_hit_pct": 0}
+
+    def test_serve_crash_is_oom_signatures(self):
+        # F10：OOM 特征识别（大小写/换行宽容）——Free memory + less than desired / CUDA OOM / torch OOM
+        assert bench._serve_crash_is_oom(
+            "ValueError: Free memory on device cuda:0 (2.0 GiB / 22.0 GiB) on startup "
+            "is less than desired GPU memory utilization (0.92)") is True
+        assert bench._serve_crash_is_oom(
+            "free memory on device cuda:0 is low\nless than desired gpu memory utilization") is True  # 跨行
+        assert bench._serve_crash_is_oom("RuntimeError: CUDA out of memory.") is True
+        assert bench._serve_crash_is_oom("torch.OutOfMemoryError: allocated 2.0 GiB") is True
+        assert bench._serve_crash_is_oom("") is False
+        assert bench._serve_crash_is_oom("fake docker serve crashing") is False
+        assert bench._serve_crash_is_oom("Free memory on device cuda:0 is fine") is False  # 缺后半特征
+
+    def test_classify_oom_crash(self, tmp_path, monkeypatch):
+        # F10：命中 OOM → 可执行口径 reason + 崩溃当时重新共租检测的 pid；未命中不回归
+        log = tmp_path / "run.log"
+        log.write_text("=== bench.py serve(docker): ...\n"
+                       "ValueError: Free memory on device cuda:0 (2.0 GiB / 22.0 GiB) on startup "
+                       "is less than desired GPU memory utilization\n",
+                       encoding="utf-8")
+        monkeypatch.setattr(bench, "_detect_co_tenants",
+                            lambda: [{"pid": 1234, "process_name": "torchrun",
+                                      "used_memory_mib": 512}])
+        reason, cont = bench._classify_oom_crash("serve 提前退出（rc=1）", str(log), 0)
+        assert "serve OOM" in reason and "1234(torchrun)" in reason
+        assert cont is not None
+        assert cont["foreign_gpu_apps"][0]["pid"] == 1234
+        # 未命中 → 原样返回 + None（不回归既有通用崩溃原因）
+        (log.write_text("fake docker serve crashing\n", encoding="utf-8"))
+        reason2, cont2 = bench._classify_oom_crash("serve 提前退出（rc=1）", str(log), 0)
+        assert reason2 == "serve 提前退出（rc=1）" and cont2 is None
+        # since=None（无本次段起点）→ 不扫描，不分类
+        reason3, cont3 = bench._classify_oom_crash("serve 提前退出（rc=1）", str(log), None)
+        assert reason3 == "serve 提前退出（rc=1）" and cont3 is None
+
 
 class TestDockerRuntime:
     RUNTIME = {"kind": "docker", "image": "vllm/vllm-openai:v0.31.0",
@@ -664,6 +710,10 @@ def test_docker_lifecycle_with_stub_docker(tmp_path, capsys, monkeypatch):
     result = json.loads((out / "result.json").read_text(encoding="utf-8"))
     assert result["stats"]["goodput_std"] == pytest.approx(
         round(statistics.stdev([12.34, 13.34]), 4))
+    # workload：本次 bench 实际生效值（DEFAULT_WORKLOAD ⊕ harness/target + ref_conc）
+    assert result["workload"] == {"dataset": "random", "isl": 2048, "osl": 256,
+                                  "num_prompts": 1000, "ref_concurrency": 128,
+                                  "prefix_hit_pct": 0}
 
 
 def test_docker_crash_serve_exits(tmp_path, capsys, monkeypatch):
@@ -679,6 +729,32 @@ def test_docker_crash_serve_exits(tmp_path, capsys, monkeypatch):
     result = json.loads((out / "result.json").read_text(encoding="utf-8"))
     assert result["status"] == "crash"
     assert "rc=1" in result["reason"]                            # stub serve exit 1
+    sout = capsys.readouterr().out
+    assert "status: crash" in sout
+
+
+def test_docker_serve_oom_crash_classified(tmp_path, capsys, monkeypatch):
+    # F10：serve 崩溃日志含 OOM 特征 → 原因改为可执行口径 + 崩溃当时重新共租检测的 pid
+    port = 18110
+    _write_docker_inputs(tmp_path, port, startup=10, trial=30, repeats=1)
+    out = tmp_path / "out"
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+    monkeypatch.setenv("FAKE_DOCKER_CRASH_OOM", "1")
+    monkeypatch.setattr(bench, "_detect_co_tenants",
+                        lambda: [{"pid": 1234, "process_name": "torchrun",
+                                  "used_memory_mib": 512}])
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file))
+    assert rc != 0
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["status"] == "crash"
+    assert "serve OOM" in result["reason"]                       # OOM 分类替换泛化「rc=1」
+    assert "1234(torchrun)" in result["reason"]                  # foreign pid + process_name
+    assert "rc=1" not in result["reason"]                        # 命中 OOM → 不再保留泛化原因
+    assert result["contention"]["foreign_gpu_apps"][0]["pid"] == 1234
+    status = json.loads((out / "status.json").read_text(encoding="utf-8"))
+    assert "serve OOM" in status["message"]
     sout = capsys.readouterr().out
     assert "status: crash" in sout
 
