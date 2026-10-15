@@ -36,7 +36,7 @@ OK_RESULT = {
 
 class TestBuildRow:
     def test_ok_row_full_identity(self):
-        # ok 行：全部列按 HEADER 顺序、身份/上下文/数值齐全
+        # ok 行：全部列按 HEADER 顺序、身份/上下文/数值齐全；warmup_repeats 缺省 → 0（协议列）
         row = record.build_row(OK_RESULT, commit="abc1234", desc="基线",
                                status="keep", slo=OK_RESULT["slo"],
                                wl_hash=record.workload_hash(OK_RESULT))
@@ -44,9 +44,17 @@ class TestBuildRow:
         assert row == [
             "abc1234", "20261015T103000-abc123", "feedfacebeef",
             record.workload_hash(OK_RESULT), "ttft500/tpot50",
-            "2", "0", "12.84", "0.42", "12345.6", "620.1", "18.3", "71.2", "912.4",
+            "2", "0", "0", "12.84", "0.42", "12345.6", "620.1", "18.3", "71.2", "912.4",
             "keep", "基线",
         ]
+
+    def test_ok_row_warmup_repeats_present(self):
+        # M2a：ok 行带 warmup_repeats → 协议列如实写入
+        with_wu = dict(OK_RESULT, warmup_repeats=1)
+        row = record.build_row(with_wu, commit="c", desc="", status="keep",
+                               slo=OK_RESULT["slo"], wl_hash="w")
+        assert row[6] == "1"
+        assert row[5] == "2"                      # repeats 在其前
 
     def test_crash_row_blank_metrics(self):
         # crash 行：数值列留空，身份/上下文列保留
@@ -56,21 +64,21 @@ class TestBuildRow:
         row = record.build_row(crash, commit="deadbeef", desc="OOM", status="crash",
                                slo=crash["slo"], wl_hash=record.workload_hash(crash))
         assert len(row) == len(HEADER)
-        # 数值列全空；goodput 列（index 7）与 repeats（index 5）为空
-        for i in (5, 7, 8, 9, 10, 11, 12, 13):
+        # 数值列全空：repeats(5)/warmup(6)/goodput(8)/goodput_std(9)/…/dur(14)
+        for i in (5, 6, 8, 9, 10, 11, 12, 13, 14):
             assert row[i] == ""
         assert row[1] == "T-crash" and row[2] == "h1"          # 身份列保留
         assert row[4] == "ttft500/tpot50"                      # slo 列保留
-        assert row[15] == "OOM"
+        assert row[16] == "OOM"
 
     def test_contention_flag(self):
         with_cont = dict(OK_RESULT, contention={"foreign_gpu_apps": []})
         row = record.build_row(with_cont, commit="c", desc="", status="keep",
                                slo=OK_RESULT["slo"], wl_hash="w")
-        assert row[6] == "1"
+        assert row[7] == "1"
         row2 = record.build_row(OK_RESULT, commit="c", desc="", status="keep",
                                 slo=OK_RESULT["slo"], wl_hash="w")
-        assert row2[6] == "0"
+        assert row2[7] == "0"
 
 
 class TestWorkloadHash:
@@ -81,6 +89,12 @@ class TestWorkloadHash:
 
     def test_missing_workload_empty(self):
         assert record.workload_hash({"status": "crash"}) == ""
+
+    def test_seed_changes_hash(self):
+        # M2c：seed 属 workload 身份——seed 变化 → workload_hash 变化
+        wl0 = {**OK_RESULT["workload"], "seed": 0}
+        wl1 = {**OK_RESULT["workload"], "seed": 1}
+        assert record.workload_hash({"workload": wl0}) != record.workload_hash({"workload": wl1})
 
 
 class TestFormatSlo:

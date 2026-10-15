@@ -31,12 +31,41 @@ class TestDecide:
         assert ml.decide(10.0, None, noise_band_pct=3.0) == "keep"
 
     def test_sigma_decides_when_larger_than_percent_band(self):
-        # 提升 +4%（> 3% 百分比带）但 σ 大：k×σ = 2×0.25 = 0.5（abs）> best×4% = 0.4 → σ 主导
-        assert ml.decide(10.4, 10.0, sigma=0.25, noise_band_pct=3.0) == "discard"
-        # 同 σ 下超过 k×σ（Δ=0.6 > 0.5）才 keep
-        assert ml.decide(10.6, 10.0, sigma=0.25, noise_band_pct=3.0) == "keep"
-        # 百分比带主导时（σ=0 → 纯百分比）行为不变
-        assert ml.decide(10.4, 10.0, sigma=0.0, noise_band_pct=3.0) == "keep"
+        # n=3 时 σ 项 = k×sqrt(σ²/3)：σ=0.25 → 2×0.1443=0.2887 < 百分比带 0.3 → 百分比主导
+        assert ml.decide(10.4, 10.0, sigma=0.25, n_cand=3, noise_band_pct=3.0) == "keep"
+        # σ=0.5 → 2×0.2887=0.5774 > 0.3 → σ 主导：Δ=0.4 不够、Δ=0.7 才够
+        assert ml.decide(10.4, 10.0, sigma=0.5, n_cand=3, noise_band_pct=3.0) == "discard"
+        assert ml.decide(10.7, 10.0, sigma=0.5, n_cand=3, noise_band_pct=3.0) == "keep"
+        # n<2 → σ 项贡献 0 → 纯百分比带（退化不变）
+        assert ml.decide(10.4, 10.0, sigma=0.5, n_cand=1, noise_band_pct=3.0) == "keep"
+
+    def test_combined_se_uses_both_uncertainties(self):
+        # 合并标准误：k×sqrt(σ_cand²/n_cand + σ_best²/n_best)。
+        # σ=0.25(n=3) 双侧 → sqrt(0.0625/3+0.0625/3)=0.2041，k×=0.4082：Δ=0.4 不够、Δ=0.5 才够
+        assert ml.decide(10.4, 10.0, sigma=0.25, best_sigma=0.25, n_cand=3, n_best=3,
+                         noise_band_pct=3.0) == "discard"
+        assert ml.decide(10.5, 10.0, sigma=0.25, best_sigma=0.25, n_cand=3, n_best=3,
+                         noise_band_pct=3.0) == "keep"
+        # 同 σ 更大 n → SE 更小 → keep；更小 n → SE 更大 → discard
+        assert ml.decide(10.4, 10.0, sigma=0.5, n_cand=8, noise_band_pct=3.0) == "keep"
+        assert ml.decide(10.4, 10.0, sigma=0.5, n_cand=3, noise_band_pct=3.0) == "discard"
+        # best_sigma=0 → 退化为单侧 SE（不回归）
+        assert ml.decide(10.5, 10.0, sigma=0.25, n_cand=3, noise_band_pct=3.0) == "keep"
+        # 双侧 σ=0 → 纯百分比带
+        assert ml.decide(10.4, 10.0, sigma=0.0, n_cand=3, best_sigma=0.0, n_best=3,
+                         noise_band_pct=3.0) == "keep"
+
+    def test_loop_state_tracks_best_sigma_and_n(self):
+        # keep 后 best_sigma / best_n 记录该行 σ 与 repeats，并传入后续 decide
+        st = ml.LoopState(plateau_trials=8, crash_streak=3)
+        st.step(10.0, True, sigma=0.5, n=3, commit="a")       # keep（基线）→ best_sigma=0.5, best_n=3
+        assert st.best_sigma == 0.5 and st.best_n == 3
+        # 候选 σ=0.5(n=3) vs best σ=0.5(n=3)：k×sqrt(0.25/3+0.25/3)=0.8165 → Δ=0.4 不够
+        assert st.step(10.4, True, sigma=0.5, n=3, commit="b") == "discard"
+        assert st.best_sigma == 0.5                            # discard 不改 best
+        # 超过合并 SE → keep，并更新 best_n
+        assert st.step(10.9, True, sigma=0.5, n=3, commit="c") == "keep"
+        assert st.best_sigma == 0.5 and st.best_n == 3
 
 
 class TestLoopState:

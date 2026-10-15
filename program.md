@@ -13,7 +13,7 @@ Phase 0 输入齐全且 Phase 1.5 无阻断项后进入禁问窗口：自主执�
 ## 指标定义
 
 - **goodput** = 满足 SLO 的成功请求吞吐，来自 `vllm bench serve --goodput ttft:<slo.ttft_p99_ms> tpot:<slo.tpot_p99_ms>` 输出的 `request_goodput`（单位 **req/s**，只统计同时满足全部 SLO 的成功请求）。工具细节见 `docs/vllm-facts.md`。
-- **σ（goodput_std）** = 本次 trial `bench.repeats`（默认 3）次测量的**样本标准差**（`statistics.stdev`；n<2 时退化为 0.0），由 `bench.py` 写入 `result.json` 的 `stats.goodput_std` 与 `results.tsv` 的 `goodput_std` 列。显著性口径：keep 阈值 = `max(best × noise_band_pct/100, noise_k_sigma × σ)`（统一单位 req/s，见「决策规则」）。
+- **σ（goodput_std）** = 本次 trial `bench.repeats`（默认 3）次测量的**样本标准差**（`statistics.stdev`；n<2 时退化为 0.0），由 `bench.py` 写入 `result.json` 的 `stats.goodput_std` 与 `results.tsv` 的 `goodput_std` 列。显著性口径（keep 阈值）：`max(best × noise_band_pct/100, noise_k_sigma × sqrt(σ_cand²/n_cand + σ_best²/n_best))`——`σ_cand` / `σ_best` 为候选行 / 当前 best 行的 `goodput_std`，`n_cand` / `n_best` 为对应行的 `repeats`（min 1，缺失 → 1；n<2 → 该侧 σ 项贡献 0，退化不变），统一单位 req/s，见「决策规则」。
 - **非独占主机（共租）**：`bench.py` 在起 serve 前检测 `nvidia-smi --query-compute-apps`；检测到其他 GPU 进程 → `result.json` 记录 `contention`（含 pid 列表）并在 status 告警；`bench.require_idle=true` 时直接判 crash（主机非空闲）。共租会污染吞吐/时延测量，建议尽量独占主机；无 nvidia-smi 的主机（如开发机 Mac）自动跳过检测。
 - SLO 取值：`config.yaml` 的 `slo`（运行期校准的有效 SLO）> `target.yaml` 的 `metrics.slo`（参考）> `harness.yaml` 的 `slo`（占位）；逐键覆盖。
 - workload 与参考并发点固定：`target.yaml` 的 `workload`（**逐键覆盖**：target 未填的键回退 `harness.yaml` 默认）；缺省整块用 `harness.yaml` 的 `workload` 与 `bench.ref_concurrency`。
@@ -36,9 +36,10 @@ Phase 0 输入齐全且 Phase 1.5 无阻断项后进入禁问窗口：自主执�
 
 本节 SLO 均指有效 SLO（见「SLO 可行性与自主放宽」）。
 
-- **keep**：`(cand − best) > max(best × noise_band_pct/100, noise_k_sigma × σ)`——`best` = 当前最佳 goodput（req/s）、`σ` = 本次 trial 的 `goodput_std`（req/s）、`noise_band_pct` 为百分比（如 3.0 → 3%，乘 `best` 得绝对 req/s），两侧同为单位 req/s——且 SLO 达标 → 更新当前最佳。σ 不可用（n<2）时退化为仅 `best × noise_band_pct/100`。
+- **keep**：`(cand − best) > max(best × noise_band_pct/100, noise_k_sigma × sqrt(σ_cand²/n_cand + σ_best²/n_best))`——`best` = 当前最佳 goodput（req/s）、`σ_cand` / `σ_best` = 候选行 / 当前 best 行的 `goodput_std`（req/s，缺失 → 0）、`n_cand` / `n_best` = 对应行的 `repeats`（min 1，缺失 → 1；n<2 → 该侧 σ 项贡献 0），`noise_band_pct` 为百分比（如 3.0 → 3%，乘 `best` 得绝对 req/s），两侧同为单位 req/s——且 SLO 达标 → 更新当前最佳。σ 不可用（n<2）时退化为仅 `best × noise_band_pct/100`。
 - **discard**：提升 ≤ 噪声阈值（含变差）→ 回退该配置。
 - **crash**：启动失败 / OOM / 超时（`startup_timeout_s` / `trial_timeout_s`）→ 记录 crash，按崩溃处理（见「崩溃处理」）。
+- **测量协议（agent 可调）**：`config.bench` 可逐键覆盖 `harness.yaml` 的 `bench`（合并：repeats / warmup_repeats / startup_timeout_s / trial_timeout_s / seed / require_idle / gmu_detect / ref_concurrency）。高方差配置或 confirm 回归建议提高 repeats（探索 2–3，confirm 5–8）；`warmup_repeats` 消除首轮冷启动污染（0 = 关闭）；超时与 require_idle 类失败为清晰 crash。改变 repeats / warmup_repeats 即改变测量协议，跨协议行严格不可比——账本（result.json 与 results.tsv 的 repeats / warmup_repeats 列）记录协议，report 会标注协议不一致。
 
 ## git 约定
 

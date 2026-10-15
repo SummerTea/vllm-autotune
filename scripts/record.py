@@ -117,6 +117,7 @@ def build_row(result: dict, *, commit: str, desc: str, status: str, slo: dict | 
         wl_hash,
         format_slo(slo),
         metric(result.get("repeats")),
+        (str(result.get("warmup_repeats") or 0) if ok else ""),   # 协议列：ok 行缺省 0（= 旧口径）
         "1" if "contention" in result else "0",
         metric(result.get("goodput_req_s")),
         metric((result.get("stats") or {}).get("goodput_std")),

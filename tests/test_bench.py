@@ -215,15 +215,16 @@ options:
         assert bench.resolve_slo({}, {}, {}) == {}
 
     def test_resolved_workload(self):
-        # 实际生效 workload = DEFAULT_WORKLOAD ⊕ harness/target + 解析后的 ref_concurrency
+        # 实际生效 workload = DEFAULT_WORKLOAD ⊕ harness/target + 解析后的 ref_concurrency 与 seed
         wl = {"dataset": "random", "isl": 2048, "osl": 256, "num_prompts": 500}
         assert bench._resolved_workload(wl, 128) == {
             "dataset": "random", "isl": 2048, "osl": 256, "num_prompts": 500,
-            "ref_concurrency": 128, "prefix_hit_pct": 0}
-        # 缺省键回 DEFAULT_WORKLOAD
+            "ref_concurrency": 128, "prefix_hit_pct": 0, "seed": 0}
+        # 缺省键回 DEFAULT_WORKLOAD；seed 传入生效（属 workload 身份）
         assert bench._resolved_workload({}, 64) == {
             "dataset": "random", "isl": 1024, "osl": 128, "num_prompts": 1000,
-            "ref_concurrency": 64, "prefix_hit_pct": 0}
+            "ref_concurrency": 64, "prefix_hit_pct": 0, "seed": 0}
+        assert bench._resolved_workload({}, 64, seed=7)["seed"] == 7
 
     def test_serve_crash_is_oom_signatures(self):
         # F10：OOM 特征识别（大小写/换行宽容）——Free memory + less than desired / CUDA OOM / torch OOM
@@ -705,6 +706,7 @@ def _write_docker_inputs(tmp_path: Path, port: int, *, startup: int = 30, trial:
                          repeats: int = 2, image: str = "vllm/vllm-openai:v0.31.0") -> None:
     harness = {
         "bench": {"tool": "vllm bench serve", "repeats": repeats,
+                  "warmup_repeats": 0,   # 生命周期测试保持旧口径（默认 1；warmup 专项测试单独开启）
                   "startup_timeout_s": startup, "trial_timeout_s": trial,
                   "ref_concurrency": 128},
         "slo": {"ttft_p99_ms": 500, "tpot_p99_ms": 50},
@@ -767,10 +769,10 @@ def test_docker_lifecycle_with_stub_docker(tmp_path, capsys, monkeypatch):
     result = json.loads((out / "result.json").read_text(encoding="utf-8"))
     assert result["stats"]["goodput_std"] == pytest.approx(
         round(statistics.stdev([12.34, 13.34]), 4))
-    # workload：本次 bench 实际生效值（DEFAULT_WORKLOAD ⊕ harness/target + ref_conc）
+    # workload：本次 bench 实际生效值（DEFAULT_WORKLOAD ⊕ harness/target + ref_conc + seed）
     assert result["workload"] == {"dataset": "random", "isl": 2048, "osl": 256,
                                   "num_prompts": 1000, "ref_concurrency": 128,
-                                  "prefix_hit_pct": 0}
+                                  "prefix_hit_pct": 0, "seed": 0}
     # stub 双 -v（结果目录 + 模型挂载）区分正确后：--save-result JSON 落到 bench_results
     # （此前会误落到模型目录 → find_newest_json 落空 → stdout 回退）
     assert list((out / "bench_results").glob("result-*.json"))
@@ -976,3 +978,191 @@ def test_early_failure_writes_identity_placeholder(tmp_path, monkeypatch):
     assert result["config_hash"] == bench.config_fingerprint(
         json.loads((tmp_path / "config.yaml").read_text(encoding="utf-8")))
     assert "未完成" in result["reason"]
+
+
+# ── 预热轮（warmup_repeats）：丢弃输出 + 边界冷缓存重置 + config.bench 覆盖 ──
+
+def _with_bench_config(tmp_path: Path, patch: dict) -> None:
+    """在 config.yaml 上叠加 bench 覆盖（Delta 2：config.bench 逐键覆盖 harness.bench）。"""
+    cfg = json.loads((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    (tmp_path / "config.yaml").write_text(json.dumps({**cfg, "bench": patch}), encoding="utf-8")
+
+
+def test_warmup_repeats_executed_but_excluded(tmp_path, capsys, monkeypatch):
+    # stub 的 goodput = 12.34 + n×1.0（n = .count 调用序号）：
+    # 预热 1 次消耗 n=0（12.34 被丢弃）；实测 n=1→13.34、n=2→14.34 → 中位 13.84。
+    # 若预热未被排除，[12.34, 13.34, 14.34] 中位 = 13.34 → 断言可区分。
+    port = 18124
+    _write_docker_inputs(tmp_path, port, repeats=2)
+    _with_bench_config(tmp_path, {"warmup_repeats": 1})
+    out = tmp_path / "out"
+    out.mkdir()
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file))
+    assert rc == 0
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["warmup_repeats"] == 1 and result["repeats"] == 2
+    assert result["goodput_req_s"] == pytest.approx(13.84)     # 预热行未进中位
+    assert result["stats"]["goodput_std"] == pytest.approx(    # 预热行未进 σ
+        round(statistics.stdev([13.34, 14.34]), 4))
+
+
+def test_config_bench_overrides_and_reset_once_between_warmup_and_measured(
+        tmp_path, capsys, monkeypatch):
+    # config.bench.repeats 覆盖 harness.repeats；前缀缓存重置：
+    # warmup→measured 边界恰 1 次 + 每次 i>=1 各 1 次 = 1 + (repeats−1)
+    port = 18125
+    _write_docker_inputs(tmp_path, port, repeats=2)            # harness repeats=2
+    _with_bench_config(tmp_path, {"repeats": 4, "warmup_repeats": 1})
+    calls: list[int] = []
+    monkeypatch.setattr(bench, "_reset_prefix_cache",
+                        lambda port, log_fh: calls.append(port))
+    out = tmp_path / "out"
+    out.mkdir()
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file))
+    assert rc == 0
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["repeats"] == 4                              # config 覆盖生效
+    assert result["warmup_repeats"] == 1
+    assert len(calls) == 4                                     # 1 边界 + 3 次 i>=1
+
+
+def test_warmup_repeats_zero_preserves_old_behavior(tmp_path, capsys, monkeypatch):
+    # warmup_repeats=0：无预热、无边界重置（起服即冷）；重置仅 i>=1 前一次；
+    # .count 不被预热消耗 → 中位 = median(12.34, 13.34) = 12.84（旧口径）
+    port = 18126
+    _write_docker_inputs(tmp_path, port, repeats=2)            # fixture 默认 warmup_repeats=0
+    calls: list[int] = []
+    monkeypatch.setattr(bench, "_reset_prefix_cache",
+                        lambda port, log_fh: calls.append(port))
+    out = tmp_path / "out"
+    out.mkdir()
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file))
+    assert rc == 0
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["warmup_repeats"] == 0
+    assert result["goodput_req_s"] == pytest.approx(12.84)
+    assert len(calls) == 1                                     # 仅 i=1 前一次重置
+
+
+# ── M1：前缀缓存重置失败语义 + m1/m2 minor（预热 JSON 清理 / 预热无输出 crash）──
+
+def _with_target_workload(tmp_path: Path, patch: dict) -> None:
+    """在 target.yaml 的 model 基础上叠加 workload 覆盖（prefix_hit_pct 走这里）。"""
+    tgt = json.loads((tmp_path / "target.yaml").read_text(encoding="utf-8"))
+    (tmp_path / "target.yaml").write_text(json.dumps({**tgt, "workload": patch}), encoding="utf-8")
+
+
+def test_boundary_reset_failure_crashes_with_prefix(tmp_path, capsys, monkeypatch):
+    # M1：warmup→measured 边界重置失败且 prefix_hit_pct>0 → 直接 crash（无法保证冷缓存口径）
+    port = 18127
+    _write_docker_inputs(tmp_path, port, repeats=1)
+    _with_bench_config(tmp_path, {"warmup_repeats": 1})
+    _with_target_workload(tmp_path, {"prefix_hit_pct": 60})
+    monkeypatch.setattr(bench, "_reset_prefix_cache", lambda port, log_fh: False)
+    out = tmp_path / "out"
+    out.mkdir()
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file))
+    assert rc != 0
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["status"] == "crash"
+    assert "重置前缀缓存失败" in result["reason"]
+
+
+def test_boundary_reset_failure_tolerated_without_prefix(tmp_path, capsys, monkeypatch):
+    # M1：prefix_hit_pct=0 时边界重置失败 → 容忍（缓存无关），结果如实标记 prefix_cache_reset_ok=false
+    port = 18128
+    _write_docker_inputs(tmp_path, port, repeats=1)
+    _with_bench_config(tmp_path, {"warmup_repeats": 1})
+    monkeypatch.setattr(bench, "_reset_prefix_cache", lambda port, log_fh: False)
+    out = tmp_path / "out"
+    out.mkdir()
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file))
+    assert rc == 0
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["status"] == "ok"
+    assert result["prefix_cache_reset_ok"] is False
+
+
+def test_prefix_cache_reset_ok_true_when_all_succeed(tmp_path, capsys, monkeypatch):
+    # M1：全部重置成功 → prefix_cache_reset_ok=true
+    port = 18129
+    _write_docker_inputs(tmp_path, port, repeats=2)
+    _with_bench_config(tmp_path, {"warmup_repeats": 1})
+    calls: list[int] = []
+    monkeypatch.setattr(bench, "_reset_prefix_cache",
+                        lambda port, log_fh: (calls.append(port), True)[1])
+    out = tmp_path / "out"
+    out.mkdir()
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file))
+    assert rc == 0
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["prefix_cache_reset_ok"] is True
+    assert len(calls) == 2                                     # 边界 1 + i=1 前 1
+
+
+def test_warmup_json_cleared_before_measured(tmp_path, capsys, monkeypatch):
+    # m1：实测前二次清空——预热写的 JSON 不得被 find_newest_json 误取
+    port = 18130
+    _write_docker_inputs(tmp_path, port, repeats=1)
+    _with_bench_config(tmp_path, {"warmup_repeats": 1})
+    seen: list[int] = []
+
+    def fake_bench(bench_tokens, timeout, log_fh, result_dir):
+        # 第 1 次调用（预热）时目录应已被首轮清空（0 个 JSON）；随后写一个预热 JSON；
+        # 第 2 次调用（实测）时该预热 JSON 应已被二次清空（仍 0 个 JSON）
+        seen.append(len([f for f in os.listdir(result_dir) if f.endswith(".json")]))
+        if len(seen) == 1:
+            with open(os.path.join(result_dir, "warmup-seed.json"), "w", encoding="utf-8") as f:
+                json.dump({"request_goodput": 99.0}, f)
+        return {"goodput": 12.0, "output_tok_s": 1.0, "ttft_p99_ms": 1.0, "tpot_p99_ms": 1.0}
+
+    monkeypatch.setattr(bench, "_run_bench_once", fake_bench)
+    monkeypatch.setattr(bench, "_reset_prefix_cache", lambda port, log_fh: True)
+    out = tmp_path / "out"
+    out.mkdir()
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file))
+    assert rc == 0
+    assert seen == [0, 0]                                      # 预热 JSON 在实测前被清掉
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["goodput_req_s"] == pytest.approx(12.0)      # 取的是实测返回值
+
+
+def test_warmup_no_goodput_crashes(tmp_path, capsys, monkeypatch):
+    # m2：预热 bench 无有效输出 → 与实测同判 crash（不静默丢弃）
+    port = 18131
+    _write_docker_inputs(tmp_path, port, repeats=1)
+    _with_bench_config(tmp_path, {"warmup_repeats": 1})
+    monkeypatch.setattr(bench, "_run_bench_once",
+                        lambda *a, **k: {"goodput": None, "output_tok_s": None,
+                                         "ttft_p99_ms": None, "tpot_p99_ms": None})
+    out = tmp_path / "out"
+    out.mkdir()
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file))
+    assert rc != 0
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["status"] == "crash"
+    assert "预热 bench 无有效输出" in result["reason"]

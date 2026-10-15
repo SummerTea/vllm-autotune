@@ -5,8 +5,12 @@
 bench:
   tool: vllm bench serve        # 真实的度量命令（非可执行别名）
   repeats: 3                    # 每个配置重复次数：取中位数抗噪（n≥2 可算样本标准差 σ，n≥3 更稳）
-  noise_band_pct: 3.0           # keep 的百分比噪声带：best×pct/100（绝对 req/s）；与 k×σ 取较大者
-  noise_k_sigma: 2.0            # 显著性倍数 k：keep 阈值 = max(best×noise_band_pct/100, k×σ)（单位 req/s）
+  warmup_repeats: 1             # 丢弃的预热轮数：暖核/CUDA 图/前缀缓存，消除首轮冷启动污染；
+                                # 预热后重置一次前缀缓存再进入实测序列；0 = 关闭（行为回退旧口径）
+  noise_band_pct: 3.0           # keep 的百分比噪声带：best×pct/100（绝对 req/s）；与 k×SE 取较大者
+  noise_k_sigma: 2.0            # 显著性倍数 k。keep 阈值 = max(best×noise_band_pct/100,
+                                #   k × sqrt(σ_cand²/n_cand + σ_best²/n_best))（单位 req/s）；
+                                #   σ 为候选/best 行 goodput_std，n 为对应行 repeats（min 1；n<2 → σ 项为 0）
   require_idle: false           # true → 检测到共租 GPU 进程即判 crash（要求独占）；false → 仅记录+告警
   startup_timeout_s: 1200       # 服务器启动就绪超时（大模型加载可能很慢）
   trial_timeout_s: 2400         # 单次实验硬超时
@@ -32,7 +36,8 @@ workload:                       # 合成 workload 默认；可被 target.yaml �
                                #   让 enable-prefix-caching 成为可测维度（random 默认无共享前缀）
 
 exit:                           # 退出机制（主退出 max_hours/stop_at 来自 target.yaml budget；另有平台期/崩溃连击/SLO 不可达）
-  plateau_trials: 8             # 连续 N 次未达 keep 阈值（max(best×noise_band_pct/100, noise_k_sigma×σ)）→ 平台期退出
+  plateau_trials: 8             # 连续 N 次未达 keep 阈值（max(best×noise_band_pct/100,
+                                #   k × sqrt(σ_cand²/n_cand + σ_best²/n_best))）→ 平台期退出
   crash_streak: 3               # 连续 N 次 crash → 停下并报告
 
 remote:

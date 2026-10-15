@@ -167,6 +167,16 @@ def find_newest_json(d: str) -> str | None:
     return max(cands, key=os.path.getmtime) if cands else None
 
 
+def _clear_result_json(result_dir: str) -> None:
+    """清空 result-dir 直接目录下的所有 *.json（best-effort；不删 .count 与子目录）。"""
+    try:
+        for f in os.listdir(result_dir):
+            if f.endswith(".json"):
+                os.remove(os.path.join(result_dir, f))
+    except OSError:
+        pass
+
+
 def parse_compute_apps(text: str | None) -> list[dict]:
     """nvidia-smi --query-compute-apps=pid,process_name,used_memory →
     [{"pid":int, "process_name":str|None, "used_memory_mib":int|None}]。
@@ -209,12 +219,13 @@ def resolve_slo(harness: dict, target: dict, config: dict) -> dict:
             **(config.get("slo") or {})}
 
 
-def _resolved_workload(workload: dict, ref_conc: int) -> dict:
+def _resolved_workload(workload: dict, ref_conc: int, seed: int = DEFAULT_SEED) -> dict:
     """本次 bench 实际生效的 workload（DEFAULT_WORKLOAD ⊕ harness/target + 解析后的
-    ref_concurrency），写入 result.json 供逐行比较（跨 workload 的行不可混比）。"""
-    eff = {**DEFAULT_WORKLOAD, **workload, "ref_concurrency": ref_conc}
+    ref_concurrency 与 seed），写入 result.json 供逐行比较（跨 workload 的行不可混比）。
+    seed 改变即 prompt 语料改变，属 workload 身份一部分（workload_hash 应覆盖它）。"""
+    eff = {**DEFAULT_WORKLOAD, **workload, "ref_concurrency": ref_conc, "seed": seed}
     return {k: eff.get(k) for k in
-            ("dataset", "isl", "osl", "num_prompts", "ref_concurrency", "prefix_hit_pct")}
+            ("dataset", "isl", "osl", "num_prompts", "ref_concurrency", "prefix_hit_pct", "seed")}
 
 
 def container_model_path(runtime: dict) -> str:
@@ -708,9 +719,10 @@ def _health_code(port: int, timeout: float = 2.0) -> int | None:
         return None
 
 
-def _reset_prefix_cache(port: int, log_fh) -> None:
+def _reset_prefix_cache(port: int, log_fh) -> bool:
     """尽力 POST /reset_prefix_cache（repeats≥2 前清缓存，保证每次测量是冷缓存独立）。
-    非 200 / 异常一律容忍：只写 run.log，绝不因重置失败中止 trial。"""
+    返回 True=200（重置成功）；非 200 / 异常 → 只写 run.log 并返回 False（不抛异常——
+    是否致命由调用方按 workload.prefix_hit_pct 决定：>0 时必须保证冷缓存，0 时容忍）。"""
     try:
         req = urllib.request.Request(f"http://127.0.0.1:{port}/reset_prefix_cache", method="POST")
         with urllib.request.urlopen(req, timeout=5) as r:
@@ -718,10 +730,12 @@ def _reset_prefix_cache(port: int, log_fh) -> None:
     except (urllib.error.URLError, OSError, ValueError) as e:
         log_fh.write(f"=== bench.py {_now_iso()} reset_prefix_cache 失败（容忍）: {e}\n".encode())
         log_fh.flush()
-        return
+        return False
     if status != 200:
         log_fh.write(f"=== bench.py {_now_iso()} reset_prefix_cache 返回 {status}（容忍，非 200）\n".encode())
         log_fh.flush()
+        return False
+    return True
 
 
 def _scan_kv(log_path: str) -> int | None:
@@ -955,7 +969,9 @@ def main(argv: list[str] | None = None) -> int:
         _err("需要 docker 镜像：在 config.yaml 或 harness.yaml 的 runtime.image 指定"
              "（如 vllm/vllm-openai:v0.31.0）")
 
-    bench_cfg = harness.get("bench") or {}
+    # bench 参数：harness.bench ⊕ config.bench（config 逐键覆盖——agent 经 config.yaml 可调
+    # repeats/warmup_repeats 等测量协议项）
+    bench_cfg = {**(harness.get("bench") or {}), **((config.get("bench") or {}))}
     remote = harness.get("remote") or {}
     port = int(remote.get("vllm_port", 8000))
 
@@ -970,6 +986,7 @@ def main(argv: list[str] | None = None) -> int:
         _err("config.yaml 与 target.yaml 都未提供模型 id。")
     assert model is not None  # _err 已 exit
     repeats = int(bench_cfg.get("repeats", 3))
+    warmup_repeats = int(bench_cfg.get("warmup_repeats", 1))   # 丢弃的预热轮数（消除首轮冷启动污染）
     startup_timeout_s = float(bench_cfg.get("startup_timeout_s", 1200))
     trial_timeout_s = float(bench_cfg.get("trial_timeout_s", 2400))
     seed = int(bench_cfg.get("seed", DEFAULT_SEED))
@@ -979,6 +996,8 @@ def main(argv: list[str] | None = None) -> int:
     workload = {**harness.get("workload", {}), **(target.get("workload") or {})}
     slo = resolve_slo(harness, target, config)
     ref_conc = int(workload.get("ref_concurrency") or bench_cfg.get("ref_concurrency", DEFAULT_REF_CONCURRENCY))
+    # 共享前缀口径：prefix_hit_pct>0 时前缀缓存是测量维度——重置失败必须 crash（保冷缓存）
+    prefix_pct = int(workload.get("prefix_hit_pct", 0) or 0)
 
     os.makedirs(out_dir, exist_ok=True)
     started_at = _now_iso()
@@ -1070,24 +1089,44 @@ def main(argv: list[str] | None = None) -> int:
             # 不删 .count 状态文件与子目录），防止 find_newest_json 误取陈旧结果
             bench_result_dir = os.path.join(out_dir, "bench_results")
             os.makedirs(bench_result_dir, exist_ok=True)
-            try:
-                for f in os.listdir(bench_result_dir):
-                    if f.endswith(".json"):
-                        os.remove(os.path.join(bench_result_dir, f))
-            except OSError:
-                pass
+            _clear_result_json(bench_result_dir)
             bench_tokens = build_docker_bench_cmd(args.docker_cmd, runtime, model, workload, slo,
                                                   ref_conc, seed, bench_result_dir,
                                                   trust_remote_code, port,
                                                   host_model_path=host_model_path)
+            # 预热：warmup_repeats 次 bench 输出全部丢弃（暖核/图/前缀缓存，消除首轮冷启动
+            # 污染，使首个 MEASURED 样本不受冷启动偏差影响）；同样受 trial 硬超时约束，
+            # 无有效输出与实测同判 crash（不静默丢弃）。
+            for _ in range(warmup_repeats):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TrialCrash("trial_timeout")
+                wp = _run_bench_once(bench_tokens, remaining, log_fh, bench_result_dir)
+                if wp["goodput"] is None:
+                    raise TrialCrash("预热 bench 无有效输出（goodput 缺失）")
+            # 预热后重置一次前缀缓存 → 实测序列应从冷缓存开始：重置失败且 workload 用了共享前缀
+            # （prefix_hit_pct>0）时直接 crash（否则首个实测样本可能是暖缓存，prefix caching 口径
+            # 失真）；prefix_hit_pct=0 时缓存无关，容忍并如实标记 reset_ok=False。
+            reset_ok = True
+            if warmup_repeats > 0:
+                reset_ok = _reset_prefix_cache(port, log_fh)
+                if not reset_ok and prefix_pct > 0:
+                    raise TrialCrash("预热后重置前缀缓存失败：无法保证冷缓存测量（prefix caching 口径失真）")
+            # m1：预热会写 JSON——实测前再清一次，防实测 rc=0 但未写 JSON 时 find_newest_json
+            # 误取预热 JSON（只清 *.json，保留 .count 与子目录）
+            _clear_result_json(bench_result_dir)
             results = []
             for i in range(repeats):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TrialCrash("trial_timeout")
                 if i >= 1:
-                    # D：同实例的后续 repeat 前清前缀缓存 → 每次测量冷缓存独立（首 repeat 起服即冷）
-                    _reset_prefix_cache(port, log_fh)
+                    # D：同实例的后续 repeat 前清前缀缓存 → 每次测量冷缓存独立（首 repeat 起服即冷）。
+                    # 失败容忍规则同边界：prefix_hit_pct>0 时无法保证口径 → crash；=0 时容忍
+                    if not _reset_prefix_cache(port, log_fh):
+                        reset_ok = False
+                        if prefix_pct > 0:
+                            raise TrialCrash("前缀缓存重置失败：无法保证冷缓存独立测量（prefix caching 口径失真）")
                 parsed = _run_bench_once(bench_tokens, remaining, log_fh, bench_result_dir)
                 if parsed["goodput"] is None:
                     raise TrialCrash(f"bench 第 {i + 1} 次无有效输出（goodput 缺失）")
@@ -1123,9 +1162,13 @@ def main(argv: list[str] | None = None) -> int:
             "peak_vram_gb": peak_gb,
             "dur_s": dur_s,
             "repeats": repeats,
+            "warmup_repeats": warmup_repeats,
+            # 协议所需的前缀缓存重置全部成功（warmup_repeats=0 且无 i>=1 重置时为空真 True）；
+            # 仅记入 result.json（不入账本列）
+            "prefix_cache_reset_ok": reset_ok,
             "env_fingerprint": fingerprint,
             "calibration": calibration,
-            "workload": _resolved_workload(workload, ref_conc),
+            "workload": _resolved_workload(workload, ref_conc, seed),
             "slo": slo,
             "started_at": started_at,
             "trial_id": trial_id,

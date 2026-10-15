@@ -35,3 +35,16 @@ serve: {}                       # vLLM serve 参数，kebab-case 作为 CLI flag
 #   kv-cache-dtype: fp8
 #   enable-prefix-caching: true
 #   tensor-parallel-size: 8
+
+# bench:                         # 可选。逐键覆盖 harness.yaml 的 bench 默认（均为实验输入，逐键合并）：
+#   repeats: 3                   #   实测重复次数：取中位数抗噪。高方差配置 / confirm 回归可调高
+#                                #   （探索 2-3，confirm 5-8）以提高显著性；repeats 改变即改测量协议。
+#   warmup_repeats: 1            #   丢弃的预热轮数（消除首轮冷启动污染；0 = 关闭，行为回退旧口径）。
+#                                #   协议（repeats / warmup_repeats）会写入 result.json 并记入账本
+#                                #   （results.tsv 的 repeats / warmup_repeats 列）。
+#   startup_timeout_s: 1200      #   起服就绪超时（秒）；超时 → 清晰 crash。
+#   trial_timeout_s: 2400        #   单次 trial 硬超时（秒）；超时 → 清晰 crash。
+#   seed: 0                      #   bench 随机种子——改变即改变 prompt 语料，属 workload 身份
+#                                #   （workload_hash 覆盖 seed）。
+#   require_idle: false          #   true → 检测到共租 GPU 进程即 crash（要求独占）。
+#                                #   gmu_detect / ref_concurrency 亦可覆盖（见 harness.yaml 注释）。

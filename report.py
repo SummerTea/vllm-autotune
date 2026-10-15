@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import math
 import os
 import re
 import shlex
@@ -30,12 +31,13 @@ except ImportError:  # pragma: no cover
 
 # 结果账本列（单一来源；scripts/record.py 从此导入）。列序固定，但 parse_tsv 按名字对齐：
 # 旧 10 列表与新 16 列表都接受——核心列必须齐全，扩展列可选。
-HEADER = ["commit", "trial_id", "config_hash", "workload_hash", "slo", "repeats", "contention",
+HEADER = ["commit", "trial_id", "config_hash", "workload_hash", "slo", "repeats",
+          "warmup_repeats", "contention",
           "goodput", "goodput_std", "output_tok_s", "ttft_p99_ms", "tpot_p99_ms",
           "peak_vram_gb", "dur_s", "status", "description"]
 # 数值列（coerce 用）：纯诊断列除外——contention 保持字符串/None，不参与数值解析
 NUM_COLS = {"goodput", "goodput_std", "output_tok_s", "ttft_p99_ms", "tpot_p99_ms",
-            "peak_vram_gb", "dur_s", "repeats"}
+            "peak_vram_gb", "dur_s", "repeats", "warmup_repeats"}
 # 任何表头都必须包含的核心列（旧表与扩展表的交集）
 CORE_COLS = ["commit", "goodput", "goodput_std", "output_tok_s", "ttft_p99_ms", "tpot_p99_ms",
              "peak_vram_gb", "dur_s", "status", "description"]
@@ -127,6 +129,21 @@ def _ctx_rows(rows: list[dict], baseline_ctx: tuple | None) -> list[dict]:
     if baseline_ctx is None:
         return rows
     return [r for r in rows if context_key(r) == baseline_ctx]
+
+
+def _protocol_mismatch_line(rows: list[dict], baseline_ctx: tuple | None) -> str | None:
+    """基线上下文内出现多种 (repeats, warmup_repeats) 测量协议时的 ⚠ 文案（单一协议/无基线 → None）。
+    协议 = (repeats, warmup_repeats)；任一缺失（None/空）按 0 归一（= 旧口径 / 未知），
+    渲染值一致用 0。"""
+    if baseline_ctx is None:
+        return None
+    bctx = [r for r in rows if context_key(r) == baseline_ctx]
+    protocols = sorted({(r.get("repeats") or 0, r.get("warmup_repeats") or 0) for r in bctx})
+    if len(protocols) <= 1:
+        return None
+    protos = "、".join(f"(repeats={_fmt(p[0])}, warmup={_fmt(p[1])})" for p in protocols)
+    return (f"- ⚠ 基线上下文内存在多种测量协议 {protos}：不同 (repeats, warmup_repeats) 协议下的行"
+            "严格不可比（账本记录协议；跨协议慎做 keep 判定）。")
 
 
 def pick_best(rows: list[dict], slo: dict | None = None,
@@ -319,12 +336,18 @@ def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict
     lines.append(f"- trial 数：{len(rows)}（keep={counts.get('keep', 0)}，"
                  f"discard={counts.get('discard', 0)}，crash={counts.get('crash', 0)}，"
                  f"best={counts.get('best', 0)}，confirm={counts.get('confirm', 0)}）")
+    # M2b：基线上下文内协议（repeats/warmup_repeats）不一致 → ⚠（挂在可比性节，无节则挂概览）
+    proto_line = _protocol_mismatch_line(rows, baseline_ctx)
+    show_ctx_section = bool(comparability) and (
+        len(comparability) > 1 or (baseline_ctx is None and len(comparability) >= 1))
+    if proto_line is not None and not show_ctx_section:
+        lines.append(proto_line)
     lines.append(f"- 生成时间：{datetime.datetime.now().isoformat(timespec='seconds')}")
     lines.append("")
 
     # F4：legacy 基线（无上下文）+ ≥1 个非空上下文 → 也要出可比性节（否则静默混比）；
     # 基线有上下文时仅在 >1 个不同上下文（含基线外的）才出节。
-    if comparability and (len(comparability) > 1 or (baseline_ctx is None and len(comparability) >= 1)):
+    if show_ctx_section and comparability:
         lines += ["## 可比性", ""]
         lines.append("账本包含多个不同的 `(workload_hash, slo)` 上下文——跨上下文行不可混比：")
         lines.append("")
@@ -339,6 +362,8 @@ def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict
         else:
             lines.append("- 基线为旧表行（无上下文）：best 选择按旧行为覆盖全部行，但各上下文不可混比"
                          "——建议用 scripts/record.py 重建账本。")
+        if proto_line is not None:
+            lines.append(proto_line)   # M2b：基线上下文内协议不一致的 ⚠ 挂在可比性节内
         lines.append("")
 
     lines += ["## 基线 vs 最佳", ""]
@@ -421,9 +446,20 @@ def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict
     latest = confirm_rows[-1] if confirm_rows else None
     if latest is not None and best is not None and best.get("goodput"):
         bg, cg = best["goodput"], latest.get("goodput")
+        # 复用 keep 规则公式（合并双侧不确定度的标准误）：阈值 =
+        # max(best × noise_band_pct/100, k × sqrt(σ_best²/n_best + σ_confirm²/n_confirm))；
+        # n = 该行 repeats（min 1，缺失 → 1）；n<2 → 该侧 σ 项贡献 0（stdev 未定义 → σ=0）
         bs = best.get("goodput_std") or 0.0
-        # 复用 keep 规则公式：阈值 = max(best × noise_band_pct/100, noise_k_sigma × σ)
-        threshold = max(bg * noise_band_pct / 100.0, noise_k_sigma * bs)
+        cs = latest.get("goodput_std") or 0.0
+        bn = max(1, int(best.get("repeats") or 1))
+        cn = max(1, int(latest.get("repeats") or 1))
+
+        def _se_term(sig: float, n: int) -> float:
+            return sig if n >= 2 else 0.0
+
+        threshold = max(bg * noise_band_pct / 100.0,
+                        noise_k_sigma * math.sqrt(_se_term(bs, bn) ** 2 / bn
+                                                  + _se_term(cs, cn) ** 2 / cn))
         delta = abs((cg or 0.0) - bg)
         if delta <= threshold:
             verdict = "确认（噪声带内一致）"
@@ -433,12 +469,15 @@ def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict
             "| 指标 | best | confirm（最新） |",
             "|---|---|---|",
             f"| goodput（req/s） | {_fmt(bg)} | {_fmt(cg)} |",
-            f"| goodput_std（σ） | {_fmt(bs)} | {_fmt(latest.get('goodput_std'))} |",
+            f"| goodput_std（σ） | {_fmt(bs)} | {_fmt(cs)} |",
+            f"| repeats | {_fmt(best.get('repeats'))} | {_fmt(latest.get('repeats'))} |",
             f"| Δ（|confirm−best|） | — | {_fmt(delta)} |",
             "",
         ]
         lines.append(f"- 判定：**{verdict}**（阈值 = max(best × {noise_band_pct}/100, "
-                     f"{noise_k_sigma} × σ) = {_fmt(threshold)} req/s；σ=best 行的 goodput_std）。")
+                     f"{noise_k_sigma} × sqrt(σ_best²/n_best + σ_confirm²/n_confirm)) = "
+                     f"{_fmt(threshold)} req/s；σ 为 best / confirm 行 goodput_std，"
+                     f"n 为各行 repeats）。")
     elif latest is not None:
         lines.append("存在 confirm 行，但无 best（keep/best）行可核对——best 回退选择见「基线 vs 最佳」。")
     else:

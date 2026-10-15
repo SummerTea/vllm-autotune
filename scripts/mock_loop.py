@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 NOISE_BAND_PCT = 3.0   # 内置默认（与 harness.yaml 当前值一致）
@@ -46,10 +47,15 @@ def _load_thresholds():
 NOISE_BAND_PCT, NOISE_K_SIGMA, PLATEAU_TRIALS, CRASH_STREAK = _load_thresholds()
 
 
-def decide(trial_goodput, best_goodput, sigma=0.0, noise_band_pct=NOISE_BAND_PCT,
-           noise_k_sigma=NOISE_K_SIGMA, slo_ok=True):
+def decide(trial_goodput, best_goodput, sigma=0.0, best_sigma=0.0, n_cand=1, n_best=1,
+           noise_band_pct=NOISE_BAND_PCT, noise_k_sigma=NOISE_K_SIGMA, slo_ok=True):
     """决策规则（program.md §决策规则，统一单位 req/s）：
-    keep   ：(trial − best) > max(best × noise_band_pct/100, noise_k_sigma × σ)，且 SLO 达标；
+    keep   ：(trial − best) > max(best × noise_band_pct/100,
+                                  noise_k_sigma × sqrt(σ_cand²/n_cand + σ_best²/n_best))，
+             且 SLO 达标。σ 为该行 goodput_std、n 为该行 repeats（min 1，缺失 → 1）；
+             n<2 → 该侧 σ 项贡献 0（stdev 未定义 → σ=0 退化不变）。
+             注意：省略 n_cand/n_best（默认 1）即把该侧 σ 项归零（与 n<2 同一退化）——
+             传 σ 时务必同时传 n（重复次数），否则 σ 不会生效。
     discard：提升 ≤ 阈值（含变差）或 SLO 不达标；
     crash  ：启动失败 / OOM / 超时（调用方传 trial_goodput=None）。
     首个有效 trial（best 尚为 None）即成为当前最佳。"""
@@ -59,17 +65,26 @@ def decide(trial_goodput, best_goodput, sigma=0.0, noise_band_pct=NOISE_BAND_PCT
         return "discard"
     if best_goodput is None:
         return "keep" if trial_goodput > 0 else "discard"
-    threshold = max(best_goodput * noise_band_pct / 100.0, noise_k_sigma * (sigma or 0.0))
+
+    def _se_term(sig: float, n: int) -> float:
+        return (sig or 0.0) if n >= 2 else 0.0   # n<2：σ 项贡献 0（σ=0 退化）
+
+    nc = max(1, int(n_cand or 1))
+    nb = max(1, int(n_best or 1))
+    se = math.sqrt(_se_term(sigma, nc) ** 2 / nc + _se_term(best_sigma, nb) ** 2 / nb)
+    threshold = max(best_goodput * noise_band_pct / 100.0, noise_k_sigma * se)
     if (trial_goodput - best_goodput) > threshold:
         return "keep"
     return "discard"
 
 
 class LoopState:
-    """小型状态机：plateau_count / crash_count / best_goodput / best_commit。
+    """小型状态机：plateau_count / crash_count / best_goodput / best_sigma / best_n / best_commit。
 
     - crash 行**不计入**平台期序列（plateau_count 不前进；只计入崩溃连击）；
-    - keep 清零崩溃连击并重置平台期；discard 清零崩溃连击、推进平台期。"""
+    - keep 清零崩溃连击并重置平台期；discard 清零崩溃连击、推进平台期。
+    - best_sigma / best_n：成为 best 时记录该行 goodput_std 与 repeats（后续候选 keep 判定
+      用它合成合并标准误）。"""
 
     def __init__(self, plateau_trials=PLATEAU_TRIALS, crash_streak=CRASH_STREAK):
         self.plateau_trials = plateau_trials
@@ -77,18 +92,22 @@ class LoopState:
         self.plateau_count = 0
         self.crash_count = 0
         self.best_goodput = None
+        self.best_sigma = 0.0
+        self.best_n = 1
         self.best_commit = None
 
     def step(self, trial_goodput, slo_ok, noise_band_pct=NOISE_BAND_PCT, sigma=0.0,
-             noise_k_sigma=NOISE_K_SIGMA, commit=None):
-        d = decide(trial_goodput, self.best_goodput, sigma, noise_band_pct,
-                   noise_k_sigma, slo_ok)
+             noise_k_sigma=NOISE_K_SIGMA, commit=None, n=1):
+        d = decide(trial_goodput, self.best_goodput, sigma, self.best_sigma,
+                   n, self.best_n, noise_band_pct, noise_k_sigma, slo_ok)
         if d == "crash":
             self.crash_count += 1            # plateau_count 不前进（program.md §平台期）
         elif d == "keep":
             self.crash_count = 0
             self.plateau_count = 0
             self.best_goodput = trial_goodput
+            self.best_sigma = sigma or 0.0
+            self.best_n = max(1, int(n or 1))
             self.best_commit = commit
         else:  # discard
             self.crash_count = 0

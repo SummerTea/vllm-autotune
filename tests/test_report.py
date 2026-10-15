@@ -56,24 +56,30 @@ class TestParseTsv:
 
 
 NEW_TSV = (
-    "commit\ttrial_id\tconfig_hash\tworkload_hash\tslo\trepeats\tcontention\tgoodput\tgoodput_std\toutput_tok_s\tttft_p99_ms\ttpot_p99_ms\tpeak_vram_gb\tdur_s\tstatus\tdescription\n"
-    "aaaa111\tt1\th1\tw1\tttft500/tpot50\t3\t0\t10.0\t0.2\t9000.0\t420.1\t18.3\t71.2\t912.4\tkeep\t基线（mock）\n"
-    "bbbb222\tt2\th2\tw1\tttft500/tpot50\t3\t0\t10.2\t0.3\t9200.0\t430.2\t19.1\t71.5\t910.0\tdiscard\tmax-num-seqs 256\n"
-    "cccc333\tt3\th3\tw1\tttft500/tpot50\t3\t1\t11.0\t0.5\t9800.0\t450.0\t20.0\t72.0\t905.0\tkeep\tgpu-memory-utilization 0.92\n"
+    "commit\ttrial_id\tconfig_hash\tworkload_hash\tslo\trepeats\twarmup_repeats\tcontention\tgoodput\tgoodput_std\toutput_tok_s\tttft_p99_ms\ttpot_p99_ms\tpeak_vram_gb\tdur_s\tstatus\tdescription\n"
+    "aaaa111\tt1\th1\tw1\tttft500/tpot50\t3\t1\t0\t10.0\t0.2\t9000.0\t420.1\t18.3\t71.2\t912.4\tkeep\t基线（mock）\n"
+    "bbbb222\tt2\th2\tw1\tttft500/tpot50\t3\t1\t0\t10.2\t0.3\t9200.0\t430.2\t19.1\t71.5\t910.0\tdiscard\tmax-num-seqs 256\n"
+    "cccc333\tt3\th3\tw1\tttft500/tpot50\t3\t1\t1\t11.0\t0.5\t9800.0\t450.0\t20.0\t72.0\t905.0\tkeep\tgpu-memory-utilization 0.92\n"
 )
 
 
 class TestParseTsvNewColumns:
-    def test_new_16col_header_parses(self):
+    def test_new_17col_header_parses(self):
         rows = report.parse_tsv(NEW_TSV)
         assert len(rows) == 3
         r0 = rows[0]
         assert r0["trial_id"] == "t1" and r0["config_hash"] == "h1"
         assert r0["workload_hash"] == "w1" and r0["slo"] == "ttft500/tpot50"
         assert r0["repeats"] == 3.0                       # 新列数值 coerce
+        assert r0["warmup_repeats"] == 1.0                # 协议列数值 coerce
         assert r0["contention"] == "0"                    # contention 保持字符串
         assert rows[2]["contention"] == "1"
         assert r0["goodput"] == 10.0                      # 核心列照常
+        # 缺 warmup_repeats 的旧扩展表 → 该列 None（向后兼容）
+        old = report.parse_tsv(
+            "commit\ttrial_id\tconfig_hash\tworkload_hash\tslo\trepeats\tcontention\tgoodput\tgoodput_std\toutput_tok_s\tttft_p99_ms\ttpot_p99_ms\tpeak_vram_gb\tdur_s\tstatus\tdescription\n"
+            "x\tt\th\tw1\tttft500/tpot50\t3\t0\t10.0\t0.2\t9000.0\t420.1\t18.3\t71.2\t912.4\tkeep\t基线\n")
+        assert old[0]["warmup_repeats"] is None
 
     def test_column_order_does_not_matter(self):
         # 名字对齐：核心列齐全但列序打乱也能解析出相同字段（扩展列任意位置）
@@ -432,11 +438,61 @@ class TestConfirm:
                            noise_band_pct=3.0, noise_k_sigma=2.0)
         assert "未做确认 run" in md
 
+    def test_confirm_combined_se(self):
+        # 合并标准误：阈值 = max(11×3%, 2×sqrt(0.5²/3 + 0.5²/3)=0.8165)；Δ=|9.8−11|=1.2。
+        # 旧合并口径（不除 n：2×sqrt(0.5²+0.5²)=1.414）会判「确认」；除 n（标准误）后判「未确认」。
+        tsv = ("commit\ttrial_id\tconfig_hash\tworkload_hash\tslo\trepeats\twarmup_repeats\tcontention"
+               "\tgoodput\tgoodput_std\toutput_tok_s\tttft_p99_ms\ttpot_p99_ms"
+               "\tpeak_vram_gb\tdur_s\tstatus\tdescription\n"
+               "cccc333\tt3\th3\tw1\tttft500/tpot50\t3\t1\t0\t11.0\t0.5\t9800.0\t450.0\t20.0\t72.0\t905.0\tbest\tbest\n"
+               "eeee555\tt5\th5\tw1\tttft500/tpot50\t3\t1\t0\t9.8\t0.5\t9700.0\t455.0\t20.5\t72.0\t900.0\tconfirm\tconfirm best\n")
+        rows = report.parse_tsv(tsv)
+        best, _ = report.pick_best(rows, SLO)
+        assert best is not None and best["commit"] == "cccc333"
+        md = report.render(rows, SLO, None, best, False, None,
+                           noise_band_pct=3.0, noise_k_sigma=2.0)
+        assert "未确认（差异" in md                     # SE 口径下 1.2 > 0.8165
+        assert "sqrt(σ_best²/n_best + σ_confirm²/n_confirm)" in md   # 公式说明带 n
+        assert "0.82" in md                            # 阈值 0.8165（_fmt 去尾零）
+
+    def test_protocol_mismatch_warning(self):
+        # M2b：基线上下文内 (repeats, warmup_repeats) 协议不一致 → ⚠ 行（无可比性节时挂概览）
+        tsv = ("commit\ttrial_id\tconfig_hash\tworkload_hash\tslo\trepeats\twarmup_repeats\tcontention"
+               "\tgoodput\tgoodput_std\toutput_tok_s\tttft_p99_ms\ttpot_p99_ms"
+               "\tpeak_vram_gb\tdur_s\tstatus\tdescription\n"
+               "aaaa111\tt1\th1\tw1\tttft500/tpot50\t3\t0\t0\t10.0\t0.2\t9000.0\t420.1\t18.3\t71.2\t912.4\tkeep\twarmup=0（旧口径）\n"
+               "bbbb222\tt2\th2\tw1\tttft500/tpot50\t3\t1\t0\t10.2\t0.3\t9200.0\t430.2\t19.1\t71.5\t910.0\tkeep\twarmup=1\n")
+        rows = report.parse_tsv(tsv)
+        baseline = report.pick_baseline(rows)
+        ctx = report.context_key(baseline)
+        best, flagged = report.pick_best(rows, SLO, ctx)
+        md = report.render(rows, SLO, baseline, best, flagged,
+                           report.improvement_pct(baseline, best), baseline_ctx=ctx)
+        assert "⚠ 基线上下文内存在多种测量协议" in md
+        assert "(repeats=3, warmup=0)" in md and "(repeats=3, warmup=1)" in md
+
+    def test_protocol_mismatch_tolerates_blank_repeats(self):
+        # R2：repeats 缺失（None）与有值行混在同一基线上下文 → 归一为 0 参与协议判定，不抛异常
+        tsv = ("commit\ttrial_id\tconfig_hash\tworkload_hash\tslo\trepeats\twarmup_repeats\tcontention"
+               "\tgoodput\tgoodput_std\toutput_tok_s\tttft_p99_ms\ttpot_p99_ms"
+               "\tpeak_vram_gb\tdur_s\tstatus\tdescription\n"
+               "aaaa111\tt1\th1\tw1\tttft500/tpot50\t3\t1\t0\t10.0\t0.2\t9000.0\t420.1\t18.3\t71.2\t912.4\tkeep\t基线 repeats=3\n"
+               "bbbb222\tt2\th2\tw1\tttft500/tpot50\t\t0\t0\t10.2\t0.3\t9200.0\t430.2\t19.1\t71.5\t910.0\tkeep\trepeats 缺失\n")
+        rows = report.parse_tsv(tsv)
+        assert rows[1]["repeats"] is None                       # 迁移期空数值 → None
+        baseline = report.pick_baseline(rows)
+        ctx = report.context_key(baseline)
+        best, flagged = report.pick_best(rows, SLO, ctx)
+        md = report.render(rows, SLO, baseline, best, flagged,
+                           report.improvement_pct(baseline, best), baseline_ctx=ctx)
+        assert "⚠ 基线上下文内存在多种测量协议" in md          # (3,1) vs (0,0)
+        assert "(repeats=3, warmup=1)" in md and "(repeats=0, warmup=0)" in md
+
 
 # ── Phase 2：可比性上下文 + 参考/有效 SLO 双口径 ─────────────────────────
 
 MIXED_TSV = NEW_TSV + (
-    "dddd444\tt4\th4\tw2\tttft4000/tpot80\t3\t0\t50.0\t1.0\t50000.0\t300.0\t20.0\t75.0\t900.0\tkeep\t另一上下文（w2/slo2）高 goodput\n"
+    "dddd444\tt4\th4\tw2\tttft4000/tpot80\t3\t1\t0\t50.0\t1.0\t50000.0\t300.0\t20.0\t75.0\t900.0\tkeep\t另一上下文（w2/slo2）高 goodput\n"
 )
 
 
