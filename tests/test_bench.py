@@ -261,10 +261,66 @@ options:
         assert reason3 == "serve 提前退出（rc=1）" and cont3 is None
 
 
+# ── P0：trial 身份与配置指纹 / extra_docker_args 零破坏白名单 ─────────────
+
+class TestTrialIdentity:
+    def test_sha12(self):
+        assert len(bench._sha12("x")) == 12
+        assert bench._sha12("a") != bench._sha12("b")
+
+    def test_config_fingerprint_stable_across_key_order(self):
+        a = {"serve": {"max-num-seqs": 256}, "env": {"A": "1"}}
+        b = {"env": {"A": "1"}, "serve": {"max-num-seqs": 256}}
+        assert bench.config_fingerprint(a) == bench.config_fingerprint(b)
+        assert len(bench.config_fingerprint(a)) == 12
+
+    def test_config_fingerprint_differs_when_value_changes(self):
+        a = {"serve": {"max-num-seqs": 256}, "env": {"A": "1"}}
+        b = {"serve": {"max-num-seqs": 128}, "env": {"A": "1"}}
+        assert bench.config_fingerprint(a) != bench.config_fingerprint(b)
+
+
+class TestExtraDockerArgsWhitelist:
+    def test_validate_accepts_whitelist(self):
+        # 白名单：--cpuset-cpus 期待值（不带 =）；--cpuset-mems=0 自带值
+        assert bench._validate_extra_docker_args(
+            ["--cpuset-cpus", "0-31", "--cpuset-mems=0"]) == []
+
+    def test_validate_rejects_offending(self):
+        assert bench._validate_extra_docker_args(["-v", "/x:/y"]) != []      # 挂载
+        assert bench._validate_extra_docker_args(["--privileged"]) != []     # 特权
+        assert bench._validate_extra_docker_args(["--gpus", "all"]) != []    # 设备
+        assert bench._validate_extra_docker_args(["--network", "host"]) != []  # 网络
+        assert bench._validate_extra_docker_args(["0-31"]) != []             # 游离值
+
+    def test_validate_rejects_dangling_whitelisted_flag(self):
+        # m1：白名单 flag 期待值却被下一个 flag 打断 / 到列表末尾仍未提供 → 悬空判非法
+        assert bench._validate_extra_docker_args(
+            ["--cpuset-cpus", "--cpuset-mems=0"]) == ["--cpuset-cpus"]
+        assert bench._validate_extra_docker_args(["--cpuset-cpus"]) == ["--cpuset-cpus"]
+        # 带值写法与正常 值+flag 序列不误伤
+        assert bench._validate_extra_docker_args(["--cpuset-cpus=0-31", "--cpuset-mems=0"]) == []
+        assert bench._validate_extra_docker_args(["--cpuset-cpus", "0-31", "--cpuset-mems=0"]) == []
+
+    def test_build_docker_run_cmd_rejects_non_whitelisted(self):
+        runtime = {"kind": "docker", "image": "img:1",
+                   "extra_docker_args": ["--privileged"]}
+        with pytest.raises(ValueError) as ei:
+            bench.build_docker_run_cmd("docker", runtime, "/m", 8000, {"serve": {}})
+        assert "--privileged" in str(ei.value)
+        assert "--cpuset-cpus" in str(ei.value)   # 错误消息说明白名单
+
+    def test_build_docker_run_cmd_accepts_whitelisted(self):
+        runtime = {"kind": "docker", "image": "img:1",
+                   "extra_docker_args": ["--cpuset-cpus", "0-31"]}
+        cmd = bench.build_docker_run_cmd("docker", runtime, "/m", 8000, {"serve": {}})
+        assert "--cpuset-cpus" in cmd and "0-31" in cmd
+
+
 class TestDockerRuntime:
     RUNTIME = {"kind": "docker", "image": "vllm/vllm-openai:v0.31.0",
                "container_model_path": "/model", "shm_size": "16g",
-               "extra_docker_args": ["--privileged"]}
+               "extra_docker_args": ["--cpuset-cpus", "0-31"]}
 
     def test_effective_runtime_merge(self):
         rt = bench.effective_runtime({"runtime": {}}, {"runtime": {"image": "img:1"}})
@@ -290,7 +346,8 @@ class TestDockerRuntime:
         assert "-p" in cmd and "127.0.0.1:8000:8000" in joined
         assert "-v" in cmd and "/models/qwen3:/model:ro" in joined
         assert "-e" in cmd and "NCCL_IB_DISABLE=1" in joined
-        assert "--privileged" in cmd                         # extra_docker_args 透传
+        assert "--privileged" not in cmd and "--cpuset-cpus" in cmd  # 白名单 extra 透传（P0 零破坏）
+        assert "0-31" in cmd
         # entrypoint / image / 模型位
         i = cmd.index("--entrypoint")
         assert cmd[i + 1] == "vllm"
@@ -714,6 +771,9 @@ def test_docker_lifecycle_with_stub_docker(tmp_path, capsys, monkeypatch):
     assert result["workload"] == {"dataset": "random", "isl": 2048, "osl": 256,
                                   "num_prompts": 1000, "ref_concurrency": 128,
                                   "prefix_hit_pct": 0}
+    # stub 双 -v（结果目录 + 模型挂载）区分正确后：--save-result JSON 落到 bench_results
+    # （此前会误落到模型目录 → find_newest_json 落空 → stdout 回退）
+    assert list((out / "bench_results").glob("result-*.json"))
 
 
 def test_docker_crash_serve_exits(tmp_path, capsys, monkeypatch):
@@ -805,3 +865,114 @@ def test_docker_unknown_serve_flag_crashes_before_serve(tmp_path, capsys, monkey
     assert "serve /model" not in text
     sout = capsys.readouterr().out
     assert "status: crash" in sout
+
+
+# ── P0：trial 身份写入产物 + 陈旧 bench JSON 隔离（stub docker）────────────
+
+def test_docker_lifecycle_trial_identity_and_stale_cleanup(tmp_path, capsys, monkeypatch):
+    # status/result 都写 trial_id + config_hash；预置的陈旧 bench JSON 在测量前被清掉
+    import re as _re
+    port = 18120
+    _write_docker_inputs(tmp_path, port, repeats=1)
+    out = tmp_path / "out"
+    out.mkdir()
+    br = out / "bench_results"
+    br.mkdir()
+    stale = br / "result-stale.json"
+    stale.write_text(json.dumps({"request_goodput": 99.0}), encoding="utf-8")
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file) + ["--trial-id", "T-1"])
+    assert rc == 0
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["status"] == "ok"
+    assert result["trial_id"] == "T-1"
+    status = json.loads((out / "status.json").read_text(encoding="utf-8"))
+    assert status["trial_id"] == "T-1"
+    cfg = json.loads((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert result["config_hash"] == bench.config_fingerprint(cfg)
+    assert status["config_hash"] == result["config_hash"]
+    # 陈旧 JSON 已清：测量前种下的文件不存在（stub 只写新 result-*.json；.count 保留）
+    assert not stale.exists()
+    assert result["goodput_req_s"] == pytest.approx(12.34)      # repeats=1 取唯一样本
+
+    # 未显式给 --trial-id → 自动生成 <时间戳>-<uuid6>；两次运行 id 不同
+    out2 = tmp_path / "out2"
+    out2.mkdir()
+    state_file2 = tmp_path / "docker_state2.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file2))
+    assert bench.main(_docker_args(tmp_path, out2, state_file2)) == 0
+    r2 = json.loads((out2 / "result.json").read_text(encoding="utf-8"))
+    assert _re.fullmatch(r"\d{8}T\d{6}-[0-9a-f]{6}", r2["trial_id"])
+    assert r2["trial_id"] != "T-1"
+
+
+def test_docker_crash_writes_trial_identity(tmp_path, capsys, monkeypatch):
+    # crash 路径 result.json / status.json 同样写 trial_id + config_hash
+    port = 18121
+    _write_docker_inputs(tmp_path, port, startup=10, trial=30, repeats=1)
+    out = tmp_path / "out"
+    out.mkdir()
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+    monkeypatch.setenv("FAKE_DOCKER_CRASH", "1")
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file) + ["--trial-id", "T-crash"])
+    assert rc != 0
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["status"] == "crash"
+    assert result["trial_id"] == "T-crash"
+    assert result["config_hash"] == bench.config_fingerprint(
+        json.loads((tmp_path / "config.yaml").read_text(encoding="utf-8")))
+    status = json.loads((out / "status.json").read_text(encoding="utf-8"))
+    assert status["trial_id"] == "T-crash"
+    assert status["config_hash"] == result["config_hash"]
+
+
+def test_stale_run_log_not_contaminating(tmp_path, capsys, monkeypatch):
+    # P0 回归：run.log 启动即截断——预置的旧 trial KV 行不得污染本次 measured_kv_tokens
+    port = 18122
+    _write_docker_inputs(tmp_path, port, repeats=1)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "run.log").write_text(
+        "GPU KV cache size: 9,999,999 tokens, Maximum concurrency ...\n"
+        "旧 trial 残留日志行（应被截断，不得进入本次解析）\n",
+        encoding="utf-8")
+    state_file = tmp_path / "docker_state.txt"
+    monkeypatch.setenv("FAKE_DOCKER_STATE_FILE", str(state_file))
+
+    rc = bench.main(_docker_args(tmp_path, out, state_file))
+    assert rc == 0
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    # 本次 stub serve 的实测 KV 值；若沿用追加模式，会扫到预置的旧值 9999999
+    assert result["calibration"]["measured_kv_tokens"] == 1234567
+    # 顺带确认 --save-result JSON 路径真实走通（stub 双 -v 修复后 JSON 落 bench_results）
+    assert list((out / "bench_results").glob("result-*.json"))
+    log = (out / "run.log").read_text(encoding="utf-8")
+    assert "9,999,999" not in log and "旧 trial 残留日志行" not in log
+
+
+def test_early_failure_writes_identity_placeholder(tmp_path, monkeypatch):
+    # M1：main() 早退路径（runtime.image 缺失 → _err exit 2）也刷新 result.json 为本次身份的
+    # crash 占位，绝不留下一次 trial 的陈旧成功结果（rsync_back 只会拿到本次身份的产物）
+    (tmp_path / "harness.yaml").write_text(json.dumps(
+        {"runtime": {"kind": "docker"}}), encoding="utf-8")     # 无 image → 早退
+    (tmp_path / "target.yaml").write_text(json.dumps(
+        {"model": {"id": "Qwen/Qwen3-32B", "source": "local",
+                   "path": str(tmp_path / "models")}}), encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(json.dumps({"serve": {}}), encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "result.json").write_text(json.dumps(
+        {"status": "ok", "goodput_req_s": 99.0, "trial_id": "OLD-TRIAL"}), encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        bench.main(_docker_args(tmp_path, out, tmp_path / "st.txt") + ["--trial-id", "T-new"])
+    result = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert result["status"] == "crash"
+    assert result["trial_id"] == "T-new"                        # 本次身份，绝非 OLD-TRIAL
+    assert result["config_hash"] == bench.config_fingerprint(
+        json.loads((tmp_path / "config.yaml").read_text(encoding="utf-8")))
+    assert "未完成" in result["reason"]

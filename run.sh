@@ -163,8 +163,19 @@ cmd_start() {  # $1 = 可选 "--detect-gmu"：启动 gmu 预检而非正式 tria
     return 1
   fi
 
-  local p src
+  local p
   p="$(path_for_remote "$REMOTE_DIR")"
+
+  # 本机 trial 身份：日期-时间-本地 shell PID（持久化到 .trial_id；poll 侧据此识别陈旧远端产物）
+  LOCAL_TRIAL_ID="$(date +%Y%m%dT%H%M%S)-$$"
+  printf '%s\n' "$LOCAL_TRIAL_ID" > .trial_id
+  # 已确认无存活 trial：清掉上一个 trial 的远端状态产物（只删 4 个文件，不碰 run.log / 模型；
+  # gmu_probe.json 一并清，防陈旧探测结果被 rsync 回传误作本次的）
+  ssh "${SSH_OPTS[@]}" "$head_ssh" "rm -f $p/status.json $p/result.json $p/bench.pid $p/gmu_probe.json" 2>/dev/null || true
+  # 探测模式：先清本机旧 gmu_probe.json，失败的探测不会留下上一次的 gmu_suggested（普通 trial 不清）
+  if [ "$mode" = "--detect-gmu" ]; then rm -f ./gmu_probe.json; fi
+
+  local src
   src=(config.yaml harness.yaml target.yaml bench.py)
   if [ -f env.json ]; then src+=(env.json); fi
   if [ -f model_profile.json ]; then src+=(model_profile.json); fi
@@ -183,7 +194,7 @@ cmd_start() {  # $1 = 可选 "--detect-gmu"：启动 gmu 预检而非正式 tria
   # trial 结束；`nohup <cmd> >f 2>&1 </dev/null &` 才秒回）。解释器：harness.remote.vllm_python
   # 仅作首选，缺失回退 python3/python（主机常只有 python3）。
   if ! ssh "${SSH_OPTS[@]}" -n "$head_ssh" \
-      "mkdir -p $p; nohup env$env_str sh -c 'cd $p && PY=\$(command -v $(path_for_remote "$vllm_python") 2>/dev/null || command -v python3 2>/dev/null || command -v python 2>/dev/null) && exec \"\$PY\" bench.py --config config.yaml --harness harness.yaml --target target.yaml --out-dir .$bench_extra' > $p/bench.stdout 2>&1 < /dev/null & echo \$! > $p/bench.pid"; then
+      "mkdir -p $p; nohup env$env_str sh -c 'cd $p && PY=\$(command -v $(path_for_remote "$vllm_python") 2>/dev/null || command -v python3 2>/dev/null || command -v python 2>/dev/null) && exec \"\$PY\" bench.py --config config.yaml --harness harness.yaml --target target.yaml --out-dir . --trial-id $LOCAL_TRIAL_ID$bench_extra' > $p/bench.stdout 2>&1 < /dev/null & echo \$! > $p/bench.pid"; then
     echo "远端启动失败（请查 $head_ssh:$p/bench.stdout）" >&2
     return 1
   fi
@@ -229,10 +240,62 @@ cmd_poll() {
     esac
   fi
 
+  # status.json 单字段解析小工具（首次读取与 TOCTOU 重读共用，避免复制粘贴 sed）
+  status_field() {  # $1 = raw json 文本  $2 = 字段名
+    printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+  }
+  # done 收尾（正常 done 分支与 running→DEAD 重读后共用）：回传产物 + 远端 summary
+  finish_done() {
+    rsync_back "$head_ssh" result.json
+    rsync_back "$head_ssh" model_profile.json
+    rsync_back "$head_ssh" gmu_probe.json
+    echo "=== remote summary ==="
+    local gmu_line blk
+    gmu_line="$(ssh "${SSH_OPTS[@]}" "$head_ssh" \
+      "grep '^gmu_suggested:' $p/bench.stdout 2>/dev/null || true")" || true
+    if [ -n "$gmu_line" ]; then
+      printf '%s\n' "$gmu_line"    # 探测模式：结果已回传本机 gmu_probe.json
+    else
+      blk="$(ssh "${SSH_OPTS[@]}" "$head_ssh" \
+        "awk '/^status:/{start=last} /^---/{last=NR} start&&NR>=start{print}' $p/bench.stdout 2>/dev/null || true")" || true
+      if [ -z "${blk:-}" ]; then
+        blk="$(ssh "${SSH_OPTS[@]}" "$head_ssh" "sed -n '/^---/,\$p' $p/bench.stdout 2>/dev/null || true")" || true
+      fi
+      printf '%s\n' "$blk"
+    fi
+    echo "=== end summary ==="
+    return 0
+  }
+  # crash 收尾（正常 crash 分支与 running→DEAD 重读后共用）
+  finish_crash() {  # $1 = crash 消息（空则用通用提示）
+    rsync_back "$head_ssh" result.json
+    rsync_back "$head_ssh" gmu_probe.json
+    echo "crash：${1:-详见远端 status.json / bench.stdout}"
+    return 1
+  }
+  # 陈旧产物防护（done/crash/running 一律先过此关）：status.json 带 trial_id 时，与本机
+  # .trial_id 期望不符 → 属于别的 trial（错配/残留），不消费结果，按 crash 返回 1 让循环
+  # 退出而非悬挂。.trial_id 缺失（如断点续跑会话）→ 完全按旧行为（向后兼容）。
+  local expected_trial_id=""
+  if [ -f .trial_id ]; then
+    expected_trial_id="$(cat .trial_id)"
+  fi
+  guard_trial_mismatch() {  # $1 = raw json 文本；命中错配 → return 1
+    local rid
+    rid="$(status_field "$1" trial_id)"
+    if [ -n "$rid" ] && [ -n "$expected_trial_id" ] && [ "$rid" != "$expected_trial_id" ]; then
+      echo "警告：远端 status.json 属于另一个 trial（remote trial_id=${rid}，本机期望=${expected_trial_id}）：" \
+           "疑似陈旧/错配产物，本次结果不消费。请确认无并发启动后重试。"
+      return 1
+    fi
+    return 0
+  }
+
   local state phase message
-  state="$(printf '%s' "$raw" | sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
-  phase="$(printf '%s' "$raw" | sed -n 's/.*"phase"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
-  message="$(printf '%s' "$raw" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+  state="$(status_field "$raw" state)"
+  phase="$(status_field "$raw" phase)"
+  message="$(status_field "$raw" message)"
+  guard_trial_mismatch "$raw" || return 1
 
   case "$state" in
     running)
@@ -240,9 +303,29 @@ cmd_poll() {
       # 避免 --poll 永久返回 3；UNKNOWN（ssh 抖动）→ 视为仍运行，避免误杀健康 trial。
       case "$(trial_alive_state "$head_ssh")" in
         DEAD)
-          rsync_back "$head_ssh" result.json
-          echo "远端进程已消失（按 crash 处理）：${message:-详见远端 status.json / bench.stdout}"
-          return 1 ;;
+          # TOCTOU 窗口：读到 running 后进程恰好收尾退出——bench.py 在写出终态 status 之前的
+          # 清理（如 _wait_mem_freed）可耗时数十秒，探活会先看到 DEAD。重读一次 status.json：
+          # 已转 done/crash → 按终态正常收尾；重读 ssh 抖动 → 暂按运行中（return 3，勿误判 crash）；
+          # 仍 running / 不可读 → 按 crash（同旧行为）。
+          local rr=0
+          raw="$(ssh "${SSH_OPTS[@]}" "$head_ssh" "cat $p/status.json 2>/dev/null || true")" || rr=$?
+          if [ "$rr" -ne 0 ]; then
+            echo "running（重读远端状态 ssh 抖动，暂按运行中）：bash run.sh --poll"
+            return 3
+          fi
+          state="$(status_field "$raw" state)"
+          phase="$(status_field "$raw" phase)"
+          message="$(status_field "$raw" message)"
+          guard_trial_mismatch "$raw" || return 1
+          case "$state" in
+            done) finish_done ;;
+            crash) finish_crash "$message" ;;
+            *)
+              rsync_back "$head_ssh" result.json
+              echo "远端进程已消失（按 crash 处理）：${message:-详见远端 status.json / bench.stdout}"
+              return 1 ;;
+          esac
+          ;;
         ALIVE)
           echo "running（phase=${phase:-?}${message:+, message=$message}）；仍运行中: bash run.sh --poll"
           return 3 ;;
@@ -252,31 +335,10 @@ cmd_poll() {
       esac
       ;;
     done)
-      rsync_back "$head_ssh" result.json
-      rsync_back "$head_ssh" model_profile.json
-      rsync_back "$head_ssh" gmu_probe.json
-      echo "=== remote summary ==="
-      local gmu_line blk
-      gmu_line="$(ssh "${SSH_OPTS[@]}" "$head_ssh" \
-        "grep '^gmu_suggested:' $p/bench.stdout 2>/dev/null || true")" || true
-      if [ -n "$gmu_line" ]; then
-        printf '%s\n' "$gmu_line"    # 探测模式：结果已回传本机 gmu_probe.json
-      else
-        blk="$(ssh "${SSH_OPTS[@]}" "$head_ssh" \
-          "awk '/^status:/{start=last} /^---/{last=NR} start&&NR>=start{print}' $p/bench.stdout 2>/dev/null || true")" || true
-        if [ -z "${blk:-}" ]; then
-          blk="$(ssh "${SSH_OPTS[@]}" "$head_ssh" "sed -n '/^---/,\$p' $p/bench.stdout 2>/dev/null || true")" || true
-        fi
-        printf '%s\n' "$blk"
-      fi
-      echo "=== end summary ==="
-      return 0
+      finish_done
       ;;
     crash)
-      rsync_back "$head_ssh" result.json
-      rsync_back "$head_ssh" gmu_probe.json
-      echo "crash：${message:-详见远端 status.json / bench.stdout}"
-      return 1
+      finish_crash "$message"
       ;;
     *)
       echo "未知 state=${state}；原样输出远端 status.json："

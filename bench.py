@@ -45,6 +45,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from typing import NoReturn
 
 try:
@@ -64,6 +65,9 @@ KV_LINE_RE = re.compile(r"GPU KV cache size:\s*([\d,]+)\s*tokens")
 # --detect-gmu 预检（借鉴 vLLM auto_tune.sh:252-272 + :95，见 docs/auto-tune-notes.md A/B）
 DEFAULT_GMU_DETECT = {"start": 0.98, "step": 0.02, "floor": 0.10,
                       "ready_timeout_s": 120, "total_timeout_s": 900}
+# 零破坏契约：runtime.extra_docker_args 仅允许 NUMA 对齐白名单参数（其余一律拒绝，
+# 禁止挂载/特权/设备/网络/entrypoint 等绕过构建器的 docker 能力）
+ALLOWED_EXTRA_DOCKER_ARGS = ("--cpuset-cpus", "--cpuset-mems")
 
 
 def _now_iso() -> str:
@@ -73,6 +77,17 @@ def _now_iso() -> str:
 def _err(msg: str) -> NoReturn:
     print(f"bench.py: 错误: {msg}", file=sys.stderr)
     sys.exit(2)
+
+
+def _sha12(text: str) -> str:
+    """sha256 hex 前 12 位（紧凑内容指纹）。"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def config_fingerprint(config: dict) -> str:
+    """config.yaml 内容指纹：键序无关，任一 value 变化即变（default=str 兜底非 JSON 标量），
+    写入 status.json / result.json 供 trial 与配置对齐。"""
+    return _sha12(json.dumps(config, sort_keys=True, ensure_ascii=False, default=str))
 
 
 def load_yaml(path: str, required: bool = True) -> dict:
@@ -307,6 +322,39 @@ def _get_serve_help(docker_cmd: str, runtime: dict, cache_dir: str) -> str | Non
     return None
 
 
+def _validate_extra_docker_args(extra: list) -> list[str]:
+    """白名单校验 runtime.extra_docker_args：返回非法 token 列表（空 = 全合法）。
+    规则：以 `-` 开头的 token 是 flag——`=` 前为名；名不在白名单 → 非法（且不期待值）；
+    名在白名单 → 仅当不带 `=` 写时才期待一个值。不以 `-` 开头的 token 只有在
+    前一个白名单 flag 期待值时才合法，否则是游离值。期待值的白名单 flag 若被
+    下一个 flag 打断或到列表末尾仍未拿到值 → 该 flag 悬空，同样判非法。"""
+    offending: list[str] = []
+    expects_value = False
+    pending_flag = ""
+    for tok in extra:
+        s = str(tok)
+        if s.startswith("-"):
+            name = s.split("=", 1)[0]
+            if name not in ALLOWED_EXTRA_DOCKER_ARGS:
+                offending.append(s)
+                expects_value = False
+                pending_flag = ""
+            else:
+                if expects_value:
+                    offending.append(pending_flag)  # 上个白名单 flag 还在等值就被新 flag 打断
+                expects_value = "=" not in s
+                pending_flag = s if expects_value else ""
+        else:
+            if expects_value:
+                expects_value = False
+                pending_flag = ""
+            else:
+                offending.append(s)
+    if expects_value:
+        offending.append(pending_flag)  # 末尾悬空：白名单 flag 期待值但未提供
+    return offending
+
+
 def build_docker_run_cmd(docker_cmd: str, runtime: dict, model_path: str, port: int,
                          config: dict, name: str = "vllm-autotune-trial") -> list[str]:
     """docker 运行时 serve 命令（frozen 设计）：
@@ -326,8 +374,15 @@ def build_docker_run_cmd(docker_cmd: str, runtime: dict, model_path: str, port: 
            "-v", f"{model_path}:{cpath}:ro"]
     for k, v in (config.get("env") or {}).items():
         cmd += ["-e", f"{k}={v}"]
-    for a in (runtime.get("extra_docker_args") or []):
-        cmd.append(str(a))
+    # 零破坏契约单一口（trial / gmu 探测 / report 部署共用本函数）：extra 只允许 NUMA 白名单
+    extra_args = [str(a) for a in (runtime.get("extra_docker_args") or [])]
+    offending = _validate_extra_docker_args(extra_args)
+    if offending:
+        raise ValueError(
+            "runtime.extra_docker_args 仅允许 NUMA 对齐白名单参数 "
+            f"--cpuset-cpus/--cpuset-mems；非法项: {offending}"
+            "（零破坏契约：禁止挂载/特权/设备/网络/entrypoint 等）")
+    cmd += extra_args
     cmd += ["--entrypoint", "vllm", image, "serve", cpath]
     return cmd + _serve_flags(config, port)
 
@@ -475,7 +530,8 @@ def _set_profile_gmu_suggested(out_dir: str, gmu: float | None) -> None:
 
 
 def _run_gmu_probe(docker_cmd: str, runtime: dict, config: dict, target: dict, port: int,
-                   bench_cfg: dict, out_dir: str, poll_interval: float) -> int:
+                   bench_cfg: dict, out_dir: str, poll_interval: float,
+                   trial_id: str, config_hash: str) -> int:
     """--detect-gmu：从高到低起服（--load-format dummy）探测最大可用 gpu-memory-utilization。
     产出 gmu_probe.json 与 status.json（running→done/crash，run.sh --poll 可直接轮询）；
     out_dir 已有 model_profile.json 则就地补 gmu_suggested。
@@ -486,14 +542,16 @@ def _run_gmu_probe(docker_cmd: str, runtime: dict, config: dict, target: dict, p
     if not host_model_path:
         msg = "需要 target.yaml 的 model.path（宿主上的模型目录，将只读挂载进容器）"
         print(f"bench.py: 错误: {msg}", file=sys.stderr)
-        _write_status(out_dir, "crash", "crash", f"gmu 探测失败：{msg}", started_at)
+        _write_status(out_dir, "crash", "crash", f"gmu 探测失败：{msg}", started_at,
+                      trial_id=trial_id, config_hash=config_hash)
         return 1
     img = str(runtime.get("image"))  # main 已保证 image 非空
     if _run_local([docker_cmd, "image", "inspect", img])[0] != 0:
         msg = (f"镜像 {img} 未在主机预先准备（本模板不自动拉取，保持主机零新增；"
                "请人工预先 docker pull 或改用已存在的镜像）")
         print(f"bench.py: 错误: {msg}", file=sys.stderr)
-        _write_status(out_dir, "crash", "crash", f"gmu 探测失败：{msg}", started_at)
+        _write_status(out_dir, "crash", "crash", f"gmu 探测失败：{msg}", started_at,
+                      trial_id=trial_id, config_hash=config_hash)
         return 1
     detect = {**DEFAULT_GMU_DETECT, **((bench_cfg.get("gmu_detect") or {}))}
     ready_timeout_s = float(detect["ready_timeout_s"])
@@ -501,14 +559,15 @@ def _run_gmu_probe(docker_cmd: str, runtime: dict, config: dict, target: dict, p
     cands = gmu_candidates(bench_cfg)
     _write_status(out_dir, "running", "probing",
                   f"gmu 探测（--load-format dummy；{len(cands)} 级候选，预算 {total_timeout_s:.0f}s）",
-                  started_at)
+                  started_at, trial_id=trial_id, config_hash=config_hash)
     log_path = os.path.join(out_dir, "run.log")
     tried: list[float] = []
     suggested: float | None = None
     reason = ""
     timed_out = False
     total_deadline = time.monotonic() + total_timeout_s
-    with open(log_path, "ab") as log_fh:
+    # run.log 属于本次 probe，启动即截断：避免上一次探测的 KV 校准行/日志段污染本次解析
+    with open(log_path, "wb") as log_fh:
         # m1：探测路径也预校验 config.serve 的 flag 名（与 trial 同口径）——typo 不伪装成"无可用 gmu"
         help_text = _get_serve_help(docker_cmd, runtime, out_dir)
         if help_text is None:
@@ -522,7 +581,8 @@ def _run_gmu_probe(docker_cmd: str, runtime: dict, config: dict, target: dict, p
                 log_fh.write(f"=== bench.py {_now_iso()} flag 预校验失败: {reason}\n".encode())
                 log_fh.flush()
                 msg = f"gmu 探测失败：{reason}"
-                _write_status(out_dir, "crash", "crash", msg, started_at)
+                _write_status(out_dir, "crash", "crash", msg, started_at,
+                              trial_id=trial_id, config_hash=config_hash)
                 print(f"bench.py: 错误: {reason}", file=sys.stderr)
                 return 1
         for gmu in cands:
@@ -555,10 +615,12 @@ def _run_gmu_probe(docker_cmd: str, runtime: dict, config: dict, target: dict, p
                    "reason": reason}, f, ensure_ascii=False, indent=2)
     _set_profile_gmu_suggested(out_dir, suggested)
     if suggested is not None:
-        _write_status(out_dir, "done", "done", f"gmu_suggested={suggested}", started_at)
+        _write_status(out_dir, "done", "done", f"gmu_suggested={suggested}", started_at,
+                      trial_id=trial_id, config_hash=config_hash)
         print(f"gmu_suggested: {suggested}")
         return 0
-    _write_status(out_dir, "crash", "crash", f"gmu 探测失败：{reason}", started_at)
+    _write_status(out_dir, "crash", "crash", f"gmu 探测失败：{reason}", started_at,
+                  trial_id=trial_id, config_hash=config_hash)
     if timed_out:
         print(f"gmu_suggested: 无（{reason}；已尝试 {len(tried)} 级，未到 floor）")
     else:
@@ -623,9 +685,14 @@ def _calibrate_profile(out_dir: str, kv_tokens: int | None, load_seconds: float 
 
 # ── 状态与健康 ──────────────────────────────────────────────────────────
 
-def _write_status(out_dir: str, state: str, phase: str, message: str, started_at: str) -> None:
+def _write_status(out_dir: str, state: str, phase: str, message: str, started_at: str,
+                  trial_id: str | None = None, config_hash: str | None = None) -> None:
     data = {"state": state, "phase": phase, "started_at": started_at,
             "updated_at": _now_iso(), "message": message}
+    if trial_id is not None:
+        data["trial_id"] = trial_id
+    if config_hash is not None:
+        data["config_hash"] = config_hash
     with open(os.path.join(out_dir, "status.json"), "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -791,9 +858,9 @@ class TrialCrash(Exception):
 
 # ── bench 单次运行 ──────────────────────────────────────────────────────
 
-def _run_bench_once(bench_tokens: list[str], timeout: float, log_fh, out_dir: str) -> dict:
-    """跑一次 bench：优先解析 --save-result JSON，回退 stdout 表格；失败抛 TrialCrash。"""
-    result_dir = os.path.join(out_dir, "bench_results")
+def _run_bench_once(bench_tokens: list[str], timeout: float, log_fh, result_dir: str) -> dict:
+    """跑一次 bench：优先解析 --save-result JSON，回退 stdout 表格；失败抛 TrialCrash。
+    result_dir 由调用方在 repeats 循环前创建并清空（防误取上一个 trial 的 JSON）。"""
     os.makedirs(result_dir, exist_ok=True)
     cmd = bench_tokens
     marker = f"\n=== bench run {_now_iso()} cmd: {shlex.join(cmd)}\n"
@@ -861,11 +928,26 @@ def main(argv: list[str] | None = None) -> int:
                          "gpu-memory-utilization，写 gmu_probe.json 后退出（不跑 trial）")
     ap.add_argument("--poll-interval", type=float, default=2.0, help="/health 轮询间隔（秒）")
     ap.add_argument("--vram-interval", type=float, default=2.0, help="显存采样间隔（秒）")
+    ap.add_argument("--trial-id", default="", help="trial 身份（留空自动生成 <时间戳>-<uuid6>）")
     args = ap.parse_args(argv)
 
     config = load_yaml(args.config)
     harness = load_yaml(args.harness)
     target = load_yaml(args.target)
+
+    # trial 身份与配置指纹（贯穿 status.json / result.json，供 run.sh poll 对齐 / 陈旧产物识别）
+    trial_id = args.trial_id or f"{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    config_hash = config_fingerprint(config)
+
+    # M1：身份已知即落占位 result.json——任何早退路径（_err exit / gmu 预检早退 / 硬杀）
+    # 都只会留下"本次 trial 未完成"的 crash 占位，绝不残留上一次 trial 的成功结果
+    # （正常结束时会被末尾的正式写入覆盖）。
+    out_dir = args.out_dir
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "result.json"), "w", encoding="utf-8") as f:
+        json.dump({"status": "crash", "reason": "trial 未完成（占位：正常结束时会被覆盖）",
+                   "trial_id": trial_id, "config_hash": config_hash,
+                   "started_at": _now_iso()}, f, ensure_ascii=False, indent=2)
 
     # docker-only：运行时 = harness.runtime 与 config.runtime 逐键合并（config 覆盖）
     runtime = effective_runtime(harness, config)
@@ -876,12 +958,12 @@ def main(argv: list[str] | None = None) -> int:
     bench_cfg = harness.get("bench") or {}
     remote = harness.get("remote") or {}
     port = int(remote.get("vllm_port", 8000))
-    out_dir = args.out_dir
 
     # 预检模式：探测最大可用 gpu-memory-utilization（--load-format dummy）后退出，不跑 trial
     if args.detect_gmu:
         return _run_gmu_probe(args.docker_cmd, runtime, config, target, port,
-                              bench_cfg, out_dir, args.poll_interval)
+                              bench_cfg, out_dir, args.poll_interval,
+                              trial_id=trial_id, config_hash=config_hash)
 
     model = config.get("model") or (target.get("model") or {}).get("id")
     if not model:
@@ -902,7 +984,8 @@ def main(argv: list[str] | None = None) -> int:
     started_at = _now_iso()
     start_mono = time.monotonic()
     deadline = start_mono + trial_timeout_s
-    _write_status(out_dir, "running", "loading", "启动 vllm serve（等待 /health 就绪）", started_at)
+    _write_status(out_dir, "running", "loading", "启动 vllm serve（等待 /health 就绪）", started_at,
+                  trial_id=trial_id, config_hash=config_hash)
 
     fp = _capture_fingerprint()
     env_path = os.path.join(out_dir, "env.json")
@@ -928,7 +1011,8 @@ def main(argv: list[str] | None = None) -> int:
     log_path = os.path.join(out_dir, "run.log")
 
     try:
-        log_fh = open(log_path, "ab")
+        # run.log 属于本次 trial，启动即截断：避免上一次的 KV 校准行/日志段污染本次解析
+        log_fh = open(log_path, "wb")
         # docker：serve/bench 都在容器内跑；本机只跑 docker 客户端
         host_model_path = (target.get("model") or {}).get("path")
         if not host_model_path:
@@ -972,7 +1056,8 @@ def main(argv: list[str] | None = None) -> int:
                     f"{[a['pid'] for a in contention['foreign_gpu_apps']]}")
         if diff:
             msg += f"；环境指纹变化：{diff}"
-        _write_status(out_dir, "running", "benching", msg, started_at)
+        _write_status(out_dir, "running", "benching", msg, started_at,
+                      trial_id=trial_id, config_hash=config_hash)
 
         # 显存峰值采样线程（整个 bench 期间）
         peak_mib: list[int] = []
@@ -981,8 +1066,18 @@ def main(argv: list[str] | None = None) -> int:
                                        args=(stop, args.vram_interval, peak_mib), daemon=True)
         vram_thread.start()
         try:
+            # 隔离性：每次 trial 前清空 bench_results 下上一个 trial 的 JSON（best-effort；
+            # 不删 .count 状态文件与子目录），防止 find_newest_json 误取陈旧结果
+            bench_result_dir = os.path.join(out_dir, "bench_results")
+            os.makedirs(bench_result_dir, exist_ok=True)
+            try:
+                for f in os.listdir(bench_result_dir):
+                    if f.endswith(".json"):
+                        os.remove(os.path.join(bench_result_dir, f))
+            except OSError:
+                pass
             bench_tokens = build_docker_bench_cmd(args.docker_cmd, runtime, model, workload, slo,
-                                                  ref_conc, seed, os.path.join(out_dir, "bench_results"),
+                                                  ref_conc, seed, bench_result_dir,
                                                   trust_remote_code, port,
                                                   host_model_path=host_model_path)
             results = []
@@ -993,7 +1088,7 @@ def main(argv: list[str] | None = None) -> int:
                 if i >= 1:
                     # D：同实例的后续 repeat 前清前缀缓存 → 每次测量冷缓存独立（首 repeat 起服即冷）
                     _reset_prefix_cache(port, log_fh)
-                parsed = _run_bench_once(bench_tokens, remaining, log_fh, out_dir)
+                parsed = _run_bench_once(bench_tokens, remaining, log_fh, bench_result_dir)
                 if parsed["goodput"] is None:
                     raise TrialCrash(f"bench 第 {i + 1} 次无有效输出（goodput 缺失）")
                 results.append(parsed)
@@ -1032,6 +1127,8 @@ def main(argv: list[str] | None = None) -> int:
             "calibration": calibration,
             "workload": _resolved_workload(workload, ref_conc),
             "started_at": started_at,
+            "trial_id": trial_id,
+            "config_hash": config_hash,
             **({"contention": contention} if contention else {}),
         }
     except TrialCrash as c:
@@ -1039,14 +1136,16 @@ def main(argv: list[str] | None = None) -> int:
         # F10：OOM 特征 → 可执行口径 + 崩溃当时重新共租检测（写入 contention）；未命中保持原原因
         crash_reason, oom_cont = _classify_oom_crash(c.reason, log_path, log_start)
         result = {"status": "crash", "reason": crash_reason, "started_at": started_at,
-                  "calibration": {"measured_kv_tokens": kv_tokens, "load_seconds": load_seconds}}
+                  "calibration": {"measured_kv_tokens": kv_tokens, "load_seconds": load_seconds},
+                  "trial_id": trial_id, "config_hash": config_hash}
         if oom_cont:
             result["contention"] = oom_cont
     except Exception as e:  # 兜底：任何异常都记为 crash，绝不让进程挂起
         kv_tokens = kv_sink[0]
         result = {"status": "crash", "reason": f"{type(e).__name__}: {e}",
                   "started_at": started_at,
-                  "calibration": {"measured_kv_tokens": kv_tokens, "load_seconds": load_seconds}}
+                  "calibration": {"measured_kv_tokens": kv_tokens, "load_seconds": load_seconds},
+                  "trial_id": trial_id, "config_hash": config_hash}
     finally:
         _cleanup(procs, args.docker_cmd)
         if log_fh is not None:
@@ -1058,9 +1157,11 @@ def main(argv: list[str] | None = None) -> int:
     with open(os.path.join(out_dir, "result.json"), "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     if result["status"] == "ok":
-        _write_status(out_dir, "done", "done", f"完成 dur_s={result['dur_s']}", started_at)
+        _write_status(out_dir, "done", "done", f"完成 dur_s={result['dur_s']}", started_at,
+                      trial_id=trial_id, config_hash=config_hash)
     else:
-        _write_status(out_dir, "crash", "crash", f"崩溃：{result['reason']}", started_at)
+        _write_status(out_dir, "crash", "crash", f"崩溃：{result['reason']}", started_at,
+                      trial_id=trial_id, config_hash=config_hash)
     _print_summary(result)
     return 0 if result["status"] == "ok" else 1
 

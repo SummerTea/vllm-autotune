@@ -17,6 +17,7 @@ model_profile.json
 report.md
 result.json
 deploy-best.sh
+.trial_id
 
 # Python
 __pycache__/

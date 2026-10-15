@@ -24,12 +24,12 @@ if [ "$1" = "rm" ]; then
   exit 0
 fi
 
-# 解析：--port <n>、-v <host>:<container>（取宿主侧）、--gpu-memory-utilization <g>、
-#   --entrypoint vllm <image> <serve|bench>
+# 解析：--port <n>、-v 中 /bench_results 挂载（取宿主侧；另有 -v <model>:/model:ro 须区分）、
+#   --gpu-memory-utilization <g>、--entrypoint vllm <image> <serve|bench>
 SUB=""; PORT=""; RDIR_HOST=""; GMU=""; prev=""; entry_seen=""; entry_tok=0
 for a in "$@"; do
   if [ "$prev" = "--port" ]; then PORT=$a; fi
-  if [ "$prev" = "-v" ]; then RDIR_HOST="${a%%:*}"; fi
+  case "$a" in *:/bench_results) RDIR_HOST="${a%%:*}" ;; esac
   if [ "$prev" = "--gpu-memory-utilization" ]; then GMU=$a; fi
   if [ "$a" = "--entrypoint" ]; then
     entry_seen=1
