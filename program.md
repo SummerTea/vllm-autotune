@@ -113,12 +113,12 @@ commit  goodput  goodput_std  output_tok_s  ttft_p99_ms  tpot_p99_ms  peak_vram_
 
 ## workload 降档（保持可比性）
 
-isl / osl / ref_concurrency 定义负载身份，单次 run 内绝不改动（会破坏可比性）。预算紧张时只允许下调 num_prompts（缩短单 trial 墙钟，不改变 goodput 语义）；降档后所有后续 trial 同口径，必要时重测基线，并在 results.tsv.description 记 `num_prompts:1000→300`。若必须改 isl/osl/ref_concurrency，则结束当前 run、开新 run 重新基线。
+isl / osl / ref_concurrency 定义负载身份，单次 run 内绝不改动（会破坏可比性）。预算紧张时只允许下调 num_prompts（缩短单 trial 墙钟，不改变 goodput 语义）；降档后所有后续 trial 同口径，必要时重测基线，并在 results.tsv.description 记 `num_prompts:<原>→<新>`。若必须改 isl/osl/ref_concurrency，则结束当前 run、开新 run 重新基线。
 
 ## 环境失效与共租处置
 
 1. **显存不足 / 被外部占用致起服失败**（`Free memory ... less than desired`）：判为可自愈 crash，按序尝试——(a) 用 env.CUDA_VISIBLE_DEVICES 缩到空闲 GPU 子集并同步下调 tp；(b) 下调 gpu-memory-utilization；(c) 若 target.yaml 预声明了 fallback 主机/模型则切换；(d) 仍不行记 crash，继续下一配置。
-2. **contention（检测到外部 GPU 进程）**：(a) 切到空闲的声明候选主机/GPU 子集 →(b) 有限时间内重探后重试（上限如 15min）→(c) 持续共租则带 contention 告警继续，并在该轮标注「共租，仅供横向参考」；不求助人类。
+2. **contention（检测到外部 GPU 进程）**：(a) 切到空闲的声明候选主机/GPU 子集 →(b) 有限时间内重探后重试（参考上限 15min，可按主机调整）→(c) 持续共租则带 contention 告警继续，并在该轮标注「共租，仅供横向参考」；不求助人类。
 3. **主机整体不可达 / 模型路径消失**：停止循环，诊断写入 report.md。
 
 ## 崩溃处理
@@ -129,7 +129,7 @@ isl / osl / ref_concurrency 定义负载身份，单次 run 内绝不改动（�
 
 ## 子 agent 分派
 
-- **固定分派点**：Phase 1 —— 探索子 agent 核验环境事实与踩坑查证；Phase 3 —— 每 5 轮一次分析子 agent 做趋势 / 瓶颈体检；Phase 4 前 —— 验证子 agent 独立复核 best 回归与结论。
+- **固定分派点**：Phase 1 —— 探索子 agent 核验环境事实与踩坑查证；Phase 3 —— 周期性（每 N 轮，N 取 3–5，可由 harness 配置）一次分析子 agent 做趋势 / 瓶颈体检；Phase 4 前 —— 验证子 agent 独立复核 best 回归与结论。
 - **触发**：需要跨文件 / 跨知识检索，或结论将被 keep / 采纳时派；纯机械执行（改一个已定参数、跑一次 run.sh）不派。
 - **评估可执行化**：评估子 agent 优先直接运行 scripts/mock_loop.py 的纯函数，不靠心算。
 - **成本护栏**：同一 Phase 内子 agent 总预算设上限；验证角色不得复用产生结论者的会话。
