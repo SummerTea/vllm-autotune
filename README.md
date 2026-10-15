@@ -46,6 +46,7 @@
 | `docs/vllm-facts.md` | 模板依赖的 vLLM 行为事实（版本相关，升级需重新核对） | 只读 |
 | `docs/external-resources.md` | 外部 skills / MCP / 工具调研（vLLM 调优生态） | 只读 |
 | `docs/roadmap.md` | 后续路线图（v1.1 证据/验收层、v2 架构扩展） | 只读 |
+| `docs/remake-plan-review.md` | 对「5-Sprint 改造计划」的评估（事实核验 / 鲁棒性 / 自主性 + 有界修正路线） | 只读 |
 | `.agents/skills/` | 工程级 agent skills（vllm-bench-serve / vllm-deploy-docker / vllm-prefix-cache-bench，版本由 skills-lock.json 锁定） | 只读 |
 | `skills-lock.json` | skills 来源与哈希锁定（防漂移） | 只读 |
 | `pyproject.toml` / `LICENSE` / `.gitignore` | 工程元数据 | 只读 |
@@ -112,6 +113,7 @@
 - `docs/vllm-facts.md` — vLLM 行为事实（bench CLI / 输出字段 / 启动校准行）。
 - `docs/external-resources.md` — 外部 skills / MCP / 工具调研（vLLM 调优生态）。
 - `docs/roadmap.md` — 后续路线图（v1.1：监控证据层 / GuideLLM 验收 / nvbandwidth 拓扑实测 / lm-eval 精度 gate / vllm-tuner 大脑；v2：跨机执行 / PD 分离 / Dynamo AIConfigurator / 系统参数白名单）。
+- `docs/remake-plan-review.md` — 对「5-Sprint 改造计划」的评估：方向对但细节需修正；按原样实施会**削弱** agent 自主规划能力（controller 须限为安全/执行/状态/证据，策略权留给 agent）。
 
 ## 依赖
 
