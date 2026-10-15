@@ -26,10 +26,9 @@
 - **成本**：低。
 - **依据**：external-resources.md §4（GuideLLM 行）、Top-8 #5。
 
-### (c) 拓扑实测（静态 → 实测带宽）
-- **目标**：把 probe 的静态拓扑（NV#/PIX/PHB/SYS）升级为实测带宽，tp 剪枝更准。
-- **集成方式**：开跑前一次性跑 `nvbandwidth --format json` + `nccl-tests all_reduce_perf` + `ib_write_bw`，结果写入 `model_profile.json` / `env.json`（只读工具，缺失跳过、不安装）。
-- **成本**：低。
+### (c) 拓扑实测（静态 → 实测带宽）— ✅ 已实现
+- **现状**：`probe.py` 已实测 **GPU↔GPU P2P 带宽**（容器内 torch 测例，同/跨 NUMA）与 **跨 NUMA RoCE/IB 带宽**（`ib_write_bw`），写入 **`env.json` 的 `hosts.<name>.interconnect`**（`gpu_p2p_bw_gbps` / `rdma_bw_gbps`；不可得 → null + note，不阻塞）。同时补齐 **NIC↔GPU 亲和与速率**（`net.rdma.devices[].gpu_links/speed_gbps/numa_node`）与**模型盘顺序读带宽**（`disk.read_bw_gbps`）。`program.md` 的 NUMA/placement 与网络剪枝以这些**实测值**为输入。
+- **仍未做**：`nvbandwidth` / `nccl-tests all_reduce_perf`（非必须；当前以容器 torch 测例 + `ib_write_bw` 覆盖）。
 - **依据**：external-resources.md §7（nvbandwidth/nccl-tests/perftest）、Top-8 #6。
 
 ### (d) 精度 gate（lm-eval 小子集）
@@ -48,6 +47,16 @@
 - **现状**：NUMA 采集/约束已实现（`probe.py` `numa_groups` + 「NUMA 放置」检查清单建议 + `program.md` 剪枝规则）；系统级绑定仍只建议、不自动。
 - **目标**：把「NUMA 亲和」从只建议升级为可 opt-in 的自动绑定——容器 `--cpuset-cpus/--cpuset-mems` + `env.CUDA_VISIBLE_DEVICES` 限定可见 GPU、必要时宿主机 `numactl` 绑定（改动前记录原值、失败自动回滚）。**注意**：`build_docker_run_cmd` 已固定 `--gpus all`，若将来改用 `--gpus device=` 限卡，须先在构建器做 `--gpus` 去重（或统一走 `CUDA_VISIBLE_DEVICES`）。
 - **成本**：低-中；属 v2「系统级参数白名单自动调」的前置子项。
+
+## v1.2 — 本轮真机演练新增待办（131 / DeepSeek-V4.1-Flash）
+
+> 来源：`drill/deepseek-v4-flash-6000d05` 全流程演练。**前两项属设计决策，需人工拍板后再实现**；其余为低成本增强。
+
+- **(g) 高方差 workload 的噪声模型**：keep 阈值 `max(best×3%, k×σ)` 在 σ 达 best 的 ~55% 时几乎无法 keep（实测 σ≈3.67 vs best 6.62 req/s），循环会退化为「平台期退出」。候选手段：**丢弃预热轮**（首轮冷启动污染：实测 ttft_p99 的组间 σ 达 13s）、**σ 上限**、**自适应 repeats**。注意：改 `harness.yaml` 语义会影响跨 run 可比性，需与历史行区分标注。
+- **(h) `fallbacks`（换机 / 换模型）**：`target.example.yaml` 已留注释位，但**当前未实现**（`run.sh` 硬绑唯一 `role:head`）。需要：target schema（候选主机/模型）+ `run.sh` 的选主/切换与失败回退机制 + 留痕。
+- **(i) `loop-orchestration` skill**：把「主循环唯一写者 / 子 agent 只读认知分工（探索·分析·验证·评估）/ 摘要即弃」的纪律做成 `.agents/skills/` 工程级 skill，使不支持子 agent 的 harness 也有一致降级口径。
+- **(j) `scripts/mock_loop.py --score`**：让「评估」角色直接跑纯函数打分，而非 LLM 心算 keep/discard。
+- **(k) probe 的宿主回退**：docker-only 下若某次容器实测抖动失败，`gpu_p2p_bw` 会「未采集」（当前无宿主回退）——可加退避重试，或在 note 中写明成因（无 `runtime.image` / docker 不可用 / GPU 忙）。
 
 ## v2 — 架构扩展
 
