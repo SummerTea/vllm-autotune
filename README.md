@@ -11,7 +11,7 @@
 - **单点可变**：整个仓库对 agent 只有一个可编辑文件 `config.yaml`，其余均为只读 harness。改动面小，实验结果可审计。
 - **可比性**：固定 workload 与参考并发点（见 `harness.yaml`），所有实验在同一输入分布下比较，噪声可统计。
 - **goodput 标量化**：单个标量 = 在 SLO（ttft_p99 / tpot_p99）约束下成功请求的吞吐（单位 req/s，即 vLLM 的 `request_goodput`；输出 token 吞吐作为辅助诊断列）。调优目标明确，keep/discard 判定机械可执行。
-- **三层退出**：deadline 主退出 + 平台期 + 崩溃连击，过夜运行自动收尾，不留僵尸进程。
+- **多层退出**：deadline 主退出 + 平台期 + 崩溃连击 + SLO 不可达退出，过夜运行自动收尾，不留僵尸进程。
 
 ## 如何使用（fork 指南）
 
@@ -20,7 +20,7 @@
 3. `cp .env.example .env`，填写 SSH 选项（端口、私钥路径、远端目录）。
 4. 在编排机（本仓库目录）运行 `bash setup_remote.sh`（一次性校验：docker 可用 + 镜像已就绪；零 pull、零安装）。
 5. 把编码 agent（Claude Code / Codex / opencode）指向本仓库。
-6. 对它说：「读 AGENTS.md，开始」——之后它自主循环，你睡觉。
+6. 对它说：「读 AGENTS.md，开始」——之后它自主循环、运行期自行处置环境波动，不再打断你；你睡觉。
 
 ## 仓库结构
 
@@ -52,12 +52,14 @@
 
 - **固定 workload 与参考并发**：所有 trial 用同一合成 workload 与参考并发点（`harness.yaml`），保证配置之间可比。
 - **goodput 标量化**：以 `vllm bench serve --goodput` 的输出为唯一指标，SLO 来自 `target.yaml`（缺省用 `harness.yaml` 占位）。
-- **三层退出**：deadline 主退出（硬保证）+ 平台期（连续 N 次无 > 噪声带的改进）+ 崩溃连击（连续 N 次 crash）。每轮开头做 deadline 感知调度，来不及就不开新 trial；在途 trial 宽限跑完。
+- **多层退出**：deadline 主退出（硬保证）+ 平台期（连续 N 次无 > 噪声带的改进）+ 崩溃连击（连续 N 次 crash）+ SLO 不可达退出（校准后仍 goodput=0）。每轮开头做 deadline 感知调度，来不及就不开新 trial；在途 trial 宽限跑完。
 - **系统参数只建议**：governor / hugepages / 锁频等系统级参数只探测并写入报告建议，不自动修改；v1 不提供自动修改开关。
 - **NUMA 感知的 tp 选择**：`probe.py` 产出 `numa_groups`（每 GPU 的 `numa_node`）与「NUMA 放置」检查清单建议——tp 组限同一 NUMA 节点内的 GPU；**主机级**绑定（`numactl`）只建议、不自动；**容器级** `--cpuset-cpus/--cpuset-mems`（经 `runtime.extra_docker_args`）为 opt-in 逃生口，限定可见 GPU 用 `env.CUDA_VISIBLE_DEVICES`。
 - **前缀缓存可测性**：`workload.prefix_hit_pct`（0-100，仅 random 数据集）按目标命中率拆共享前缀，让 `enable-prefix-caching` 成为可测维度；repeats 之间自动 `POST /reset_prefix_cache`，保证每次测量冷缓存独立。
 - **多机采集 + 单机执行**：v1 只在 `role=head` 的主机上跑实验，其余主机仅做采集探测；跨机调度留到 v2。
 - **运行时：docker-only**：vLLM 环境复杂，统一用镜像（如 `vllm/vllm-openai:v0.31.0`）——`config.yaml` 的 `runtime.image` 指定（逐键覆盖 `harness.yaml` 默认），**不支持**本机安装式 vLLM；`image` 本身是合法的搜索维度（如 CUDA 12/13 变体镜像）；模型目录经 `-v host:container:ro` 只读挂载进容器，serve/bench 都在容器内跑、本机无需安装 vllm。
+- **运行期自主**：Phase 0 之后 agent 不再打断人类；SLO 校准、workload 降档、共租 / 失效处置均按 program.md 自主执行并留痕。
+- **编排**：主循环串行 + 子 agent 只读认知分工（摘要即弃）；results.tsv + git 为唯一真源，子 agent 会话不承载状态；不并发 trial（并行实验见 docs/roadmap.md 暂缓）。
 
 ## 支持矩阵
 
@@ -71,7 +73,8 @@
 1. 跑 `python probe.py`，检查生成的 `env_report.md`（系统参数清单 pass / warn / fail）。
 2. 用初始 `config.yaml`（基线）跑 `bash run.sh` 并轮询 `bash run.sh --poll` 至退出 0，确认 bench 出数正常。
 2.5 可选预检（共享主机防 OOM）：`bash run.sh --detect-gmu`，然后循环 `bash run.sh --poll` 至退出 0，结果回传本机 `gmu_probe.json`（`gmu_suggested` 为安全 `gpu-memory-utilization` 起点）。
-3. 跑一次短预算循环，确认 keep / discard 判定与三层退出逻辑正确。
+3. 跑一次短预算循环，确认 keep / discard 判定与多层退出逻辑正确。
+> 若 harness 不支持子 agent，主循环以内联摘要纪律等价运行（功能不缺失）。
 
 > 注：全部脚本均已交付（清单 1/2/3 条均可执行）。离线排练：`uv run pytest -q` 无需 GPU/网络即可跑通 probe → bench → report 的 mock 全链路与循环规则核对。
 
@@ -94,6 +97,7 @@
 ## 如何解读 report.md
 
 - 「基线 vs 最佳」：goodput 提升 % =（最佳 − 基线）/ 基线；若标注「⚠ 无满足 SLO 的 trial」，则最佳为回退选择（全部已测量行中最高），需人工复核 SLO 是否过严。
+- 若出现「运行期 SLO 校准」标注：说明参考 SLO 不可达，agent 已按实测 p99 校准出有效 SLO（概览标注「参考→有效」ttft/tpot）；best 为有效 SLO 下的最优，校准留痕见 `results.tsv.description`。
 - 「全部 trial 表」：按 goodput 降序，SLO 达标列一眼看出哪些配置可用。
 - 「最佳配置」：内嵌 `git show <best_commit>:config.yaml` 的快照（git 不可用时提示手动查看）。
 - 「系统级建议」：来自 `env_report.md` 的 warn/fail 项，均为人工可执行建议（v1 不自动改）。

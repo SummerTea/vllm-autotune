@@ -222,6 +222,7 @@ def _run_main(tmp: Path) -> int:
     return report.main(["--results", str(tmp / "results.tsv"),
                         "--harness", str(tmp / "harness.yaml"),
                         "--target", str(tmp / "target.yaml"),
+                        "--config", str(tmp / "config.yaml"),
                         "--out", str(tmp / "report.md")])
 
 
@@ -300,6 +301,58 @@ class TestDeploy:
         assert "-p 127.0.0.1:8000" not in text
         md = (tmp_path / "report.md").read_text(encoding="utf-8")
         assert "http://127.0.0.1:9999" in md
+
+
+# ── 运行期 SLO 校准（config.slo = 有效 SLO 通道，与 bench 同优先级）─────────
+
+class TestSloCalibration:
+    def test_calibration_marker_when_config_slo_differs(self, tmp_path, monkeypatch):
+        # config.slo（有效 SLO）覆盖 harness.slo；报告出「运行期 SLO 校准」标注，
+        # 部署产物 SLO 头也用有效 SLO（report 与 bench 共用 resolve_slo → 口径一致）
+        monkeypatch.setattr(report, "git_show_config", lambda c: (
+            "serve:\n  max-num-seqs: 256\n"))
+        _write_mini(tmp_path, TSV)          # harness.slo=500/50，target 无 metrics.slo
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(
+            {"slo": {"ttft_p99_ms": 550, "tpot_p99_ms": 55}}), encoding="utf-8")
+        assert _run_main(tmp_path) == 0
+        md = (tmp_path / "report.md").read_text(encoding="utf-8")
+        assert "运行期 SLO 校准" in md
+        assert "500→550 ms" in md and "50→55 ms" in md
+        text = (tmp_path / "deploy-best.sh").read_text(encoding="utf-8")
+        assert "ttft≤550ms" in text          # 有效 SLO 生效
+
+    def test_config_slo_beats_target_metrics(self, tmp_path, monkeypatch):
+        # 优先级：config.slo > target.metrics.slo > harness.slo（逐键覆盖）
+        monkeypatch.setattr(report, "git_show_config", lambda c: (
+            "serve:\n  max-num-seqs: 256\n"))
+        (tmp_path / "harness.yaml").write_text(yaml.safe_dump(
+            {"slo": {"ttft_p99_ms": 500, "tpot_p99_ms": 50},
+             "remote": {"vllm_port": 8000},
+             "runtime": {"image": "img:1"},
+             "workload": {"dataset": "random", "isl": 2048, "osl": 256, "num_prompts": 1000}}),
+            encoding="utf-8")
+        (tmp_path / "target.yaml").write_text(yaml.safe_dump(
+            {"metrics": {"slo": {"ttft_p99_ms": 600, "tpot_p99_ms": 60}}}), encoding="utf-8")
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(
+            {"slo": {"ttft_p99_ms": 700, "tpot_p99_ms": 70}}), encoding="utf-8")
+        (tmp_path / "results.tsv").write_text(TSV, encoding="utf-8")
+        assert _run_main(tmp_path) == 0
+        md = (tmp_path / "report.md").read_text(encoding="utf-8")
+        assert "600→700 ms" in md and "60→70 ms" in md     # 参考=target(600/60)，有效=config(700/70)
+        assert "ttft_p99 ≤ 700 ms" in md
+
+    def test_no_marker_when_config_has_no_slo(self, tmp_path, monkeypatch):
+        # config 缺省（无 slo 键）→ 行为不变：无校准标注，按参考 SLO 判定
+        monkeypatch.setattr(report, "git_show_config", lambda c: (
+            "serve:\n  max-num-seqs: 256\n"))
+        _write_mini(tmp_path, TSV)
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump({"serve": {}}), encoding="utf-8")
+        assert _run_main(tmp_path) == 0
+        md = (tmp_path / "report.md").read_text(encoding="utf-8")
+        assert "运行期 SLO 校准" not in md
+        assert "ttft_p99 ≤ 500 ms" in md      # 参考 SLO 500/50（harness）
+        text = (tmp_path / "deploy-best.sh").read_text(encoding="utf-8")
+        assert "ttft≤500ms" in text
 
 
 # ── 确认（best 回归）────────────────────────────────────────────────────

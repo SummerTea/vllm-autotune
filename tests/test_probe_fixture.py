@@ -156,3 +156,88 @@ def test_multihost_interconnect_emitted(tmp_path):
     assert ic["covered"] is True                 # ping_worker1.txt fixture 存在
     assert any("ping worker1" in c["check"] and c["result"] for c in ic["checks"])
     assert ic["reason"] is None
+
+
+# ── docker-only 模型探测（_collect_plan 命令串选择）─────────────────────
+
+def _head_plan(harness: dict | None = None, config: dict | None = None) -> dict:
+    """构造单 head 主机（source=local）的采集计划条目 dict（key → entry）。"""
+    target = {"hosts": [{"name": "head", "ssh": "user@10.0.0.1", "role": "head"}],
+              "model": {"id": "m", "source": "local", "path": "/models/m"}}
+    plan = probe._collect_plan(target, harness or {"runtime": {}}, config=config)
+    return {e["key"]: e for e in plan["head"]}
+
+
+def test_collect_plan_local_with_image_uses_docker_cmds():
+    """docker-only：source=local + runtime.image 存在 → 模型探测与 vllm_version 走镜像内执行。"""
+    harness = {"runtime": {"image": "vllm/vllm-openai:nightly"}}
+    entries = _head_plan(harness, config={})
+    for key in ("model_config_json", "model_safetensors_index_json", "df_model"):
+        cmd = entries[key]["cmd"]
+        assert "docker run" in cmd and "vllm/vllm-openai:nightly" in cmd
+    # 镜像版本命令选择
+    assert "docker run" in entries["vllm_version"]["cmd"]
+    assert "vllm/vllm-openai:nightly" in entries["vllm_version"]["cmd"]
+    # fixture 文件名保持不变（离线模式按 key→<key>.txt 读取）
+    assert entries["model_config_json"]["fixture"] == "config.json"
+    assert entries["model_safetensors_index_json"]["fixture"] == "safetensors.index.json"
+    assert entries["df_model"]["fixture"] == "df_model.txt"
+
+
+def test_collect_plan_local_without_image_uses_host_cmds():
+    """无镜像（source=local）→ 保持宿主 cat/df/pip 命令，向后兼容。"""
+    entries = _head_plan(config={})
+    assert "docker run" not in entries["model_config_json"]["cmd"]
+    assert "cat /models/m/config.json" in entries["model_config_json"]["cmd"]
+    assert "docker run" not in entries["model_safetensors_index_json"]["cmd"]
+    assert "*.safetensors.index.json" in entries["model_safetensors_index_json"]["cmd"]
+    assert "docker run" not in entries["df_model"]["cmd"]
+    assert "df -B1 --output=avail /models" in entries["df_model"]["cmd"]  # 宿主版取 dirname
+    assert "docker run" not in entries["vllm_version"]["cmd"]
+    assert "pip show vllm" in entries["vllm_version"]["cmd"]
+
+
+def test_collect_plan_config_none_missing_config_yaml_tolerant(tmp_path, monkeypatch):
+    """config=None 且仓库根无 config.yaml（测试在 tmp 目录跑）→ 容错为 {}，不抛错。"""
+    monkeypatch.chdir(tmp_path)  # tmp 目录没有 config.yaml
+    entries = _head_plan(config=None)
+    assert "docker run" not in entries["model_config_json"]["cmd"]
+    assert "cat /models/m/config.json" in entries["model_config_json"]["cmd"]
+
+
+def test_collect_plan_config_runtime_overrides_harness():
+    """逐键合并：config.yaml.runtime.image 覆盖 harness.runtime.image。"""
+    harness = {"runtime": {"image": "img-a"}}
+    config = {"runtime": {"image": "img-b"}}
+    entries = _head_plan(harness, config=config)
+    assert "img-b" in entries["model_config_json"]["cmd"]
+    assert "img-a" not in entries["model_config_json"]["cmd"]
+
+
+def test_collect_plan_hf_source_unchanged_with_image():
+    """source=hf 即使有镜像也走宿主 HF 缓存命令（行为不变）。"""
+    target = {"hosts": [{"name": "head", "ssh": "user@10.0.0.1", "role": "head"}],
+              "model": {"id": "Qwen/Qwen3-32B", "source": "hf"}}
+    plan = probe._collect_plan(target, {"runtime": {"image": "img"}}, config={})
+    entries = {e["key"]: e for e in plan["head"]}
+    assert "docker run" not in entries["model_config_json"]["cmd"]
+    assert "huggingface/hub" in entries["model_config_json"]["cmd"]
+
+
+def test_checklist_gpu_persistence_mode_is_warn_not_fail():
+    """GPU 持久模式为「只建议、不自动改」的系统级旋钮 → fail 降级 warn，不阻断门禁。"""
+    facts = {
+        "cpu": {"governor": "performance"},
+        "gpu": {"gpus": [{"index": 0, "persistence_mode": "Disabled",
+                          "clocks_sm": 1800, "clocks_max_sm": 2000}]},
+        "model_src": {"config_json": None, "note": None},
+        "disk": {"avail_bytes": None},
+        "mem": {"thp": "madvise", "swappiness": 10},
+        "net": {"rdma": {"ibstat_present": False, "ib_devices": None}, "interfaces": []},
+        "numa_groups": [{"numa_node": 0, "gpus": [0]}],
+        "docker": {"version": "20.10"},
+    }
+    items = probe._system_checklist(facts, is_head=True, weights_bytes=None)
+    pm = next(i for i in items if i["name"] == "GPU 持久模式")
+    assert pm["status"] == "warn"
+    assert pm["fix"] == "sudo nvidia-smi -pm 1"  # detail/fix 文案保留

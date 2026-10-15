@@ -31,7 +31,7 @@ workload:                       # 合成 workload 默认；可被 target.yaml �
                                #   按 isl×pct/100 拆共享前缀（--random-prefix-len）+ 余量，
                                #   让 enable-prefix-caching 成为可测维度（random 默认无共享前缀）
 
-exit:                           # 三层退出（主退出 max_hours/stop_at 来自 target.yaml budget）
+exit:                           # 退出机制（主退出 max_hours/stop_at 来自 target.yaml budget；另有平台期/崩溃连击/SLO 不可达）
   plateau_trials: 8             # 连续 N 次未达 keep 阈值（max(best×noise_band_pct/100, noise_k_sigma×σ)）→ 平台期退出
   crash_streak: 3               # 连续 N 次 crash → 停下并报告
 

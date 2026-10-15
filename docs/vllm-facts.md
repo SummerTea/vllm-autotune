@@ -2,7 +2,7 @@
 
 本文件记录本模板所依赖的 vLLM 行为事实，**全部取自 v0.31.0**（2026-10-05 发布的最新稳定版）源码与官方文档。模板实现（`bench.py` / `probe.py` / `setup_remote.sh`）以下列事实为准；升级 vLLM 版本时请重新核对。
 
-> ⚠️ 版本漂移警告：v0.31 为快速迭代版本，落地前请对 `vllm serve --help` / `vllm bench serve --help` 输出与启动日志行做一次冒烟核对。
+> ⚠️ 版本漂移警告：v0.31 为快速迭代版本，落地前请对 `vllm serve --help=all`（bare `--help` 只给配置组索引）/ `vllm bench serve --help` 输出与启动日志行做一次冒烟核对。
 
 ## 1. `vllm bench serve` CLI
 
@@ -91,6 +91,14 @@ Chunked prefill is enabled with max_num_batched_tokens=%d.
 | `--kv-cache-memory-bytes` | None | 覆盖 GMU；`--kv-cache-memory` 不存在 |
 | `-O0..-O3`（`--optimization-level`） | **O2** | O3 当前等同 O2 |
 
+### flag 预校验（bench.py 起服前）
+
+- `bench.py` 用镜像内 **`vllm serve --help=all`**（`docker run --entrypoint vllm <image> serve --help=all`，stdout+stderr 都抓，按 image 缓存到 out-dir）提取合法 flag 集；`config.yaml.serve` 里不在该集的键在起服前 fail-fast crash。
+- **bare `vllm serve --help` 只打印配置组索引**（如 `--help=ModelConfig`，约 41 行），不列任何真实 flag——不可用于预校验；完整列表须 `--help=all`（约 2384 行）。
+- 嵌套点号子参数（如 `--attention_config.indexer_kv_dtype`）是 vLLM `FlexibleArgumentParser` 的真实语法（官方 DeepSeek-V4 部署样例即用此形态，`--help=<dotted>` 查不到它只是帮助机制不枚举子字段）；模板对含 `.` 的键**原样透传**（不 `_`→`-`），并只校验其顶层组（`--attention-config`）——因为 `--help=all` 只列顶层组选项、不列子字段。
+  - 代价（已知边界）：**子字段拼写错误不会被预校验捕获**（fail-fast 只覆盖顶层组名），会由 vLLM 起服时报错或按未知键忽略。
+- 跳过条件：镜像无法提供可用 help（rc≠0，或文本里没有任何真实 flag token）→ 跳过预校验（best-effort，不阻塞 trial）。
+
 ## 5. 健康 / 就绪
 
 - `GET /health` → **200** 健康 / **503** `EngineDeadError`。
@@ -127,4 +135,4 @@ Chunked prefill is enabled with max_num_batched_tokens=%d.
 ## 存疑点
 
 - `--goodput` 落在 v0.6.3 还是 v0.6.3.post1 未逐 tag 确证；"v0.6.3 发布线引入" 是可靠下限。
-- quantization / kv-cache-dtype 的合法值表随版本扩展，需以 `vllm serve --help` 实际输出为准。
+- quantization / kv-cache-dtype 的合法值表随版本扩展，需以 `vllm serve --help=all` 实际输出为准。

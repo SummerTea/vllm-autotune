@@ -45,9 +45,10 @@ for a in "$@"; do
 done
 
 if [ "$SUB" = "serve" ]; then
-  # serve --help：打印样例 help（serve flag 预校验测试用；真实 vllm 镜像同样应答 --help）
+  # serve --help / --help=all：打印样例 help（serve flag 预校验测试用；
+  #   真实 vllm 镜像 bare --help 只给配置组索引，--help=all 才是完整 flag 列表）
   for a in "$@"; do
-    if [ "$a" = "--help" ]; then
+    if [ "$a" = "--help" ] || [ "$a" = "--help=all" ]; then
       echo "usage: vllm serve [options] MODEL"
       echo "  --model MODEL"
       echo "  --max-num-seqs MAX_NUM_SEQS"

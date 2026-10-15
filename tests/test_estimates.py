@@ -213,6 +213,58 @@ class TestValidTpDivisors:
             mtp = tp["min_tp_for_weights"]
             assert mtp is None or mtp in tp["valid_divisors"]
 
+    def test_kv_heads_one_mla_only_constrained_by_heads(self):
+        # 真机 DeepSeek-V4-Flash-0731（MLA）：heads=64 / kv_heads=1 / 权重 166878536440B
+        # / GPU≈85651MiB / gmu=0.88 → tp=8 实机可用；kv_heads<=1 时只受 heads 约数约束
+        tp = probe.valid_tp_divisors(
+            {"num_attention_heads": 64, "num_key_value_heads": 1},
+            int(85651 * 1024**2), 0.88, 166878536440)
+        assert tp["valid_divisors"] == [4, 8, 16, 32, 64]
+        assert tp["min_tp_for_weights"] == 4
+
+    def test_kv_heads_one_all_heads_divisors_without_mem_filter(self):
+        # 无显存约束时 kv_heads=1 → 合法 tp = num_attention_heads 的全部约数（vLLM 复制 KV heads）
+        tp = probe.valid_tp_divisors({"num_attention_heads": 64, "num_key_value_heads": 1}, 0)
+        assert tp["valid_divisors"] == [1, 2, 4, 8, 16, 32, 64]
+        assert tp["min_tp_for_weights"] == 1
+
+    def test_gqa_intersection_rule_unchanged_for_kv_heads_gt_one(self):
+        # surgical：kv_heads>1 仍须同时整除（8%16 != 0 → 16 非法，即便整除 heads）
+        tp = probe.valid_tp_divisors({"num_attention_heads": 64, "num_key_value_heads": 8},
+                                     0)
+        assert 16 not in tp["valid_divisors"]   # 64%16==0 但 8%16!=0
+        assert 8 in tp["valid_divisors"]
+        assert tp["valid_divisors"] == [1, 2, 4, 8]
+
+
+class TestBuildModelProfileMibToBytes:
+    """build_model_profile 的显存单位回归：parse_gpu_smi 的 memory.total 是 MiB，
+    传给 valid_tp_divisors / kv_budget 前须转字节，否则预算被低估 ~2^20 倍 → tp 剪枝全空。"""
+
+    HEAD_FACTS = {
+        "model_src": {
+            "config_json": {
+                "num_attention_heads": 64,
+                "num_key_value_heads": 1,       # MLA
+                "num_hidden_layers": 43,
+                "hidden_size": 4096,
+                "head_dim": 512,
+                "max_position_embeddings": 1048576,
+                "torch_dtype": "bfloat16",
+            },
+            "safetensors_index": {"metadata": {"total_size": 166878536440}},
+        },
+        "gpu": {"gpus": [{"name": "NVIDIA RTX 6000D", "memory_total": 85651}]},  # MiB
+    }
+
+    def test_mib_gpu_mem_yields_nonempty_tp_and_kv_estimate(self):
+        prof = probe.build_model_profile({"id": "DeepSeek-V4-Flash-0731"}, self.HEAD_FACTS, 0.88)
+        assert prof["tp"]["valid_divisors"] == [4, 8, 16, 32, 64]
+        assert prof["tp"]["min_tp_for_weights"] == 4
+        assert prof["kv"]["est_capacity_tokens"] is not None
+        assert prof["kv"]["est_capacity_tokens"] > 0
+        assert "note" not in prof["kv"]   # 不再出现「权重在合法 tp 集合内无法装下」
+
 
 class TestTopoAffinity:
     def test_parse_fixture_topo(self):

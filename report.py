@@ -218,7 +218,8 @@ def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict
            workload: dict | None = None, config_snapshot: str | None = None,
            system_advice: list[dict] | None = None,
            deploy_cmd: list[str] | None = None,
-           noise_band_pct: float = 3.0, noise_k_sigma: float = 2.0) -> str:
+           noise_band_pct: float = 3.0, noise_k_sigma: float = 2.0,
+           slo_calibrated: dict | None = None) -> str:
     sl = {**DEFAULT_SLO, **(slo or {})}
     wl = workload or {}
     counts = Counter(r.get("status") for r in rows)
@@ -231,6 +232,11 @@ def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict
                  f"num_prompts=`{wl.get('num_prompts', 1000)}`"
                  + (f"，ref_concurrency=`{wl.get('ref_concurrency')}`" if wl.get("ref_concurrency") else ""))
     lines.append(f"- SLO：ttft_p99 ≤ {sl['ttft_p99_ms']} ms；tpot_p99 ≤ {sl['tpot_p99_ms']} ms")
+    if slo_calibrated:
+        ref = {**DEFAULT_SLO, **slo_calibrated}
+        lines.append(f"- ⚠ **运行期 SLO 校准**：参考 ttft {ref['ttft_p99_ms']}→{sl['ttft_p99_ms']} ms、"
+                     f"tpot {ref['tpot_p99_ms']}→{sl['tpot_p99_ms']} ms 为有效 SLO"
+                     "（本报告 SLO 达标列与 best 判定均按有效 SLO）。")
     lines.append(f"- trial 数：{len(rows)}（keep={counts.get('keep', 0)}，"
                  f"discard={counts.get('discard', 0)}，crash={counts.get('crash', 0)}，"
                  f"best={counts.get('best', 0)}，confirm={counts.get('confirm', 0)}）")
@@ -350,6 +356,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--results", default="results.tsv")
     ap.add_argument("--harness", default="harness.yaml")
     ap.add_argument("--target", default="target.yaml")
+    ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--env-report", default="env_report.md")
     ap.add_argument("--model-profile", default="model_profile.json")
     ap.add_argument("--out", default="report.md")
@@ -368,7 +375,23 @@ def main(argv: list[str] | None = None) -> int:
     if os.path.exists(args.target):
         with open(args.target, encoding="utf-8") as f:
             target = yaml.safe_load(f) or {}
-    slo = {**harness.get("slo", {}), **((target.get("metrics") or {}).get("slo") or {})}
+    config = {}
+    if os.path.exists(args.config):
+        with open(args.config, encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+    # 有效 SLO：harness.slo ⊕ target.metrics.slo ⊕ config.slo（与 bench.py 同口径，共用 resolve_slo）
+    try:
+        from bench import resolve_slo
+    except ImportError:  # pragma: no cover — 降级：bench 不可导入时内联同表达式
+        def resolve_slo(harness: dict, target: dict, config: dict) -> dict:
+            return {**harness.get("slo", {}),
+                    **((target.get("metrics") or {}).get("slo") or {}),
+                    **(config.get("slo") or {})}
+    target_slo = {**harness.get("slo", {}), **((target.get("metrics") or {}).get("slo") or {})}
+    config_slo = config.get("slo") or {}
+    slo = resolve_slo(harness, target, config)
+    # 校准标注：config.slo 非空且与参考（target 口径）不同 → 报告出「运行期 SLO 校准」
+    slo_calibrated = target_slo if (config_slo and config_slo != target_slo) else None
     workload = {**harness.get("workload", {}), **(target.get("workload") or {})}
     # 确认回归的噪声参数（harness.bench；缺省与 harness.yaml 一致）
     bench_cfg = harness.get("bench") or {}
@@ -396,7 +419,8 @@ def main(argv: list[str] | None = None) -> int:
     deploy_cmd = build_deploy_cmd(snapshot, target, harness, best, slo) if (best is not None and snapshot) else None
     md = render(rows, slo, baseline, best, flagged, imp, model=model, workload=workload,
                 config_snapshot=snapshot, system_advice=extract_system_advice(env_report),
-                deploy_cmd=deploy_cmd, noise_band_pct=noise_band_pct, noise_k_sigma=noise_k_sigma)
+                deploy_cmd=deploy_cmd, noise_band_pct=noise_band_pct, noise_k_sigma=noise_k_sigma,
+                slo_calibrated=slo_calibrated)
 
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(md)

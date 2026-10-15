@@ -24,6 +24,7 @@ model:
   # hf_token_env: HF_TOKEN      # gated 模型时填写环境变量名
 
 metrics:                        # 可选。缺省则用 harness.yaml 的默认 SLO。
+  # 此 SLO 应为该主机/模型可达值；若基线不可达，agent 会按 program.md 做一次性校准并在 report 标注，不会为此打断你。
   slo:
     ttft_p99_ms: 500
     tpot_p99_ms: 50
@@ -39,3 +40,8 @@ workload:                       # 可选。缺省则用 harness.yaml 默认。
 budget:                         # 主退出条件（过夜场景必填；max_hours 与 stop_at 二选一，同时填写时 max_hours 优先）
   max_hours: 10                 # 运行满 N 小时后停止
   # stop_at: "08:00"            # 或指定停止时刻（启动后下一个该时刻，按编排机本地时钟，跨天自动理解）
+
+# fallbacks:                    # 可选。预授权运行期自主切换的候选（需工具支持；当前未实现，勿依赖）。
+#   - host: user@10.0.0.3       # 备用主机
+#     model:
+#       id: Qwen/Qwen3-32B      # 备用模型（可省略 = 沿用主模型）

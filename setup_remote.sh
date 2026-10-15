@@ -66,8 +66,15 @@ ssh_addr = heads[0].get("ssh")
 if not ssh_addr:
     sys.exit("target.yaml 的 head 主机缺少 ssh 字段")
 harness = load("harness.yaml")
+# config.yaml 的 runtime 逐键覆盖 harness（docker-only 时镜像通常写在 config.yaml）；
+# 文件缺失/非法不致命（与 bench.py 的 effective_runtime 同口径）
+try:
+    with open("config.yaml") as f:
+        config = yaml.safe_load(f) or {}
+except (FileNotFoundError, yaml.YAMLError):
+    config = {}
 vllm_python = (harness.get("remote") or {}).get("vllm_python") or "python"
-runtime = harness.get("runtime") or {}
+runtime = {**(harness.get("runtime") or {}), **((config.get("runtime") or {}))}
 print(ssh_addr)
 print(heads[0].get("work_dir") or "")
 print(vllm_python)
@@ -103,7 +110,7 @@ main() {
     exit 1
   fi
 
-  echo "== setup_remote.sh：目标 head 主机 $head_ssh（python=$vllm_python，work_dir=$work_dir） =="
+  echo "== setup_remote.sh：目标 head 主机 ${head_ssh}（python=${vllm_python}，work_dir=${work_dir}） =="
   if ssh "${SSH_OPTS[@]}" "$head_ssh" \
       "bash -s $(sh_quote "$work_dir") $(sh_quote "$vllm_python") $(sh_quote "$runtime_image")" <<'RMT'
 # ── 远端脚本（在 head 主机上执行）──────────────────────────────
@@ -112,6 +119,12 @@ WORK_DIR="$1"; VLLM_PYTHON="$2"; RUNTIME_IMAGE="$3"
 case "$WORK_DIR" in
   '~/'*) WORK_DIR="$HOME${WORK_DIR#\~}" ;;
 esac
+# 解释器：harness.remote.vllm_python 仅为首选，缺失回退 python3/python（与 run.sh 同口径）
+if ! command -v "$VLLM_PYTHON" >/dev/null 2>&1; then
+  for c in python3 python; do
+    if command -v "$c" >/dev/null 2>&1; then VLLM_PYTHON="$c"; break; fi
+  done
+fi
 PASS=0; FAIL=0
 ok()  { printf '  [PASS] %s\n' "$1"; PASS=$((PASS+1)); }
 bad() { printf '  [FAIL] %s\n' "$1"; FAIL=$((FAIL+1)); }

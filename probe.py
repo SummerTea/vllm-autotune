@@ -134,11 +134,34 @@ def _cmd(key: str, cmd: str, fixture: str | None = None) -> dict:
     return {"key": key, "cmd": cmd, "fixture": fixture or f"{key}.txt"}
 
 
-def _collect_plan(target: dict, harness: dict) -> dict[str, list]:
-    """每台主机的采集计划：list of (key, cmd, fixture 文件名)。"""
+def _runtime_image(harness: dict, config: dict | None) -> str | None:
+    """运行时镜像 = harness.runtime 与 config.yaml.runtime 逐键合并（config 覆盖）。
+    config 缺省（None）时容错读仓库根 config.yaml：缺失/非法 → {}（测试可能在无 config.yaml 的目录跑）。"""
+    if config is None:
+        try:
+            config = load_yaml("config.yaml", required=False)
+        except Exception:
+            config = {}
+    runtime = {**(harness.get("runtime") or {}), **((config.get("runtime") or {}))}
+    img = runtime.get("image")
+    return str(img) if img else None
+
+
+def _docker_cmd(img: str, mp: str, inner: str) -> str:
+    """在镜像内执行采集命令串：模型路径只读挂到容器内同一绝对路径，--entrypoint sh -c。
+    整串经 SSH 远端 shell 执行，故内层命令用 shlex.quote 整体引用（远程不再二次解释）。"""
+    return (f"docker run --rm --pull=never -v {shlex.quote(mp)}:{shlex.quote(mp)}:ro "
+            f"--entrypoint sh {shlex.quote(img)} -c {shlex.quote(inner)}")
+
+
+def _collect_plan(target: dict, harness: dict, config: dict | None = None) -> dict[str, list]:
+    """每台主机的采集计划：list of (key, cmd, fixture 文件名)。
+    docker-only：source=local + runtime.image 可解析时，模型探测改为在镜像内执行
+    （宿主 SSH 用户可能不可读模型目录，而容器内 root 可读）。"""
     remote = harness.get("remote") or {}
     vllm_python = remote.get("vllm_python", "python")
     model = target.get("model") or {}
+    image = _runtime_image(harness, config)
     plan: dict[str, list] = {}
     for h in target.get("hosts", []):
         name = h["name"]
@@ -158,8 +181,11 @@ def _collect_plan(target: dict, harness: dict) -> dict[str, list]:
             _cmd("ibv_devinfo", "command -v ibv_devinfo >/dev/null 2>&1 && ibv_devinfo -l || true"),
             _cmd("docker_version", "docker --version 2>/dev/null || true"),
             _cmd("docker_images", "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null || true"),
-            # 用 pip show（不 import）避免在主机上写入 torch/vllm 缓存
-            _cmd("vllm_version", f"{shlex.quote(vllm_python)} -m pip show vllm 2>/dev/null || true"),
+            # 镜像可解析 → 镜像内 vllm --version（docker-only 主机无宿主 pip 版 vllm）；
+            # 否则用 pip show（不 import）避免在主机上写入 torch/vllm 缓存
+            _cmd("vllm_version",
+                 (f"docker run --rm --pull=never --entrypoint vllm {shlex.quote(image)} --version 2>/dev/null || true"
+                  if image else f"{shlex.quote(vllm_python)} -m pip show vllm 2>/dev/null || true")),
             _cmd("hostname", "hostname"),
             _cmd("python3_version", "python3 --version 2>&1 || true"),
         ]
@@ -167,13 +193,27 @@ def _collect_plan(target: dict, harness: dict) -> dict[str, list]:
             src = model.get("source", "hf")
             if src == "local" and model.get("path"):
                 mp = model["path"]
-                cmds += [
-                    _cmd("model_config_json", f"cat {shlex.quote(mp)}/config.json 2>/dev/null || true", "config.json"),
-                    _cmd("model_safetensors_index_json",
-                         f"cat {shlex.quote(mp)}/*.safetensors.index.json 2>/dev/null || true",
-                         "safetensors.index.json"),
-                    _cmd("df_model", f"df -B1 --output=avail {shlex.quote(os.path.dirname(mp))} 2>/dev/null | tail -1 || true"),
-                ]
+                if image:  # docker-only：宿主 SSH 用户不可读模型目录 → 镜像内 root 只读挂载探测
+                    cmds += [
+                        _cmd("model_config_json",
+                             _docker_cmd(image, mp, f"cat {shlex.quote(mp)}/config.json") + " 2>/dev/null || true",
+                             "config.json"),
+                        _cmd("model_safetensors_index_json",
+                             _docker_cmd(image, mp, f"cat {shlex.quote(mp)}/*.safetensors.index.json")
+                             + " 2>/dev/null || true",
+                             "safetensors.index.json"),
+                        _cmd("df_model",
+                             _docker_cmd(image, mp, f"df -B1 --output=avail {shlex.quote(mp)}")
+                             + " 2>/dev/null | tail -1 || true"),
+                    ]
+                else:
+                    cmds += [
+                        _cmd("model_config_json", f"cat {shlex.quote(mp)}/config.json 2>/dev/null || true", "config.json"),
+                        _cmd("model_safetensors_index_json",
+                             f"cat {shlex.quote(mp)}/*.safetensors.index.json 2>/dev/null || true",
+                             "safetensors.index.json"),
+                        _cmd("df_model", f"df -B1 --output=avail {shlex.quote(os.path.dirname(mp))} 2>/dev/null | tail -1 || true"),
+                    ]
             else:  # source=hf：尝试本地 HF 缓存（~/.cache/huggingface/hub/models--<id>/snapshots/*）
                 hid = model.get("id", "").split("@")[0].replace("/", "--")
                 glob = f"~/.cache/huggingface/hub/models--{shlex.quote(hid)}/snapshots/*"
@@ -483,7 +523,9 @@ def kv_bytes_per_token(config: dict, kv_dtype_bytes: int = KV_DTYPE_BYTES) -> in
 
 def valid_tp_divisors(config: dict, gpu_mem_bytes: int, gmu: float = DEFAULT_GMU,
                       weights_bytes: int | None = None) -> dict:
-    """合法 tp 集合：同时整除 num_attention_heads 与 num_key_value_heads（program.md:72），
+    """合法 tp 集合：tp 须整除 num_attention_heads，且 kv_heads>1（GQA）时还须同时整除
+    num_key_value_heads。例外：kv_heads<=1（MLA 的 num_key_value_heads=1、MQA）时 vLLM
+    会在 tp>kv_heads 时复制 KV heads，故合法 tp 只受 heads 约数约束（program.md:72）。
     且单卡权重 ≤ gpu_mem × gmu。min_tp_for_weights 为满足显存的最小 tp。"""
     heads = config.get("num_attention_heads")
     if not heads:
@@ -492,7 +534,10 @@ def valid_tp_divisors(config: dict, gpu_mem_bytes: int, gmu: float = DEFAULT_GMU
     wb = weights_bytes
     if wb is None:
         wb, _ = weight_bytes(None, config)
-    divs = [t for t in range(1, heads + 1) if heads % t == 0 and kv_heads % t == 0]
+    if kv_heads <= 1:  # MLA（num_key_value_heads=1）/ MQA：只受 heads 约束
+        divs = [t for t in range(1, heads + 1) if heads % t == 0]
+    else:              # GQA：同时整除 heads 与 kv_heads
+        divs = [t for t in range(1, heads + 1) if heads % t == 0 and kv_heads % t == 0]
     budget = gpu_mem_bytes * gmu
     if wb and budget:
         # 最小 tp 必须是合法约数（否则与 valid_divisors 矛盾）；装不下 → None
@@ -643,7 +688,8 @@ def _system_checklist(facts: dict, is_head: bool, weights_bytes: int | None) -> 
     else:
         bad = [g["index"] for g in gpus if g.get("persistence_mode") != "Enabled"]
         if bad:
-            items.append({"name": "GPU 持久模式", "status": "fail",
+            # 模板「只建议、不自动改」的系统级旋钮；不影响测量有效性（只影响驱动初始化/启动时延），不阻断门禁
+            items.append({"name": "GPU 持久模式", "status": "warn",
                           "detail": f"GPU {bad} 未开启持久模式",
                           "fix": "sudo nvidia-smi -pm 1"})
         else:
@@ -753,7 +799,8 @@ def build_model_profile(model: dict, head_facts: dict, gmu: float) -> dict:
     src = head_facts["model_src"]
     config = normalize_config(src["config_json"])
     gpus = head_facts["gpu"]["gpus"] or []
-    gpu_mem = min((g.get("memory_total") or 0 for g in gpus), default=0)
+    # parse_gpu_smi 的 memory.total 单位是 MiB → 转字节再用于显存估算（与权重字节一致）
+    gpu_mem_bytes = min((g.get("memory_total") or 0 for g in gpus), default=0) * 1024 * 1024
 
     if config is None:
         return {
@@ -779,7 +826,7 @@ def build_model_profile(model: dict, head_facts: dict, gmu: float) -> dict:
         "head_dim": effective_head_dim(config),  # head_dim=0 → hidden/heads 兜底
         "vocab_size": config.get("vocab_size"),
     }
-    tp = valid_tp_divisors(config, gpu_mem, gmu, wb) if gpu_mem else {
+    tp = valid_tp_divisors(config, gpu_mem_bytes, gmu, wb) if gpu_mem_bytes else {
         "valid_divisors": [], "min_tp_for_weights": None}
     kv_bytes = kv_bytes_per_token(config)
     max_len = config.get("max_position_embeddings")
@@ -789,8 +836,8 @@ def build_model_profile(model: dict, head_facts: dict, gmu: float) -> dict:
         kv_note = "arch not covered; rely on baseline-boot calibration"
     elif tp["min_tp_for_weights"] is None:
         kv_note = "权重在合法 tp 集合内无法装下（无法估算 KV 容量）"
-    elif gpu_mem and wb:
-        kv_budget = gpu_mem * gmu - wb / tp["min_tp_for_weights"]
+    elif gpu_mem_bytes and wb:
+        kv_budget = gpu_mem_bytes * gmu - wb / tp["min_tp_for_weights"]
         est_tokens = max(0, int(kv_budget // kv_bytes))
     gpu_name = gpus[0]["name"] if gpus else None
     bw = hbm_bw_gbps_for(gpu_name)
@@ -921,10 +968,11 @@ def main(argv: list[str] | None = None) -> int:
 
     target = load_yaml(args.target)
     harness = load_yaml(args.harness)
+    config = load_yaml("config.yaml", required=False)
     head = validate_target(target)
     mode = "fixtures" if args.fixtures else "live"
 
-    plan = _collect_plan(target, harness)
+    plan = _collect_plan(target, harness, config)
     os.makedirs(args.out_dir, exist_ok=True)
 
     # 并行采集所有主机

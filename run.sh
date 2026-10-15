@@ -106,7 +106,7 @@ resolve_remote_dir() {  # $1 = work_dir
     return 1
   fi
   if [ -n "$REMOTE_DIR_ENV" ] && [ "$REMOTE_DIR_ENV" != "$work_dir" ]; then
-    echo "警告: .env 的 REMOTE_DIR（$REMOTE_DIR_ENV）覆盖 target.yaml 的 work_dir（$work_dir）；" \
+    echo "警告: .env 的 REMOTE_DIR（${REMOTE_DIR_ENV}）覆盖 target.yaml 的 work_dir（${work_dir}）；" \
          "REMOTE_DIR 已弃用，建议改 target.yaml" >&2
     printf '%s' "$REMOTE_DIR_ENV"
   else
@@ -119,7 +119,7 @@ trial_alive_state() {  # $1 = head_ssh
   local head_ssh="$1" p out rc=0
   p="$(path_for_remote "$REMOTE_DIR")"
   out="$(ssh "${SSH_OPTS[@]}" "$head_ssh" \
-    "if [ -f $p/bench.pid ] && kill -0 \"\$(cat \"$p/bench.pid\")\" 2>/dev/null; then echo ALIVE; else echo DEAD; fi" 2>/dev/null)" || rc=$?
+    "if [ -f $p/bench.pid ] && kill -0 \"\$(cat $p/bench.pid)\" 2>/dev/null; then echo ALIVE; else echo DEAD; fi" 2>/dev/null)" || rc=$?
   if [ "$rc" -ne 0 ]; then echo UNKNOWN; return; fi
   case "$out" in ALIVE) echo ALIVE ;; DEAD) echo DEAD ;; *) echo UNKNOWN ;; esac
 }
@@ -144,7 +144,7 @@ cmd_start() {  # $1 = 可选 "--detect-gmu"：启动 gmu 预检而非正式 tria
   local f
   for f in config.yaml harness.yaml target.yaml bench.py; do
     if [ ! -f "$f" ]; then
-      echo "缺少 $f（请确认在仓库根目录）" >&2
+      echo "缺少 ${f}（请确认在仓库根目录）" >&2
       return 1
     fi
   done
@@ -172,15 +172,18 @@ cmd_start() {  # $1 = 可选 "--detect-gmu"：启动 gmu 预检而非正式 tria
     || { echo "rsync 同步到 $head_ssh 失败" >&2; return 1; }
 
   # 远端 nohup 启动（冻结契约：--config/--harness/--target/--out-dir 与 bench.pid）。
-  # 附加 </dev/null 与 mkdir -p：防 ssh 因后台进程占用 stdin 而挂起（不改 bench.py 契约）。
   local env_str kv
   env_str=""
   # bash 3.2 (macOS 自带) 下 set -u + 空数组展开会报 unbound；仅当非空时展开
   if [ "${#config_env[@]}" -gt 0 ]; then
     for kv in "${config_env[@]}"; do env_str+=" $(sh_quote "$kv")"; done
   fi
+  # 远端启动：必须是「简单命令 + 全重定向后台」，ssh 才会立即返回——
+  # 远端 shell 会等待任何仍持有会话 fd 的后台子 shell（实测：`{ }`/`&&` 列表式后台会挂到
+  # trial 结束；`nohup <cmd> >f 2>&1 </dev/null &` 才秒回）。解释器：harness.remote.vllm_python
+  # 仅作首选，缺失回退 python3/python（主机常只有 python3）。
   if ! ssh "${SSH_OPTS[@]}" -n "$head_ssh" \
-      "mkdir -p $p && cd $p && nohup env$env_str $(path_for_remote "$vllm_python") bench.py --config config.yaml --harness harness.yaml --target target.yaml --out-dir .$bench_extra </dev/null > bench.stdout 2>&1 & echo \$! > bench.pid"; then
+      "mkdir -p $p; nohup env$env_str sh -c 'cd $p && PY=\$(command -v $(path_for_remote "$vllm_python") 2>/dev/null || command -v python3 2>/dev/null || command -v python 2>/dev/null) && exec \"\$PY\" bench.py --config config.yaml --harness harness.yaml --target target.yaml --out-dir .$bench_extra' > $p/bench.stdout 2>&1 < /dev/null & echo \$! > $p/bench.pid"; then
     echo "远端启动失败（请查 $head_ssh:$p/bench.stdout）" >&2
     return 1
   fi
@@ -276,7 +279,7 @@ cmd_poll() {
       return 1
       ;;
     *)
-      echo "未知 state=$state；原样输出远端 status.json："
+      echo "未知 state=${state}；原样输出远端 status.json："
       printf '%s\n' "$raw"
       return 3
       ;;

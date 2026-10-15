@@ -186,6 +186,14 @@ def effective_runtime(harness: dict, config: dict) -> dict:
     return {**(harness.get("runtime") or {}), **((config.get("runtime") or {}))}
 
 
+def resolve_slo(harness: dict, target: dict, config: dict) -> dict:
+    """有效 SLO = harness.slo ⊕ target.metrics.slo ⊕ config.slo（后者覆盖前者）。
+    config.slo 是运行期校准（有效 SLO）的 agent 可写通道（config.yaml 为 agent 唯一可编辑文件）；
+    target 的 SLO 为「参考 SLO」，运行期不改其语义。与 report.py 共用本函数保证口径一致。"""
+    return {**harness.get("slo", {}), **((target.get("metrics") or {}).get("slo") or {}),
+            **(config.get("slo") or {})}
+
+
 def container_model_path(runtime: dict) -> str:
     """容器内模型挂载点，默认 /model。"""
     return str(runtime.get("container_model_path") or "/model")
@@ -197,12 +205,20 @@ def docker_clean_stale(docker_cmd: str) -> None:
     _run_local([docker_cmd, "rm", "-f", "vllm-autotune-trial"])
 
 
+def _flag_name(k: str) -> str:
+    """serve 键 → 不带 `--` 的 flag 名：含 `.` 的嵌套子参数原样返回
+    （如 attention_config.indexer_kv_dtype，vLLM 子参数约定保留下划线），
+    否则 `_`→`-`（顶层 kebab；vLLM 顶层 flag 本身 `_`/`-` 都接受）。"""
+    s = str(k)
+    return s if "." in s else s.replace("_", "-")
+
+
 def _serve_flags(config: dict, port: int) -> list[str]:
     """serve 参数 token（不含模型位）：kebab flag + 布尔约定 + --port 兜底。
     布尔：true → 裸 flag；false → 省略（保持默认）；no-<flag>: true 原样透传。"""
     args = []
     for k, v in (config.get("serve") or {}).items():
-        flag = "--" + str(k).replace("_", "-")
+        flag = "--" + _flag_name(k)
         if isinstance(v, bool):
             if v:
                 args.append(flag)
@@ -215,7 +231,7 @@ def _serve_flags(config: dict, port: int) -> list[str]:
 
 
 def _known_serve_flags(help_text: str) -> set[str]:
-    """从 `vllm serve --help` 提取全部选项名。每个空白 token 先规范化：
+    """从 `vllm serve --help=all` 提取全部选项名。每个空白 token 先规范化：
     剥首部 `[`/`(` 与尾部 `]`/`)`/`,`（覆盖 usage 行 `[--max-num-seqs N]` 等），再取 `--` 开头的。
     自动覆盖 BooleanOptionalAction 的 `--enable-x, --no-enable-x` 对。"""
     flags = set()
@@ -227,41 +243,59 @@ def _known_serve_flags(help_text: str) -> set[str]:
 
 
 def _unknown_serve_flags(serve: dict, known: set[str]) -> list[str]:
-    """config.serve 键 → `--<kebab>`（下划线→连字符）后不在 help 选项集里的列表（排序稳定）。
+    """config.serve 键 → 候选 `--<flag>` 不在 known 里的列表（排序稳定）。
+    嵌套子参数（键含 `.`）只校验顶层 root（如 attention_config.indexer_kv_dtype
+    看 `--attention-config`）：vllm `--help=all` 只列顶层组选项，不列嵌套子字段。
     no-<flag> 键同规则：`--no-enable-x` 有效当且仅当它在 known 里。"""
+    def _valid(k: str) -> bool:
+        s = str(k)
+        root = s.split(".")[0] if "." in s else s
+        return "--" + root.replace("_", "-") in known
+
     return sorted(
-        "--" + str(k).replace("_", "-")
+        "--" + _flag_name(k)
         for k in serve
-        if "--" + str(k).replace("_", "-") not in known
+        if not _valid(k)
     )
 
 
+def _usable_help_text(text: str) -> bool:
+    """help 文本是否可用：至少有一个 `--` 开头且不以 `--help` 开头的 token。
+    现代 vLLM bare `--help` 只打印配置组索引（--help=ModelConfig 之类），
+    判定不可用 → 调用方跳过预校验（fail-open）。"""
+    return any(tok.startswith("--") and not tok.startswith("--help")
+               for tok in text.split())
+
+
 def _get_serve_help(docker_cmd: str, runtime: dict, cache_dir: str) -> str | None:
-    """镜像内 `vllm serve --help` 文本：docker run --pull=never --entrypoint vllm <image> serve --help
-    （stdout+stderr 都抓；部分 CLI 打到 stderr）。按 image 缓存到 <cache_dir>/.serve_help_<hash>.txt，
-    命中即复用不重跑。失败/空 → None（调用方跳过校验，不阻塞 trial）。"""
+    """镜像内 `vllm serve --help=all` 文本（失败/不可用再退回 `vllm serve --help`）：
+    docker run --pull=never --entrypoint vllm <image> serve --help=all
+    （stdout+stderr 都抓；部分 CLI 打到 stderr）。按 image 缓存到
+    <cache_dir>/.serve_help_<hash>.txt（缓存最终选用的那份文本），命中即复用不重跑。
+    两份都失败/不可用 → None（调用方跳过校验，不阻塞 trial）。"""
     image = str(runtime.get("image"))
     cache_path = os.path.join(cache_dir, f".serve_help_{hashlib.sha256(image.encode()).hexdigest()[:12]}.txt")
     if os.path.exists(cache_path):
         try:
             with open(cache_path, encoding="utf-8", errors="replace") as f:
                 text = f.read()
-            if text.strip():
+            if _usable_help_text(text):
                 return text
         except OSError:
             pass
-    rc, out, err = _run_local(
-        [docker_cmd, "run", "--rm", "--pull=never", "--entrypoint", "vllm", image, "serve", "--help"],
-        timeout=60)
-    text = (out or "") + (err or "")
-    if rc == 0 and text.strip():
-        try:
-            os.makedirs(cache_dir, exist_ok=True)
-            with open(cache_path, "w", encoding="utf-8") as f:
-                f.write(text)
-        except OSError:
-            pass
-        return text
+    for help_arg in ("--help=all", "--help"):
+        rc, out, err = _run_local(
+            [docker_cmd, "run", "--rm", "--pull=never", "--entrypoint", "vllm", image, "serve", help_arg],
+            timeout=60)
+        text = (out or "") + (err or "")
+        if rc == 0 and _usable_help_text(text):
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+            except OSError:
+                pass
+            return text
     return None
 
 
@@ -470,13 +504,13 @@ def _run_gmu_probe(docker_cmd: str, runtime: dict, config: dict, target: dict, p
         # m1：探测路径也预校验 config.serve 的 flag 名（与 trial 同口径）——typo 不伪装成"无可用 gmu"
         help_text = _get_serve_help(docker_cmd, runtime, out_dir)
         if help_text is None:
-            log_fh.write(f"=== bench.py {_now_iso()} serve --help 不可用，跳过 flag 预校验\n".encode())
+            log_fh.write(f"=== bench.py {_now_iso()} serve --help=all 不可用，跳过 flag 预校验\n".encode())
             log_fh.flush()
         else:
             unknown = _unknown_serve_flags(config.get("serve") or {}, _known_serve_flags(help_text))
             if unknown:
                 reason = (f"未知 vllm serve 参数：{unknown}"
-                          "（对照镜像 `vllm serve --help`；请修正 config.yaml.serve）")
+                          "（对照镜像 `vllm serve --help=all`；请修正 config.yaml.serve）")
                 log_fh.write(f"=== bench.py {_now_iso()} flag 预校验失败: {reason}\n".encode())
                 log_fh.flush()
                 msg = f"gmu 探测失败：{reason}"
@@ -801,9 +835,9 @@ def main(argv: list[str] | None = None) -> int:
     seed = int(bench_cfg.get("seed", DEFAULT_SEED))
     trust_remote_code = bool((target.get("model") or {}).get("trust_remote_code", False))
 
-    # workload / slo：target 逐键覆盖 harness（program.md:11）
+    # workload / slo：target 逐键覆盖 harness；config.slo（运行期校准有效 SLO）再覆盖 target
     workload = {**harness.get("workload", {}), **(target.get("workload") or {})}
-    slo = {**harness.get("slo", {}), **((target.get("metrics") or {}).get("slo") or {})}
+    slo = resolve_slo(harness, target, config)
     ref_conc = int(workload.get("ref_concurrency") or bench_cfg.get("ref_concurrency", DEFAULT_REF_CONCURRENCY))
 
     os.makedirs(out_dir, exist_ok=True)
@@ -846,16 +880,16 @@ def main(argv: list[str] | None = None) -> int:
                              "请人工预先 docker pull 或改用已存在的镜像）")
         # 先清残留同名容器（幂等）：硬杀遗留的同名容器不算外来共租，须在共租检测前清理
         docker_clean_stale(args.docker_cmd)
-        # serve flag 预校验：对照镜像 `vllm serve --help`（按 image 缓存），未知名直接 fail-fast
+        # serve flag 预校验：对照镜像 `vllm serve --help=all`（按 image 缓存），未知名直接 fail-fast
         help_text = _get_serve_help(args.docker_cmd, runtime, out_dir)
         if help_text is None:
-            log_fh.write(f"=== bench.py {_now_iso()} serve --help 不可用，跳过 flag 预校验\n".encode())
+            log_fh.write(f"=== bench.py {_now_iso()} serve --help=all 不可用，跳过 flag 预校验\n".encode())
             log_fh.flush()
         else:
             unknown = _unknown_serve_flags(config.get("serve") or {}, _known_serve_flags(help_text))
             if unknown:
                 raise TrialCrash(f"未知 vllm serve 参数：{unknown}"
-                                 "（对照镜像 `vllm serve --help`；请修正 config.yaml.serve）")
+                                 "（对照镜像 `vllm serve --help=all`；请修正 config.yaml.serve）")
         # 共租检测（起 serve 之前）：非独占主机上其他 GPU 进程会污染测量
         foreign_apps = _detect_co_tenants()
         contention = None

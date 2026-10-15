@@ -152,6 +152,68 @@ options:
         # no-<flag> 键也按 known 校验
         assert bench._unknown_serve_flags({"no-bogus-flag": True}, known) == ["--no-bogus-flag"]
 
+    def test_flag_name(self):
+        # 含 `.` 的嵌套子参数原样返回；普通键 `_`→`-`（kebab）
+        assert bench._flag_name("max_num_seqs") == "max-num-seqs"
+        assert bench._flag_name("max-num-seqs") == "max-num-seqs"
+        assert bench._flag_name("attention_config.indexer_kv_dtype") == \
+            "attention_config.indexer_kv_dtype"
+
+    def test_unknown_serve_flags_underscore_and_nested(self):
+        # m2：`_`→`-` 键合法；嵌套子参数（含 .）只校验顶层 root
+        #   （vllm `--help=all` 只列 `--attention-config`，不列嵌套子字段）
+        known = bench._known_serve_flags(
+            "--model MODEL\n--max-num-seqs MAX_NUM_SEQS\n--attention-config ATTENTION_CONFIG\n")
+        assert bench._unknown_serve_flags({"max_num_seqs": 1}, known) == []
+        assert bench._unknown_serve_flags(
+            {"attention_config.indexer_kv_dtype": "fp8"}, known) == []
+        # root 未知 → 判未知（错误列表按原样透传嵌套键）
+        assert bench._unknown_serve_flags({"bogus_config.x": 1}, known) == ["--bogus_config.x"]
+        # 未知顶层仍判未知
+        assert bench._unknown_serve_flags({"bogus-flag": 1}, known) == ["--bogus-flag"]
+
+    def test_get_serve_help_unusable_group_index_skips(self, tmp_path, monkeypatch):
+        # 现代 vLLM bare --help 只打印配置组索引（--help=ModelConfig 之类），无真实 flag →
+        # --help=all 与 --help 都判定不可用 → 返回 None（调用方跳过预校验）
+        group_index = ("usage: vllm serve [options] MODEL\n"
+                       "options:\n"
+                       "  --help\n"
+                       "  ModelConfig:\n"
+                       "    --help=ModelConfig\n"
+                       "  EngineConfig:\n"
+                       "    --help=EngineConfig\n"
+                       "  KVConfig:\n"
+                       "    --help=KVConfig\n")
+        calls = []
+
+        def fake_run(cmd, timeout=10):
+            calls.append(cmd)
+            assert cmd[-1] in ("--help=all", "--help")
+            return 0, group_index, ""
+
+        monkeypatch.setattr(bench, "_run_local", fake_run)
+        assert bench._get_serve_help("docker", {"image": "img:1"}, str(tmp_path)) is None
+        # 先试 --help=all，不可用再退回 --help
+        assert [c[-1] for c in calls] == ["--help=all", "--help"]
+        # 两份都不可用 → 不写缓存
+        assert list(tmp_path.iterdir()) == []
+
+    def test_resolve_slo_priority(self):
+        # 有效 SLO = harness.slo ⊕ target.metrics.slo ⊕ config.slo（后者覆盖前者）
+        harness = {"slo": {"ttft_p99_ms": 500, "tpot_p99_ms": 50}}
+        target = {"metrics": {"slo": {"ttft_p99_ms": 600, "tpot_p99_ms": 60}}}
+        # config.slo 覆盖 target.metrics.slo（逐键覆盖）
+        assert bench.resolve_slo(harness, target, {"slo": {"ttft_p99_ms": 700}}) == \
+            {"ttft_p99_ms": 700, "tpot_p99_ms": 60}
+        assert bench.resolve_slo(harness, target, {"slo": {"ttft_p99_ms": 700, "tpot_p99_ms": 70}}) == \
+            {"ttft_p99_ms": 700, "tpot_p99_ms": 70}
+        # target.metrics.slo 覆盖 harness.slo
+        assert bench.resolve_slo(harness, target, {}) == {"ttft_p99_ms": 600, "tpot_p99_ms": 60}
+        # config 缺省 → 行为不变（target 覆盖 harness；无 target 则回 harness）
+        assert bench.resolve_slo(harness, {}, {}) == {"ttft_p99_ms": 500, "tpot_p99_ms": 50}
+        # 全缺省 → 空（DEFAULT_SLO 由调用方合并，语义不变）
+        assert bench.resolve_slo({}, {}, {}) == {}
+
 
 class TestDockerRuntime:
     RUNTIME = {"kind": "docker", "image": "vllm/vllm-openai:v0.31.0",
