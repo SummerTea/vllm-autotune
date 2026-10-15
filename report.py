@@ -3,10 +3,11 @@
 
 由编码 agent 在满足任一退出条件后运行：解析 results.tsv，找出基线（首行）与
 最佳（keep/best 且 SLO 达标的最高 goodput；无达标行则回退最高 goodput 并标注），
-渲染中文 report.md（概览 / 基线 vs 最佳 / 全部 trial / 最佳配置 / 系统级建议 / 适用范围）。
+渲染中文 report.md（概览 / 基线 vs 最佳 / 全部 trial / 最佳配置 / 部署 / 系统级建议 / 适用范围），
+并在 --out 同目录生成可执行的 deploy-best.sh（复用 bench.py 的 docker 命令构建器）。
 
 只读性：绝不修改 results.tsv / config.yaml / env_report.md / model_profile.json；
-仅写 --out 指定的 report.md（git show 仅读取历史）。
+仅写 --out 指定的 report.md 与同目录 deploy-best.sh（git show 仅读取历史）。
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import datetime
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from collections import Counter
@@ -147,12 +149,72 @@ def git_show_config(commit: str | None) -> str | None:
     return p.stdout if p.returncode == 0 else None
 
 
+# ── 部署产物（best 配置 → 可直接运行的 docker 命令）────────────────────
+
+def _deploy_port(cmd: list[str]) -> int:
+    """serve 端口从命令里取（build_docker_run_cmd 必带 --port）；缺省 8000。"""
+    try:
+        return int(cmd[cmd.index("--port") + 1])
+    except (ValueError, IndexError):
+        return 8000
+
+
+def build_deploy_cmd(best_config_text: str, target: dict, harness: dict,
+                     best: dict, slo: dict) -> list[str] | None:
+    """由 best commit 的 config.yaml 快照构建独立部署的 docker run 命令——
+    复用 bench.build_docker_run_cmd + effective_runtime（不重复实现）。
+    部署容器名 vllm-deploy-best（与 trial 的 vllm-autotune-trial 不同，后续调优轮次的
+    docker rm -f 不会误杀部署）。
+    有效 serve 端口 = best 配置 serve.port（若有），否则 harness.remote.vllm_port（缺省 8000），
+    使 -p 发布端口与容器内 serve 端口一致。
+    任一前提缺失（YAML 解析失败 / bench 不可导入 / runtime.image 缺 /
+    target.model.path 缺）→ None（降级跳过，绝不 crash）。"""
+    try:
+        import bench  # 复用 bench.py 的 docker 命令构建器
+        config = yaml.safe_load(best_config_text) or {}
+        runtime = bench.effective_runtime(harness, config)
+        model_path = (target.get("model") or {}).get("path")
+        if not model_path:
+            return None
+        serve_port = int(((config.get("serve") or {}).get("port"))
+                         or ((harness.get("remote") or {}).get("vllm_port")) or 8000)
+        return bench.build_docker_run_cmd("docker", runtime, model_path, serve_port, config,
+                                          name="vllm-deploy-best")
+    except Exception:
+        return None  # 降级：构建失败不阻塞报告
+
+
+def write_deploy_artifact(out_dir: str, cmd: list[str], best: dict, slo: dict) -> str:
+    """写 <out_dir>/deploy-best.sh（可执行）；返回文件路径。"""
+    os.makedirs(out_dir, exist_ok=True)
+    g, sig = best.get("goodput"), best.get("goodput_std")
+    header = [
+        "#!/usr/bin/env bash",
+        "# 部署 best 配置（report.py 生成；仅 serve 单实例，不含 bench/循环）",
+        f"# 最佳 commit: {best.get('commit') or '?'}  goodput: {_fmt(g)}"
+        + (f"（σ={_fmt(sig)}）" if sig is not None else "")
+        + f"  SLO: ttft≤{slo.get('ttft_p99_ms')}ms / tpot≤{slo.get('tpot_p99_ms')}ms",
+        f"# 生成时间: {datetime.datetime.now().isoformat(timespec='seconds')}",
+        "# 容器名 vllm-deploy-best：与 trial 的 vllm-autotune-trial 不同，后续调优轮次的清理不会误杀本部署。",
+        f"# 镜像须在主机预先准备（模板不自动拉取）；模型目录只读挂载进容器；serve 端口 {_deploy_port(cmd)}。",
+        "set -euo pipefail",
+        "exec " + shlex.join(cmd),
+        "",
+    ]
+    path = os.path.join(out_dir, "deploy-best.sh")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(header))
+    os.chmod(path, 0o755)
+    return path
+
+
 # ── 渲染（纯函数，测试目标）────────────────────────────────────────────
 
 def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict | None,
            best_flagged: bool, improvement: float | None, *, model: str = "（未知）",
            workload: dict | None = None, config_snapshot: str | None = None,
-           system_advice: list[dict] | None = None) -> str:
+           system_advice: list[dict] | None = None,
+           deploy_cmd: list[str] | None = None) -> str:
     sl = {**DEFAULT_SLO, **(slo or {})}
     wl = workload or {}
     counts = Counter(r.get("status") for r in rows)
@@ -216,6 +278,17 @@ def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict
         lines += [f"`git show {best_commit}:config.yaml` 未能自动读取（git 不可用或 commit 不在仓库）；"
                   "请手动执行该命令查看最佳配置。" if best_commit else
                   "无最佳配置可展示（results.tsv 为空或全部 crash）。"]
+    lines.append("")
+
+    lines += ["## 部署（best 配置）", ""]
+    if deploy_cmd:
+        lines += ["```bash", shlex.join(deploy_cmd), "```", ""]
+        lines.append("- 运行：`bash deploy-best.sh`（report.py 生成于 `--out` 同目录，可直接执行）。")
+        lines.append("- 镜像须在主机**预先准备**（模板不自动拉取，零新增）；模型目录经 `-v host:container:ro` 只读挂载。")
+        lines.append(f"- serve 就绪后访问 `http://127.0.0.1:{_deploy_port(deploy_cmd)}`（`/health` 返回 200 即可用）。")
+    else:
+        lines.append("未生成部署命令（无 best 配置 / `git show` 失败 / 缺 `target.yaml.model.path`）——"
+                     "最佳配置见上节，可手动起服。")
     lines.append("")
 
     lines += ["## 系统级建议（附录）", ""]
@@ -282,11 +355,20 @@ def main(argv: list[str] | None = None) -> int:
     best, flagged = pick_best(rows, slo)
     imp = improvement_pct(baseline, best)
     snapshot = git_show_config(best.get("commit") if best else None)
+    # 部署产物：best commit 的 config.yaml 快照 → 独立 serve 的 docker run（复用 bench.py 构建器）
+    deploy_cmd = build_deploy_cmd(snapshot, target, harness, best, slo) if (best is not None and snapshot) else None
     md = render(rows, slo, baseline, best, flagged, imp, model=model, workload=workload,
-                config_snapshot=snapshot, system_advice=extract_system_advice(env_report))
+                config_snapshot=snapshot, system_advice=extract_system_advice(env_report),
+                deploy_cmd=deploy_cmd)
 
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(md)
+
+    if deploy_cmd:
+        assert best is not None  # deploy_cmd 只在 best 存在时构建
+        deploy_dir = os.path.dirname(args.out) or "."
+        write_deploy_artifact(deploy_dir, deploy_cmd, best, slo)
+        print(f"deploy-best.sh → {deploy_dir}/deploy-best.sh")
 
     print(f"trial 数: {len(rows)}（keep={sum(1 for r in rows if r['status'] == 'keep')}，"
           f"discard={sum(1 for r in rows if r['status'] == 'discard')}，"

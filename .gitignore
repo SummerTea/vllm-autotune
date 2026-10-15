@@ -16,6 +16,7 @@ env_report.md
 model_profile.json
 report.md
 result.json
+deploy-best.sh
 
 # Python
 __pycache__/

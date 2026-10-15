@@ -266,16 +266,18 @@ def _get_serve_help(docker_cmd: str, runtime: dict, cache_dir: str) -> str | Non
 
 
 def build_docker_run_cmd(docker_cmd: str, runtime: dict, model_path: str, port: int,
-                         config: dict) -> list[str]:
+                         config: dict, name: str = "vllm-autotune-trial") -> list[str]:
     """docker 运行时 serve 命令（frozen 设计）：
-    docker run --pull=never --rm --name vllm-autotune-trial --gpus all --ipc=host --shm-size=<shm|16g>
+    docker run --pull=never --rm --name <name> --gpus all --ipc=host --shm-size=<shm|16g>
       -p 127.0.0.1:<port>:<port> -v <model_path>:<container_path>:ro [-e K=V ...]
-      [extra_docker_args...] --entrypoint vllm <image> serve <container_path> <serve flags…>"""
+      [extra_docker_args...] --entrypoint vllm <image> serve <container_path> <serve flags…>
+    name：容器名，默认 trial 名（调用方逐字节一致）；report.py 部署产物传 vllm-deploy-best，
+    避免被后续调优轮次的 docker rm -f vllm-autotune-trial 误杀。"""
     image = runtime.get("image")
     if not image:
         raise ValueError("docker 运行时缺少 runtime.image（写进 config.yaml 或 harness.yaml）")
     cpath = container_model_path(runtime)
-    cmd = [docker_cmd, "run", "--pull=never", "--rm", "--name", "vllm-autotune-trial",
+    cmd = [docker_cmd, "run", "--pull=never", "--rm", "--name", name,
            "--gpus", "all", "--ipc", "host", "--shm-size", str(runtime.get("shm_size") or "16g"),
            # --ipc host 共享宿主机 /dev/shm，--shm-size 实际不生效（保留两者，仅说明）
            "-p", f"127.0.0.1:{port}:{port}",

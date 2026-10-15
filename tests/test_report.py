@@ -3,10 +3,12 @@
 口径与 report.py 内实现一致；全部在无 GPU/网络的本机运行。
 """
 
+import os
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import report  # noqa: E402
@@ -196,3 +198,105 @@ class TestRender:
     def test_render_empty_rows(self):
         md = report.render([], SLO, None, None, True, None)
         assert "无任何可比较的 trial" in md
+
+
+# ── 部署产物（best 配置 → deploy-best.sh）──────────────────────────────
+
+def _write_mini(tmp: Path, results: str, *, harness: dict | None = None,
+                target: dict | None = None) -> None:
+    """最小 target/harness/results（deploy 测试用）。"""
+    (tmp / "results.tsv").write_text(results, encoding="utf-8")
+    (tmp / "harness.yaml").write_text(yaml.safe_dump(harness or {
+        "slo": {"ttft_p99_ms": 500, "tpot_p99_ms": 50},
+        "workload": {"dataset": "random", "isl": 2048, "osl": 256, "num_prompts": 1000},
+        "remote": {"vllm_port": 8000},
+        "runtime": {"image": "vllm/vllm-openai:v0.31.0"},
+    }), encoding="utf-8")
+    (tmp / "target.yaml").write_text(yaml.safe_dump(target or {
+        "hosts": [{"name": "head", "ssh": "u@h", "role": "head"}],
+        "model": {"id": "Qwen/Qwen3-32B", "source": "local", "path": "/models/qwen3-32b"},
+    }), encoding="utf-8")
+
+
+def _run_main(tmp: Path) -> int:
+    return report.main(["--results", str(tmp / "results.tsv"),
+                        "--harness", str(tmp / "harness.yaml"),
+                        "--target", str(tmp / "target.yaml"),
+                        "--out", str(tmp / "report.md")])
+
+
+class TestDeploy:
+    def test_deploy_artifact_written(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(report, "git_show_config", lambda commit: (
+            "serve:\n  max-num-seqs: 256\n  enable-prefix-caching: true\n"))
+        _write_mini(tmp_path, TSV)          # best = cccc333（keep 且 SLO 达标）
+        assert _run_main(tmp_path) == 0
+
+        script = tmp_path / "deploy-best.sh"
+        assert script.exists()
+        text = script.read_text(encoding="utf-8")
+        assert text.startswith("#!/usr/bin/env bash")
+        assert "set -euo pipefail" in text
+        assert "vllm/vllm-openai:v0.31.0" in text        # 镜像
+        assert "--entrypoint vllm" in text
+        assert "serve" in text
+        assert "--max-num-seqs 256" in text              # best 配置的 serve flag
+        assert "--enable-prefix-caching" in text
+        assert "/models/qwen3-32b:/model:ro" in text     # 模型只读挂载
+        assert "exec docker run" in text
+        assert os.access(script, os.X_OK)                # 可执行
+        assert "cccc333" in text                          # 头部最佳 commit
+        # M1：部署容器名独立于 trial——exec 命令行用 vllm-deploy-best，绝不带 trial 名
+        exec_line = next(l for l in text.splitlines() if l.startswith("exec docker"))
+        assert "vllm-deploy-best" in exec_line
+        assert "vllm-autotune-trial" not in exec_line
+        assert "vllm-deploy-best" in text                 # 头部注释说明独立容器名
+
+        md = (tmp_path / "report.md").read_text(encoding="utf-8")
+        assert "## 部署（best 配置）" in md
+        assert "bash deploy-best.sh" in md
+        assert "http://127.0.0.1:8000" in md
+
+    def test_build_deploy_cmd_reuses_bench_builder(self):
+        # 直接单测构建器复用（bench.build_docker_run_cmd + effective_runtime）
+        config_text = "serve:\n  max-num-seqs: 256\n"
+        harness = {"remote": {"vllm_port": 8123}, "runtime": {"image": "img:1"}}
+        target = {"model": {"path": "/m"}}
+        cmd = report.build_deploy_cmd(config_text, target, harness,
+                                      {"commit": "x"}, {"ttft_p99_ms": 500, "tpot_p99_ms": 50})
+        assert cmd is not None
+        assert "img:1" in cmd
+        assert "--max-num-seqs 256" in " ".join(cmd)
+        assert "-p 127.0.0.1:8123:8123" in " ".join(cmd)
+        # 降级：缺 model.path → None（不 crash）
+        assert report.build_deploy_cmd(config_text, {}, harness, {}, {}) is None
+
+    def test_deploy_skipped_when_git_show_fails(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(report, "git_show_config", lambda commit: None)
+        _write_mini(tmp_path, TSV)
+        assert _run_main(tmp_path) == 0
+        assert not (tmp_path / "deploy-best.sh").exists()
+        md = (tmp_path / "report.md").read_text(encoding="utf-8")
+        assert "未生成部署命令" in md
+
+    def test_deploy_skipped_when_all_crash(self, tmp_path, monkeypatch):
+        crash_tsv = ("commit\tgoodput\tgoodput_std\toutput_tok_s\tttft_p99_ms\ttpot_p99_ms"
+                     "\tpeak_vram_gb\tdur_s\tstatus\tdescription\n"
+                     "d111\t\t\t\t\t\t\t\tcrash\tOOM\n")
+        _write_mini(tmp_path, crash_tsv)
+        assert _run_main(tmp_path) == 0
+        assert not (tmp_path / "deploy-best.sh").exists()
+        assert "未生成部署命令" in (tmp_path / "report.md").read_text(encoding="utf-8")
+
+    def test_deploy_port_consistent_when_config_sets_port(self, tmp_path, monkeypatch):
+        # minor：best 配置 serve.port=9999 → -p 发布端口与容器内 --port 一致（报告 URL 同端口）
+        monkeypatch.setattr(report, "git_show_config", lambda c: (
+            "serve:\n  port: 9999\n  max-num-seqs: 256\n"))
+        _write_mini(tmp_path, TSV)          # harness remote.vllm_port=8000（应被 9999 覆盖）
+        assert _run_main(tmp_path) == 0
+        text = (tmp_path / "deploy-best.sh").read_text(encoding="utf-8")
+        assert "-p 127.0.0.1:9999:9999" in text
+        assert "--port 9999" in text
+        assert "-p 127.0.0.1:8000" not in text
+        md = (tmp_path / "report.md").read_text(encoding="utf-8")
+        assert "http://127.0.0.1:9999" in md

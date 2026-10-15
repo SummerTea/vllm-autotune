@@ -201,6 +201,16 @@ class TestDockerRuntime:
         assert "/m:/model:ro" in joined
         assert "--shm-size 16g" in joined
 
+    def test_build_docker_run_cmd_custom_name(self):
+        # M1：部署产物用独立容器名（默认 trial 名不变，trial 路径逐字节一致）
+        cmd = bench.build_docker_run_cmd("docker", self.RUNTIME, "/m", 8000,
+                                         {"serve": {}, "env": {}}, name="vllm-deploy-best")
+        assert cmd[cmd.index("--name") + 1] == "vllm-deploy-best"
+        assert "vllm-autotune-trial" not in cmd
+        cmd2 = bench.build_docker_run_cmd("docker", self.RUNTIME, "/m", 8000,
+                                          {"serve": {}, "env": {}})
+        assert cmd2[cmd2.index("--name") + 1] == "vllm-autotune-trial"
+
     def test_build_docker_run_cmd_missing_image(self):
         with pytest.raises(ValueError):
             bench.build_docker_run_cmd("docker", {"kind": "docker"}, "/m", 8000, {"serve": {}})
