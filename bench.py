@@ -1126,6 +1126,7 @@ def main(argv: list[str] | None = None) -> int:
             "env_fingerprint": fingerprint,
             "calibration": calibration,
             "workload": _resolved_workload(workload, ref_conc),
+            "slo": slo,
             "started_at": started_at,
             "trial_id": trial_id,
             "config_hash": config_hash,
@@ -1137,7 +1138,7 @@ def main(argv: list[str] | None = None) -> int:
         crash_reason, oom_cont = _classify_oom_crash(c.reason, log_path, log_start)
         result = {"status": "crash", "reason": crash_reason, "started_at": started_at,
                   "calibration": {"measured_kv_tokens": kv_tokens, "load_seconds": load_seconds},
-                  "trial_id": trial_id, "config_hash": config_hash}
+                  "trial_id": trial_id, "config_hash": config_hash, "slo": slo}
         if oom_cont:
             result["contention"] = oom_cont
     except Exception as e:  # 兜底：任何异常都记为 crash，绝不让进程挂起
@@ -1145,7 +1146,7 @@ def main(argv: list[str] | None = None) -> int:
         result = {"status": "crash", "reason": f"{type(e).__name__}: {e}",
                   "started_at": started_at,
                   "calibration": {"measured_kv_tokens": kv_tokens, "load_seconds": load_seconds},
-                  "trial_id": trial_id, "config_hash": config_hash}
+                  "trial_id": trial_id, "config_hash": config_hash, "slo": slo}
     finally:
         _cleanup(procs, args.docker_cmd)
         if log_fh is not None:

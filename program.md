@@ -22,8 +22,10 @@ Phase 0 输入齐全且 Phase 1.5 无阻断项后进入禁问窗口：自主执�
 
 ## SLO 可行性与自主放宽
 
-- **参考 SLO**：target.yaml 声明值，仅用于 report.md 对标，运行期不改其语义。
-- **有效 SLO**：运行期算 goodput 与 keep/discard 用的 SLO，默认等于参考 SLO（「决策规则」中的 SLO 均指有效 SLO）。
+两个概念贯穿全程，report 必须同时呈现并**明确说明参考 SLO 是否可达**：
+
+- **参考 SLO**：target.yaml 声明值（缺省 harness.yaml 占位），仅用于 report.md 对标，运行期不改其语义。
+- **有效 SLO**：运行期算 goodput 与 keep/discard 用的 SLO，默认等于参考 SLO（「决策规则」中的 SLO 均指有效 SLO）；若参考 SLO 不可达，report 的概览标注「参考 SLO：不可达」并说明 best 为有效 SLO 下的最优、建议放宽至实测 p99 或复核硬件/模型适配。
 - **落点**：校准经 `config.yaml` 的 `slo:` 写入（`ttft_p99_ms` / `tpot_p99_ms`，优先级高于 `target.metrics.slo`）；`target.yaml` 的 SLO 只作参考、不改其语义。bench.py / report.py 均按此优先级解析。
 - **触发**：任一 trial goodput == 0（无请求同时满足参考 SLO）→ 触发一次性校准。
 - **口径**：有效 SLO = 该次实测 p99 × 1.10，向上取整到整数 ms（ttft / tpot 各自独立）；该次实测行重记为基线。
@@ -47,13 +49,23 @@ Phase 0 输入齐全且 Phase 1.5 无阻断项后进入禁问窗口：自主执�
 
 ## results.tsv 列定义
 
-tab 分隔，每行一个实验：
+tab 分隔，每行一个实验。**行由 `scripts/record.py` 生成**（从回传的 `result.json` 机械拼行，
+防手写错列）；表头 = `report.HEADER`（单一来源，report.py 定义）：
 
 ```
-commit  goodput  goodput_std  output_tok_s  ttft_p99_ms  tpot_p99_ms  peak_vram_gb  dur_s  status  description
+commit  trial_id  config_hash  workload_hash  slo  repeats  contention  goodput  goodput_std  output_tok_s  ttft_p99_ms  tpot_p99_ms  peak_vram_gb  dur_s  status  description
 ```
 
 - `commit`：本次 config.yaml 的 git commit（短 hash）。
+- `trial_id`：本次 trial 身份（bench.py 自动生成 `<时间戳>-<uuid6>` 或 run.sh 传入），
+  跨 trial 对齐产物（status.json/result.json）用。
+- `config_hash`：本次 config.yaml 内容指纹（sha256[:12]，键序无关），与 result.json 一致。
+- `workload_hash`：本次实际生效 workload（result.json 的 `workload` 字段）规范化 JSON 的
+  sha256[:12]；与 `slo` 一起构成**可比性上下文**——best 选择只在其内进行（跨上下文不混比）。
+- `slo`：本次有效 SLO，形如 `ttft500/tpot50`；来源 = result.json 的 `slo`（缺省回退
+  resolve_slo(harness, target, config)）。
+- `repeats`：本次 bench 重复次数（数值）。
+- `contention`：`1` = 本次检测到共租 GPU 进程（测量可能受扰），`0` = 独占。
 - `goodput`：SLO 约束下的成功请求吞吐（**req/s**，vLLM 的 `request_goodput`），用于 keep/discard 判定。
 - `goodput_std`：本次 trial repeats 的 goodput 样本标准差（σ；n<2 时为 0），显著性判定的噪声基数（`noise_k_sigma`×σ，与 `best × noise_band_pct/100` 取较大者）。
 - `output_tok_s`：纯输出吞吐（tok/s），辅助诊断。

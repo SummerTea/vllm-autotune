@@ -55,6 +55,40 @@ class TestParseTsv:
             report.parse_tsv("commit\tgoodput\tstatus\nx\t1\ty\n")
 
 
+NEW_TSV = (
+    "commit\ttrial_id\tconfig_hash\tworkload_hash\tslo\trepeats\tcontention\tgoodput\tgoodput_std\toutput_tok_s\tttft_p99_ms\ttpot_p99_ms\tpeak_vram_gb\tdur_s\tstatus\tdescription\n"
+    "aaaa111\tt1\th1\tw1\tttft500/tpot50\t3\t0\t10.0\t0.2\t9000.0\t420.1\t18.3\t71.2\t912.4\tkeep\t基线（mock）\n"
+    "bbbb222\tt2\th2\tw1\tttft500/tpot50\t3\t0\t10.2\t0.3\t9200.0\t430.2\t19.1\t71.5\t910.0\tdiscard\tmax-num-seqs 256\n"
+    "cccc333\tt3\th3\tw1\tttft500/tpot50\t3\t1\t11.0\t0.5\t9800.0\t450.0\t20.0\t72.0\t905.0\tkeep\tgpu-memory-utilization 0.92\n"
+)
+
+
+class TestParseTsvNewColumns:
+    def test_new_16col_header_parses(self):
+        rows = report.parse_tsv(NEW_TSV)
+        assert len(rows) == 3
+        r0 = rows[0]
+        assert r0["trial_id"] == "t1" and r0["config_hash"] == "h1"
+        assert r0["workload_hash"] == "w1" and r0["slo"] == "ttft500/tpot50"
+        assert r0["repeats"] == 3.0                       # 新列数值 coerce
+        assert r0["contention"] == "0"                    # contention 保持字符串
+        assert rows[2]["contention"] == "1"
+        assert r0["goodput"] == 10.0                      # 核心列照常
+
+    def test_column_order_does_not_matter(self):
+        # 名字对齐：核心列齐全但列序打乱也能解析出相同字段（扩展列任意位置）
+        shuffled = ("commit\tdescription\tgoodput\tstatus\tgoodput_std\tttft_p99_ms"
+                    "\ttpot_p99_ms\toutput_tok_s\tpeak_vram_gb\tdur_s\ttrial_id\tcontention\n"
+                    "x\t说明\t1.0\tkeep\t0.1\t420.0\t18.0\t9000.0\t71.0\t900.0\tt9\t1\n")
+        rows = report.parse_tsv(shuffled)
+        assert rows[0]["goodput"] == 1.0
+        assert rows[0]["trial_id"] == "t9"
+        assert rows[0]["contention"] == "1"
+        assert rows[0]["description"] == "说明"
+        assert not rows[0]["workload_hash"]           # 扩展列缺失 → 空（未知上下文）
+        assert rows[0]["repeats"] is None             # 数值扩展列缺失 → None
+
+
 class TestSloOk:
     def test_within_slo(self):
         assert report.slo_ok(_rows()[0], SLO) is True
@@ -397,3 +431,178 @@ class TestConfirm:
         md = report.render(rows, SLO, None, best, False, None,
                            noise_band_pct=3.0, noise_k_sigma=2.0)
         assert "未做确认 run" in md
+
+
+# ── Phase 2：可比性上下文 + 参考/有效 SLO 双口径 ─────────────────────────
+
+MIXED_TSV = NEW_TSV + (
+    "dddd444\tt4\th4\tw2\tttft4000/tpot80\t3\t0\t50.0\t1.0\t50000.0\t300.0\t20.0\t75.0\t900.0\tkeep\t另一上下文（w2/slo2）高 goodput\n"
+)
+
+
+class TestComparability:
+    def test_context_key(self):
+        assert report.context_key({"workload_hash": "w1", "slo": "ttft500/tpot50"}) == \
+            ("w1", "ttft500/tpot50")
+        # 两者皆空 → None（旧表/未知）
+        assert report.context_key({"workload_hash": "", "slo": None}) is None
+        assert report.context_key({}) is None
+        # 其一存在 → 有上下文
+        assert report.context_key({"workload_hash": "w1"}) == ("w1", "")
+
+    def test_best_restricted_to_baseline_context(self):
+        # 另一上下文（w2/slo2）的 50.0 不得参与 best 选择——best 仍是基线上下文内 11.0
+        rows = report.parse_tsv(MIXED_TSV)
+        baseline = report.pick_baseline(rows)
+        ctx = report.context_key(baseline)
+        assert ctx == ("w1", "ttft500/tpot50")
+        best, flagged = report.pick_best(rows, SLO, ctx)
+        assert best is not None
+        assert best["commit"] == "cccc333" and best["goodput"] == 11.0
+        assert flagged is False
+        # 不传上下文（legacy）→ 全部行参与（旧行为），50.0 胜出
+        best_legacy, _ = report.pick_best(rows, SLO)
+        assert best_legacy["commit"] == "dddd444"
+
+    def test_render_comparability_note(self):
+        rows = report.parse_tsv(MIXED_TSV)
+        baseline = report.pick_baseline(rows)
+        ctx = report.context_key(baseline)
+        best, flagged = report.pick_best(rows, SLO, ctx)
+        comparability = sorted((k, n) for k, n in
+                               report.Counter(report.context_key(r) for r in rows).items()
+                               if k is not None)
+        md = report.render(rows, SLO, baseline, best, flagged,
+                           report.improvement_pct(baseline, best),
+                           reference_slo=SLO, baseline_ctx=ctx, comparability=comparability)
+        assert "## 可比性" in md
+        assert "w2" in md and "ttft4000/tpot80" in md          # 逐项列出各上下文
+        assert "仅基线上下文" in md                              # 只有基线上下文参与 best
+        assert "参考 SLO 下的最佳" in md                          # 参考 SLO 可达 → 附对标行
+
+    def test_f1_reachability_scoped_to_baseline_context(self):
+        # F1：基线上下文（w1）无 keep/best 行满足参考 SLO，另一上下文（w2）有 → 不得报可达
+        tsv = NEW_TSV.replace("420.1\t18.3", "620.1\t18.3") \
+                     .replace("430.2\t19.1", "630.2\t19.1") \
+                     .replace("450.0\t20.0", "650.0\t20.0") + (
+            "eeee555\tt5\th5\tw2\tttft4000/tpot80\t3\t0\t5.0\t1.0\t1000.0\t300.0\t20.0\t75.0\t900.0\tkeep\t参考 SLO 达标但在另一上下文\n")
+        rows = report.parse_tsv(tsv)
+        baseline = report.pick_baseline(rows)
+        ctx = report.context_key(baseline)
+        assert ctx == ("w1", "ttft500/tpot50")
+        best, _ = report.pick_best(rows, SLO, ctx)
+        comparability = sorted((k, n) for k, n in
+                               report.Counter(report.context_key(r) for r in rows).items()
+                               if k is not None)
+        md = report.render(rows, SLO, baseline, best, False,
+                           report.improvement_pct(baseline, best),
+                           reference_slo=SLO, baseline_ctx=ctx, comparability=comparability)
+        assert "参考 SLO：**可达**" not in md                    # 另一上下文达标不算
+        assert "参考 SLO：**不可达**" in md
+        assert "参考 SLO 下无达标行" in md                        # 与可达性同口径，不矛盾
+
+    def test_f1_discard_only_ref_met_not_reachable(self):
+        # F1：仅 discard 行满足参考 SLO（keep/best 均不达标）→ 不可达（best 口径需 keep/best）
+        tsv = NEW_TSV.replace("420.1\t18.3", "620.1\t18.3") \
+                     .replace("450.0\t20.0", "650.0\t20.0")   # bbbb222(discard) 保持达标
+        rows = report.parse_tsv(tsv)
+        baseline = report.pick_baseline(rows)
+        ctx = report.context_key(baseline)
+        best, flagged = report.pick_best(rows, SLO, ctx)
+        md = report.render(rows, SLO, baseline, best, flagged,
+                           report.improvement_pct(baseline, best),
+                           reference_slo=SLO, baseline_ctx=ctx)
+        assert "参考 SLO：**不可达**" in md
+        assert "参考 SLO 下的最佳" not in md                      # discard 不是候选 best
+        assert "参考 SLO 下无达标行" in md
+        # 存在非 keep/best 的已测量行达标 → 软化建议（复核配置），而非误导为「放宽 SLO」
+        assert "人工复核该配置" in md
+        assert "建议放宽至实测 p99" not in md
+
+    def test_f4_legacy_baseline_one_context_warns(self, tmp_path, monkeypatch, capsys):
+        # F4：legacy 基线（无上下文）+ 恰一个非空上下文 → 出可比性节 + stderr 警告
+        monkeypatch.setattr(report, "git_show_config", lambda c: None)
+        tsv = ("commit\ttrial_id\tconfig_hash\tworkload_hash\tslo\trepeats\tcontention"
+               "\tgoodput\tgoodput_std\toutput_tok_s\tttft_p99_ms\ttpot_p99_ms"
+               "\tpeak_vram_gb\tdur_s\tstatus\tdescription\n"
+               "aaaa111\t\t\t\t\t\t\t10.0\t0.2\t9000.0\t420.1\t18.3\t71.2\t912.4\tkeep\t基线（无上下文）\n"
+               "bbbb222\tt2\th2\tw1\tttft500/tpot50\t3\t0\t10.2\t0.3\t9200.0\t430.2\t19.1\t71.5\t910.0\tkeep\t有上下文\n")
+        _write_mini(tmp_path, tsv)
+        assert _run_main(tmp_path) == 0
+        md = (tmp_path / "report.md").read_text(encoding="utf-8")
+        assert "## 可比性" in md
+        assert "best 选择按旧行为覆盖全部行" in md
+        err = capsys.readouterr().err
+        assert "legacy 行上下文未知" in err                        # main() 警告
+
+    def test_f5_wording_no_candidates_vs_all_crash(self):
+        # F5：行存在但基线上下文内无候选 → 明确文案；全 crash → 原文案
+        tsv = ("commit\ttrial_id\tconfig_hash\tworkload_hash\tslo\trepeats\tcontention"
+               "\tgoodput\tgoodput_std\toutput_tok_s\tttft_p99_ms\ttpot_p99_ms"
+               "\tpeak_vram_gb\tdur_s\tstatus\tdescription\n"
+               "a1\tt\th\tw1\tttft500/tpot50\t3\t0\t\t\t\t\t\t\t\tcrash\tOOM in baseline ctx\n"
+               "b2\tt\th\tw2\tttft4000/tpot80\t3\t0\t50.0\t1.0\t50000.0\t300.0\t20.0\t75.0\t900.0\tkeep\t另一上下文\n")
+        rows = report.parse_tsv(tsv)
+        baseline = report.pick_baseline(rows)
+        ctx = report.context_key(baseline)
+        best, flagged = report.pick_best(rows, SLO, ctx)
+        assert best is None
+        md = report.render(rows, SLO, baseline, best, flagged, None, baseline_ctx=ctx)
+        assert "基线上下文内无可比较的 trial" in md
+        assert "无任何可比较的 trial（results.tsv 为空或全部 crash）" not in md   # 旧结论行不再出现
+        # 全 crash → 保留原文案
+        all_crash = [dict(r, status="crash") for r in report.parse_tsv(NEW_TSV)]
+        md2 = report.render(all_crash, SLO, all_crash[0], None, True, None,
+                            baseline_ctx=report.context_key(all_crash[0]))
+        assert "无任何可比较的 trial（results.tsv 为空或全部 crash）" in md2
+
+
+class TestDualSlo:
+    def test_reference_reachable_explicit_line(self):
+        # 参考 SLO 可达：概览出「可达」，基线 vs 最佳附参考 SLO 下最佳行
+        rows = report.parse_tsv(NEW_TSV)
+        baseline = report.pick_baseline(rows)
+        ctx = report.context_key(baseline)
+        best, flagged = report.pick_best(rows, SLO, ctx)
+        md = report.render(rows, SLO, baseline, best, flagged,
+                           report.improvement_pct(baseline, best),
+                           reference_slo=SLO, baseline_ctx=ctx)
+        assert "参考 SLO（target 声明，不改语义）：ttft_p99 ≤ 500 ms" in md
+        assert "有效 SLO（goodput/keep 判定用）：ttft_p99 ≤ 500 ms" in md
+        assert "参考 SLO：**可达**" in md
+        assert "参考 SLO 下的最佳" in md
+        # 参考 = 有效 → 标注与参考一致，且无校准标注
+        assert "（与参考一致）" in md
+        assert "运行期 SLO 校准" not in md
+
+    def test_reference_unreachable_explicit_line(self):
+        # 参考 SLO 不可达：概览出「不可达」+ 说明；基线 vs 最佳明示参考 SLO 下无达标行
+        rows = report.parse_tsv(NEW_TSV)
+        baseline = report.pick_baseline(rows)
+        ctx = report.context_key(baseline)
+        best, flagged = report.pick_best(rows, SLO, ctx)
+        md = report.render(rows, SLO, baseline, best, flagged,
+                           report.improvement_pct(baseline, best),
+                           reference_slo={"ttft_p99_ms": 400, "tpot_p99_ms": 30},
+                           baseline_ctx=ctx)
+        assert "参考 SLO：**不可达**" in md
+        assert "建议放宽至实测 p99 或复核硬件/模型适配" in md
+        assert "参考 SLO 下无达标行" in md
+        # 有效 SLO（500/50）仍是判定口径 → best 照常
+        assert best["commit"] == "cccc333"
+
+    def test_effective_slo_reported_when_calibrated(self):
+        # 双口径 + 校准：有效 SLO 与参考不同 → 概览双列 + 校准标注
+        rows = report.parse_tsv(NEW_TSV)
+        baseline = report.pick_baseline(rows)
+        ctx = report.context_key(baseline)
+        eff = {"ttft_p99_ms": 550, "tpot_p99_ms": 55}
+        best, _ = report.pick_best(rows, eff, ctx)
+        md = report.render(rows, eff, baseline, best, False,
+                           report.improvement_pct(baseline, best),
+                           reference_slo=SLO, baseline_ctx=ctx,
+                           slo_calibrated=SLO)
+        assert "参考 SLO（target 声明，不改语义）：ttft_p99 ≤ 500 ms" in md
+        assert "有效 SLO（goodput/keep 判定用）：ttft_p99 ≤ 550 ms" in md
+        assert "（运行期校准，见下）" in md
+        assert "运行期 SLO 校准" in md

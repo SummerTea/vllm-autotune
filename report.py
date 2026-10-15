@@ -28,9 +28,17 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("缺少 pyyaml：请用 `uv run python report.py` 或 `pip install pyyaml`")
 
-HEADER = ["commit", "goodput", "goodput_std", "output_tok_s", "ttft_p99_ms", "tpot_p99_ms",
+# 结果账本列（单一来源；scripts/record.py 从此导入）。列序固定，但 parse_tsv 按名字对齐：
+# 旧 10 列表与新 16 列表都接受——核心列必须齐全，扩展列可选。
+HEADER = ["commit", "trial_id", "config_hash", "workload_hash", "slo", "repeats", "contention",
+          "goodput", "goodput_std", "output_tok_s", "ttft_p99_ms", "tpot_p99_ms",
           "peak_vram_gb", "dur_s", "status", "description"]
-NUM_COLS = set(HEADER) - {"commit", "status", "description"}
+# 数值列（coerce 用）：纯诊断列除外——contention 保持字符串/None，不参与数值解析
+NUM_COLS = {"goodput", "goodput_std", "output_tok_s", "ttft_p99_ms", "tpot_p99_ms",
+            "peak_vram_gb", "dur_s", "repeats"}
+# 任何表头都必须包含的核心列（旧表与扩展表的交集）
+CORE_COLS = ["commit", "goodput", "goodput_std", "output_tok_s", "ttft_p99_ms", "tpot_p99_ms",
+             "peak_vram_gb", "dur_s", "status", "description"]
 DEFAULT_SLO = {"ttft_p99_ms": 500, "tpot_p99_ms": 50}
 
 
@@ -64,22 +72,29 @@ def _coerce(col: str, v: str):
 
 
 def parse_tsv(text: str) -> list[dict]:
-    """解析 results.tsv：表头必须恰为 HEADER；数值列转 float（坏值/空 → None）。"""
+    """解析 results.tsv：按名字对齐——表头必须包含全部核心列（CORE_COLS），列序无关；
+    扩展列（trial_id/config_hash/workload_hash/slo/repeats/contention）可选，缺失 → None。
+    兼容旧 10 列表与新的 16 列表；数值列转 float（坏值/空 → None）。"""
     lines = [l for l in text.splitlines() if l.strip() != ""]
     if not lines:
         return []
     header = [c.strip() for c in lines[0].split("\t")]
-    if header != HEADER:
-        sep = "\t"
-        _err(f"results.tsv 表头必须恰为 {sep.join(HEADER)}（实际: {header}）")
+    missing = [c for c in CORE_COLS if c not in header]
+    if missing:
+        _err(f"results.tsv 表头必须包含核心列：{', '.join(missing)}（缺少；实际表头: {header}）。"
+             "旧 10 列表可继续用；新列见 report.HEADER（scripts/record.py 按此生成）")
+    idx = {h: i for i, h in enumerate(header)}
     rows = []
     for line in lines[1:]:
-        cells = [c for c in line.split("\t")]
-        if len(cells) < len(HEADER):
-            cells += [""] * (len(HEADER) - len(cells))
-        else:
-            cells = cells[: len(HEADER)]
-        rows.append({h: _coerce(h, c.strip()) for h, c in zip(HEADER, cells)})
+        cells = line.split("\t")
+        row = {}
+        for h in HEADER:
+            if h in idx:
+                i = idx[h]
+                row[h] = _coerce(h, cells[i].strip() if i < len(cells) else "")
+            else:
+                row[h] = _coerce(h, "")   # 扩展列缺失 → None（数值）/ 空串（字符串）
+        rows.append(row)
     return rows
 
 
@@ -97,20 +112,40 @@ def pick_baseline(rows: list[dict]) -> dict | None:
     return rows[0] if rows else None
 
 
-def pick_best(rows: list[dict], slo: dict | None = None) -> tuple[dict | None, bool]:
+def context_key(row: dict) -> tuple | None:
+    """可比性上下文 = (workload_hash, slo)。两者皆空（旧表/未知）→ None（legacy，
+    best 选择退化为旧行为——全部行）；其一存在 → 以该元组为上下文。"""
+    w, s = row.get("workload_hash"), row.get("slo")
+    if not w and not s:
+        return None
+    return (w or "", s or "")
+
+
+def _ctx_rows(rows: list[dict], baseline_ctx: tuple | None) -> list[dict]:
+    """best 选择候选：基线上下文已知时只留同上下文行（防止跨 workload/SLO 混比）；
+    未知（legacy）→ 全部行（旧行为）。"""
+    if baseline_ctx is None:
+        return rows
+    return [r for r in rows if context_key(r) == baseline_ctx]
+
+
+def pick_best(rows: list[dict], slo: dict | None = None,
+              baseline_ctx: tuple | None = None) -> tuple[dict | None, bool]:
     """最佳：状态恰为 {keep, best} 且 SLO 达标的最高 goodput 行——confirm 行绝不参与
-    best 选择（只作回归核对，见「确认（best 回归）」节）。
+    best 选择（只作回归核对，见「确认（best 回归）」节）；只在与基线同 (workload_hash, slo)
+    上下文内选（baseline_ctx=None 的旧表 → 全部行）。
     无达标行时：先取 {keep, best} 中最高 goodput（即便不达标）；仅当 keep/best 行
     不存在时，才回退全部已测量（非 crash、非 confirm）行的最高 goodput。
     两种情况均置 flagged=True（报告中提示 ⚠ 人工复核）。"""
-    eligible = [r for r in rows if r.get("status") in ("keep", "best")]  # 明确排除 confirm
+    cand = _ctx_rows(rows, baseline_ctx)
+    eligible = [r for r in cand if r.get("status") in ("keep", "best")]  # 明确排除 confirm
     met = [r for r in eligible if slo_ok(r, slo)]
     if met:
         return max(met, key=lambda r: r.get("goodput") or 0), False
     if eligible:
         return max(eligible, key=lambda r: r.get("goodput") or 0), True
     # 回退：已测量行中最高 goodput；confirm/crash 均不参与 best 选择
-    measured = [r for r in rows
+    measured = [r for r in cand
                 if r.get("goodput") is not None and r.get("status") not in ("crash", "confirm")]
     if measured:
         return max(measured, key=lambda r: r.get("goodput") or 0), True
@@ -213,14 +248,36 @@ def write_deploy_artifact(out_dir: str, cmd: list[str], best: dict, slo: dict) -
 
 # ── 渲染（纯函数，测试目标）────────────────────────────────────────────
 
+def _ref_eligible(rows: list[dict], baseline_ctx: tuple | None) -> list[dict]:
+    """参考 SLO 对标口径（F1）：基线上下文内的 keep/best 候选行——discard 不是候选 best，
+    confirm 只作回归核对不参与；与 best_under_slo / 可达性判定完全同口径。"""
+    cand = _ctx_rows(rows, baseline_ctx)
+    return [r for r in cand if r.get("status") in ("keep", "best")]
+
+
+def _any_row_satisfies(rows: list[dict], slo: dict | None, baseline_ctx: tuple | None) -> bool:
+    """参考 SLO 可达性：仅在基线上下文内、keep/best 行中判定（与 best_under_slo 同口径，
+    杜绝「参考 SLO 可达」与「参考 SLO 下无达标行」并存的矛盾）。"""
+    return any(slo_ok(r, slo) for r in _ref_eligible(rows, baseline_ctx))
+
+
+def best_under_slo(rows: list[dict], slo: dict | None, baseline_ctx: tuple | None) -> dict | None:
+    """给定 SLO（参考）下、基线上下文内的最优 keep/best 行；无达标行 → None。"""
+    met = [r for r in _ref_eligible(rows, baseline_ctx) if slo_ok(r, slo)]
+    return max(met, key=lambda r: r.get("goodput") or 0) if met else None
+
+
 def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict | None,
            best_flagged: bool, improvement: float | None, *, model: str = "（未知）",
            workload: dict | None = None, config_snapshot: str | None = None,
            system_advice: list[dict] | None = None,
            deploy_cmd: list[str] | None = None,
            noise_band_pct: float = 3.0, noise_k_sigma: float = 2.0,
-           slo_calibrated: dict | None = None) -> str:
+           slo_calibrated: dict | None = None,
+           reference_slo: dict | None = None, baseline_ctx: tuple | None = None,
+           comparability: list | None = None) -> str:
     sl = {**DEFAULT_SLO, **(slo or {})}
+    ref = {**DEFAULT_SLO, **(reference_slo or {})}
     wl = workload or {}
     counts = Counter(r.get("status") for r in rows)
     lines = ["# 调优报告（report.md）", ""]
@@ -232,17 +289,57 @@ def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict
                  f"num_prompts=`{wl.get('num_prompts', 1000)}`"
                  + (f"，ref_concurrency=`{wl.get('ref_concurrency')}`" if wl.get("ref_concurrency") else ""))
     lines.append("- 各 trial 实际生效 workload 以 `result.json` 的 `workload` 字段为准（跨 workload 的行不可混比）。")
-    lines.append(f"- SLO：ttft_p99 ≤ {sl['ttft_p99_ms']} ms；tpot_p99 ≤ {sl['tpot_p99_ms']} ms")
+    if reference_slo:
+        # 双口径：参考 SLO（target 声明，不改语义）vs 有效 SLO（config.slo 运行期校准，判定用）
+        lines.append(f"- 参考 SLO（target 声明，不改语义）：ttft_p99 ≤ {ref['ttft_p99_ms']} ms；"
+                     f"tpot_p99 ≤ {ref['tpot_p99_ms']} ms")
+        lines.append(f"- 有效 SLO（goodput/keep 判定用）：ttft_p99 ≤ {sl['ttft_p99_ms']} ms；"
+                     f"tpot_p99 ≤ {sl['tpot_p99_ms']} ms"
+                     + ("（与参考一致）" if ref == sl else "（运行期校准，见下）"))
+        if _any_row_satisfies(rows, ref, baseline_ctx):
+            lines.append("- 参考 SLO：**可达**（基线上下文内存在满足参考 SLO 的 keep/best trial）")
+        else:
+            # 「不可达」仅指无 keep/best 候选达标；若存在非 keep/best 的已测量行达标（如被 discard），
+            # 说明时延本身可达 → 软化建议，避免误导为「放宽 SLO」。
+            measured_ref = [r for r in _ctx_rows(rows, baseline_ctx)
+                            if r.get("status") not in ("crash", "confirm") and slo_ok(r, ref)]
+            if measured_ref:
+                lines.append("- 参考 SLO：**不可达**（无 keep/best trial 满足参考 SLO；但存在已测量行达标却未通过 keep 判定）"
+                             "——建议人工复核该配置（是否仅被噪声带拦下），而非直接放宽 SLO。")
+            else:
+                lines.append("- 参考 SLO：**不可达**（基线上下文内无 keep/best trial 满足参考 SLO；best 为有效 SLO 下的最优；"
+                             "建议放宽至实测 p99 或复核硬件/模型适配）")
+    else:
+        lines.append(f"- SLO：ttft_p99 ≤ {sl['ttft_p99_ms']} ms；tpot_p99 ≤ {sl['tpot_p99_ms']} ms")
     if slo_calibrated:
-        ref = {**DEFAULT_SLO, **slo_calibrated}
-        lines.append(f"- ⚠ **运行期 SLO 校准**：参考 ttft {ref['ttft_p99_ms']}→{sl['ttft_p99_ms']} ms、"
-                     f"tpot {ref['tpot_p99_ms']}→{sl['tpot_p99_ms']} ms 为有效 SLO"
+        ref_marker = {**DEFAULT_SLO, **slo_calibrated}
+        lines.append(f"- ⚠ **运行期 SLO 校准**：参考 ttft {ref_marker['ttft_p99_ms']}→{sl['ttft_p99_ms']} ms、"
+                     f"tpot {ref_marker['tpot_p99_ms']}→{sl['tpot_p99_ms']} ms 为有效 SLO"
                      "（本报告 SLO 达标列与 best 判定均按有效 SLO）。")
     lines.append(f"- trial 数：{len(rows)}（keep={counts.get('keep', 0)}，"
                  f"discard={counts.get('discard', 0)}，crash={counts.get('crash', 0)}，"
                  f"best={counts.get('best', 0)}，confirm={counts.get('confirm', 0)}）")
     lines.append(f"- 生成时间：{datetime.datetime.now().isoformat(timespec='seconds')}")
     lines.append("")
+
+    # F4：legacy 基线（无上下文）+ ≥1 个非空上下文 → 也要出可比性节（否则静默混比）；
+    # 基线有上下文时仅在 >1 个不同上下文（含基线外的）才出节。
+    if comparability and (len(comparability) > 1 or (baseline_ctx is None and len(comparability) >= 1)):
+        lines += ["## 可比性", ""]
+        lines.append("账本包含多个不同的 `(workload_hash, slo)` 上下文——跨上下文行不可混比：")
+        lines.append("")
+        lines.append("| workload_hash | slo | trial 数 |")
+        lines.append("|---|---|---|")
+        for (w, s), n in comparability:
+            lines.append(f"| {w or '—'} | {s or '—'} | {n} |")
+        lines.append("")
+        if baseline_ctx is not None:
+            lines.append(f"- 仅基线上下文（`{baseline_ctx[0] or '—'}` / `{baseline_ctx[1] or '—'}`）"
+                         "参与 best 选择；其余上下文仅供诊断（不混比）。")
+        else:
+            lines.append("- 基线为旧表行（无上下文）：best 选择按旧行为覆盖全部行，但各上下文不可混比"
+                         "——建议用 scripts/record.py 重建账本。")
+        lines.append("")
 
     lines += ["## 基线 vs 最佳", ""]
     lines.append("| 指标 | 基线 | 最佳 |")
@@ -255,12 +352,29 @@ def render(rows: list[dict], slo: dict | None, baseline: dict | None, best: dict
     if best is not None:
         lines.append(f"- goodput 提升：**{_fmt(improvement)}%**"
                      f"（基线 {_fmt(baseline.get('goodput') if baseline else None)} → "
-                     f"最佳 {_fmt(best.get('goodput'))}，commit={best.get('commit')}）")
+                     f"最佳 {_fmt(best.get('goodput'))}，commit={best.get('commit')}）"
+                     + ("，均按**有效 SLO**" if reference_slo else ""))
         if best_flagged:
             lines.append("- ⚠ **无满足 SLO 的 trial**：最佳为「全部已测量行中最高 goodput」的回退选择，"
                          "需人工复核（SLO 是否过严 / 配置是否需改进）。")
+        if reference_slo:
+            # 参考 SLO 对标：基线上下文内的参考 SLO 最优行（存在才列，否则明示无）
+            b_ref = best_under_slo(rows, ref, baseline_ctx)
+            if b_ref is not None:
+                lines.append(f"- 参考 SLO 下的最佳：commit={b_ref.get('commit')}，"
+                             f"goodput={_fmt(b_ref.get('goodput'))} req/s"
+                             f"（ttft_p99 {_fmt(b_ref.get('ttft_p99_ms'))} ms ≤ {ref['ttft_p99_ms']}、"
+                             f"tpot_p99 {_fmt(b_ref.get('tpot_p99_ms'))} ms ≤ {ref['tpot_p99_ms']}）"
+                             + ("；与有效 SLO best 相同" if b_ref is best else "。"))
+            else:
+                lines.append("- 参考 SLO 下无达标行（参考 SLO 不可达；best 为有效 SLO 下的最优）。")
     else:
-        lines.append("- 无任何可比较的 trial（results.tsv 为空或全部 crash）。")
+        # F5：行存在但基线上下文内无候选 → 明确文案；仅当表真空/全 crash 才用原文案
+        if not rows or all(r.get("status") == "crash" for r in rows):
+            lines.append("- 无任何可比较的 trial（results.tsv 为空或全部 crash）。")
+        else:
+            lines.append("- 基线上下文内无可比较的 trial（行存在，但基线上下文内无候选；"
+                         "其余上下文/legacy 行不参与 best 选择）。")
     lines.append("")
 
     lines += ["## 全部 trial 表", ""]
@@ -391,6 +505,8 @@ def main(argv: list[str] | None = None) -> int:
     target_slo = {**harness.get("slo", {}), **((target.get("metrics") or {}).get("slo") or {})}
     config_slo = config.get("slo") or {}
     slo = resolve_slo(harness, target, config)
+    # 双口径：参考 SLO（target 声明，不改语义）vs 有效 SLO（config.slo 运行期校准，判定用）
+    reference_slo = target_slo
     # 校准标注：config.slo 非空且与参考（target 口径）不同 → 报告出「运行期 SLO 校准」
     slo_calibrated = target_slo if (config_slo and config_slo != target_slo) else None
     workload = {**harness.get("workload", {}), **(target.get("workload") or {})}
@@ -413,7 +529,17 @@ def main(argv: list[str] | None = None) -> int:
             env_report = f.read()
 
     baseline = pick_baseline(rows)
-    best, flagged = pick_best(rows, slo)
+    # 可比性：基线上下文 (workload_hash, slo)；best 只在其内选（旧表基线无上下文 → 旧行为全行）
+    baseline_ctx = context_key(baseline) if baseline else None
+    comparability = sorted((k, n) for k, n in
+                           Counter(context_key(r) for r in rows).items() if k is not None)
+    # F4：legacy 基线（无上下文）+ ≥1 个非空上下文 → 警告（否则静默混比）
+    if baseline_ctx is None and len(comparability) >= 1:
+        # 旧表（基线无上下文）但行含非空上下文：best 覆盖全行，跨上下文不可混比
+        print("警告: results.tsv 基线无 (workload_hash, slo) 上下文（旧表），但存在含上下文的行；"
+              "best 选择按旧行为覆盖全部行，legacy 行上下文未知，跨上下文不可混比。"
+              "建议用 scripts/record.py 重建账本。", file=sys.stderr)
+    best, flagged = pick_best(rows, slo, baseline_ctx)
     imp = improvement_pct(baseline, best)
     snapshot = git_show_config(best.get("commit") if best else None)
     # 部署产物：best commit 的 config.yaml 快照 → 独立 serve 的 docker run（复用 bench.py 构建器）
@@ -421,7 +547,8 @@ def main(argv: list[str] | None = None) -> int:
     md = render(rows, slo, baseline, best, flagged, imp, model=model, workload=workload,
                 config_snapshot=snapshot, system_advice=extract_system_advice(env_report),
                 deploy_cmd=deploy_cmd, noise_band_pct=noise_band_pct, noise_k_sigma=noise_k_sigma,
-                slo_calibrated=slo_calibrated)
+                slo_calibrated=slo_calibrated,
+                reference_slo=reference_slo, baseline_ctx=baseline_ctx, comparability=comparability)
 
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(md)

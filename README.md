@@ -41,6 +41,7 @@
 | `run.sh` | 两段式执行：rsync + 远端 nohup 启动 + 轮询状态 | 只读 |
 | `setup_remote.sh` | 主机环境校验（docker-only：校验 docker 可用 + 镜像就绪；零 pull、零安装） | 只读 |
 | `scripts/mock_loop.py` | 循环规则的可执行规格/演示（REFERENCE，供离线核对 program.md 规则） | 只读 |
+| `scripts/record.py` | 从回传的 `result.json` 机械追加一行 results.tsv（trial_id/config_hash/workload_hash/slo 双口径记账，防手写错列） | 只读 |
 | `docs/vllm-facts.md` | 模板依赖的 vLLM 行为事实（版本相关，升级需重新核对） | 只读 |
 | `docs/external-resources.md` | 外部 skills / MCP / 工具调研（vLLM 调优生态） | 只读 |
 | `docs/roadmap.md` | 后续路线图（v1.1 证据/验收层、v2 架构扩展） | 只读 |
@@ -98,7 +99,9 @@
 ## 如何解读 report.md
 
 - 「基线 vs 最佳」：goodput 提升 % =（最佳 − 基线）/ 基线；若标注「⚠ 无满足 SLO 的 trial」，则最佳为回退选择（全部已测量行中最高），需人工复核 SLO 是否过严。
+- **参考 SLO vs 有效 SLO**：概览同时列出两者——参考 SLO 来自 `target.yaml`（声明值，不改语义），有效 SLO 是 goodput / keep 判定实际用的值（默认等于参考，校准后经 `config.yaml.slo` 生效）。报告明确给出「参考 SLO：可达 / 不可达」结论：不可达时 best 为有效 SLO 下的最优，建议放宽至实测 p99 或复核硬件/模型适配；「基线 vs 最佳」另附一行参考 SLO 下的最佳（基线上下文内），无达标行则明示。
 - 若出现「运行期 SLO 校准」标注：说明参考 SLO 不可达，agent 已按实测 p99 校准出有效 SLO（概览标注「参考→有效」ttft/tpot）；best 为有效 SLO 下的最优，校准留痕见 `results.tsv.description`。
+- **可比性**：账本若含多个不同的 `(workload_hash, slo)` 上下文，报告「可比性」节逐项列出（含 trial 数），并声明只有基线上下文参与 best 选择——跨上下文行不可混比。
 - 「全部 trial 表」：按 goodput 降序，SLO 达标列一眼看出哪些配置可用。
 - 「最佳配置」：内嵌 `git show <best_commit>:config.yaml` 的快照（git 不可用时提示手动查看）。
 - 「系统级建议」：来自 `env_report.md` 的 warn/fail 项，均为人工可执行建议（v1 不自动改）。
