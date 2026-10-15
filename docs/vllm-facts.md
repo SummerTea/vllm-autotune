@@ -1,6 +1,6 @@
 # vLLM 事实参考（v0.31.0）
 
-本文件记录本模板所依赖的 vLLM 行为事实，**全部取自 v0.31.0**（2026-10-05 发布的最新稳定版）源码与官方文档。模板实现（`bench.py` / `probe.py` / `setup_remote.sh`）以下列事实为准；升级 vLLM 版本时请重新核对。
+本文件记录本模板所依赖的 vLLM 行为事实，**取自 v0.31.0**（2026-10-05 发布的最新稳定版）源码与官方文档，部分条目另经 nightly（`0.31.1rc1.dev*`）实机核对（见各条标注）。模板实现（`bench.py` / `probe.py` / `setup_remote.sh`）以下列事实为准；升级 vLLM 版本时请重新核对。
 
 > ⚠️ 版本漂移警告：v0.31 为快速迭代版本，落地前请对 `vllm serve --help=all`（bare `--help` 只给配置组索引）/ `vllm bench serve --help` 输出与启动日志行做一次冒烟核对。
 
@@ -95,7 +95,7 @@ Chunked prefill is enabled with max_num_batched_tokens=%d.
 
 - `bench.py` 用镜像内 **`vllm serve --help=all`**（`docker run --entrypoint vllm <image> serve --help=all`，stdout+stderr 都抓，按 image 缓存到 out-dir）提取合法 flag 集；`config.yaml.serve` 里不在该集的键在起服前 fail-fast crash。
 - **bare `vllm serve --help` 只打印配置组索引**（如 `--help=ModelConfig`，约 41 行），不列任何真实 flag——不可用于预校验；完整列表须 `--help=all`（约 2384 行）。
-- 嵌套点号子参数（如 `--attention_config.indexer_kv_dtype`）是 vLLM `FlexibleArgumentParser` 的真实语法（官方 DeepSeek-V4 部署样例即用此形态，`--help=<dotted>` 查不到它只是帮助机制不枚举子字段）；模板对含 `.` 的键**原样透传**（不 `_`→`-`），并只校验其顶层组（`--attention-config`）——因为 `--help=all` 只列顶层组选项、不列子字段。
+- 嵌套点号子参数（如 `--attention_config.indexer_kv_dtype`）是 vLLM `FlexibleArgumentParser` 的真实语法（vLLM 官方部署样例/文档即用此形态——以官方文档为准，非某一模型专属；`--help=<dotted>` 查不到它只是帮助机制不枚举子字段）；模板对含 `.` 的键**原样透传**（不 `_`→`-`），并只校验其顶层组（`--attention-config`）——因为 `--help=all` 只列顶层组选项、不列子字段。
   - 代价（已知边界）：**子字段拼写错误不会被预校验捕获**（fail-fast 只覆盖顶层组名），会由 vLLM 起服时报错或按未知键忽略。
 - 跳过条件：镜像无法提供可用 help（rc≠0，或文本里没有任何真实 flag token）→ 跳过预校验（best-effort，不阻塞 trial）。
 

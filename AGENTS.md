@@ -72,7 +72,7 @@
 - **角色边界**：探索（只读源码/文档/外部知识 → 有界摘要 + 引用位置）；分析（解析 run.log/result.json/env.json/results.tsv → 根因/趋势，附 commit 或「文件:行」证据）；验证（对将被采纳的结论做对抗性复核，独立于产生结论者）；评估（按 program.md 决策规则打分，优先直接调用 scripts/mock_loop.py）。
 - **唯一写者原则**：只有主循环写 config.yaml 与生成物（results.tsv/report.md/git commit）；子 agent 只读 repo 与远端，经返回值回传，不写任何文件。
 - **并行与顺序**：只读且不占 GPU 的子 agent 可并行，上限 ≤3；任何触发 run.sh 的动作必须串行。
-- **不该派**：单文件小读取；结果立刻要用且便宜；需要写权限；会重复加载模型或重跑 trial（单 trial 约 19min）。harness 不支持子 agent 时，在主循环内联同等的摘要纪律（优雅降级）。
+- **不该派**：单文件小读取；结果立刻要用且便宜；需要写权限；会重复加载模型或重跑 trial（单 trial 成本高，通常远超一次只读检索）。harness 不支持子 agent 时，在主循环内联同等的摘要纪律（优雅降级）。
 - **会话回收**：常驻 explorer（环境/事实，跨 trial 复用）+ 一次性 analyst（每 trial）；回传 ≤N 行摘要 + 指针，原文不进主上下文。
 
 ## 循环调度与上下文预算

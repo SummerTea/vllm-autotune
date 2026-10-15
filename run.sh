@@ -295,13 +295,33 @@ cmd_fetch() {
   return 1
 }
 
+# 只读占用探测（供 program.md「环境失效与共租处置」的有限重探）：打印远端 GPU 利用率/显存与
+# 外部 compute 进程；退出码 0=空闲、1=有外部占用（或 ssh 失败）。不启 trial、不写远端。
+cmd_check_gpus() {
+  local out head_ssh raw apps
+  out="$(extract_meta 0)" || return 1
+  head_ssh="$(printf '%s\n' "$out" | sed -n '1p')"
+  raw="$(ssh "${SSH_OPTS[@]}" -n "$head_ssh" \
+    'echo "--- GPU (index,memory.used,util.gpu) ---"; nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader 2>/dev/null || echo "(nvidia-smi 不可用)"; echo "--- COMPUTE_APPS (pid,proc,mem) ---"; nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null || true')" \
+    || { echo "无法读取远端 GPU 状态（ssh 失败）：$head_ssh" >&2; return 1; }
+  printf '%s\n' "$raw"
+  apps="$(printf '%s\n' "$raw" | sed -n '/--- COMPUTE_APPS/,$p' | tail -n +2 | tr -d '[:space:]')"
+  if [ -n "$apps" ]; then
+    echo "判定：非空闲——检测到外部 GPU 进程（共租会污染吞吐/时延测量）" >&2
+    return 1
+  fi
+  echo "判定：空闲——无外部 GPU 进程"
+  return 0
+}
+
 usage() {
   cat <<'EOF'
-用法: bash run.sh [--poll|--fetch|--detect-gmu|--help]
+用法: bash run.sh [--poll|--fetch|--detect-gmu|--check-gpus|--help]
   无参数   启动一轮 trial（rsync → 远端 nohup 后台运行 → 秒回）
   --detect-gmu  启动 gmu 预检（同 start：远端 bench.py --detect-gmu，结果回传 gmu_probe.json）
   --poll   单次状态检查；退出码: 0=done 1=crash 3=仍在运行
   --fetch  打印本机最新 result.json（来自上次 done 的回传副本）
+  --check-gpus  只读探测 head 主机 GPU 占用（外部 compute 进程）；退出码 0=空闲 1=有外部占用
 EOF
 }
 
@@ -309,6 +329,7 @@ case "${1:-}" in
   --detect-gmu) cmd_start --detect-gmu ;;
   --poll) cmd_poll ;;
   --fetch) cmd_fetch ;;
+  --check-gpus) cmd_check_gpus ;;
   --help | -h) usage ;;
   "") cmd_start ;;
   *) usage >&2; exit 2 ;;
