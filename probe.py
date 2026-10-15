@@ -154,6 +154,86 @@ def _docker_cmd(img: str, mp: str, inner: str) -> str:
             f"--entrypoint sh {shlex.quote(img)} -c {shlex.quote(inner)}")
 
 
+def _read_bw_cmd(mp: str) -> str:
+    """模型目录顺序读带宽实测：对最大文件做限时只读顺序读（dd of=/dev/null），
+    先试 iflag=direct，失败回退不 direct；bs=1M count=1024（约 1GiB，数秒内）。
+    dd 的速率汇总写在 **stderr**，须 2>&1 并入 stdout 才能被远端捕获解析（真机教训）；
+    无文件/失败静默（|| true 容错，只读零破坏）。"""
+    q = shlex.quote(mp)
+    inner = (f"f=$(find {q} -type f -printf '%s %p\\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-); "
+             f'if [ -n "$f" ]; then dd if="$f" of=/dev/null bs=1M count=1024 iflag=direct 2>&1 '
+             f'|| dd if="$f" of=/dev/null bs=1M count=1024 2>&1 || true; fi')
+    return inner + " || true"
+
+
+# 容器内 GPU P2P copy 短时测例：128MiB 块，8 次取均值；同 NUMA 对 0→1、跨 NUMA 对 0→4
+#（启发式；少于 5 卡则跨 NUMA 取 0→n-1）。每个 pair 先 ≥2 次不计时预热 copy 并同步，
+# 再计时（真机教训：无预热会把 CUDA/P2P 首次初始化开销算进第一个被测对）。输出行
+# `P2P_INTRA <GB/s> P2P_CROSS <GB/s>`。
+_P2P_SCRIPT = (
+    "import torch,time\n"
+    "n=torch.cuda.device_count()\n"
+    "if n<2:\n"
+    " print('P2P_SKIP n<2')\n"
+    " raise SystemExit(0)\n"
+    "def bw(i,j):\n"
+    " x=torch.empty(128*1024*1024,dtype=torch.uint8,device='cuda:%d'%i)\n"
+    " y=torch.empty(128*1024*1024,dtype=torch.uint8,device='cuda:%d'%j)\n"
+    " for _ in range(2): y.copy_(x)\n"
+    " torch.cuda.synchronize()\n"
+    " t0=time.perf_counter()\n"
+    " for _ in range(8): y.copy_(x)\n"
+    " torch.cuda.synchronize()\n"
+    " return 0.134217728/((time.perf_counter()-t0)/8)\n"
+    "same=bw(0,1)\n"
+    "cp=4 if n>=5 else n-1\n"
+    "cross=bw(0,cp)\n"
+    "print('P2P_INTRA %.3f P2P_CROSS %.3f'%(same,cross))\n"
+)
+
+
+def _docker_p2p_cmd(img: str) -> str:
+    """容器内 torch GPU P2P copy 短时实测（同/跨 NUMA 启发式对；短时、只读、零安装）。"""
+    return (f"docker run --rm --pull=never --gpus all --ipc host --entrypoint python3 "
+            f"{shlex.quote(img)} -c {shlex.quote(_P2P_SCRIPT)} 2>/dev/null || true")
+
+
+# 单 SSH 调用内的 RDMA 带宽实测（ib_write_bw）：按 sysfs numa_node 挑两张跨 NUMA 的 NIC，
+# 两侧都用 -d <hca> 指定各自选中的卡（真机教训：不指定会落到同一默认 HCA，跨 NUMA 意图落空）；
+# client **只传 server IP**（ib_write_bw 一收到 IP 即进 client 模式：**server 绝不能带 IP**，否则两侧都去连别人；
+# 真机教训）。两侧 `-d <hca>` 钉住跨 NUMA 选中的卡；`--report_gbits` 让输出列为 `BW average[Gb/sec]`（默认是 MB/sec）。
+# server 必须 nohup+重定向+</dev/null 后台（否则 ssh 挂到进程结束），用 timeout 15 兜底
+#（防孤儿挂死），测完按 PID 精确 kill（禁用 pkill -f——同串会杀自身 shell）。
+_RDMA_BW_CMD = """\
+out=""; a=""; b=""
+for d in /sys/class/infiniband/*; do
+  [ -d "$d" ] || continue
+  n=${d##*/}
+  nn=$(cat "$d/device/numa_node" 2>/dev/null || true)
+  nd=$(ls "$d/device/net" 2>/dev/null | head -1)
+  [ -n "$nn" ] || continue
+  [ -n "$nd" ] || continue
+  if [ -z "$out" ]; then out="$n $nn $nd"; continue; fi
+  set -- $out
+  if [ "$2" != "$nn" ]; then a="$1 $3"; b="$n $nd"; break; fi
+done
+if [ -z "$a" ] || [ -z "$b" ]; then echo "RDMA_SKIP no cross-numa pair"; exit 0; fi
+set -- $a; sa=$1; snd=$2
+set -- $b; ca=$1
+sip=$(ip -4 -o addr show dev "$snd" 2>/dev/null | awk '{print $4}'); sip=${sip%/*}
+if [ -z "$sip" ]; then echo "RDMA_SKIP no ip on netdev"; exit 0; fi
+port=18515
+if command -v ib_write_bw >/dev/null 2>&1; then
+  nohup timeout 15 ib_write_bw -d "$sa" -D 3 -p "$port" --report_gbits >/tmp/probe_ibw_srv.log 2>&1 </dev/null &
+  spid=$!
+  sleep 2
+  ib_write_bw -d "$ca" -D 3 -p "$port" --report_gbits "$sip" 2>&1 || true
+  kill "$spid" 2>/dev/null || true
+fi
+exit 0
+"""
+
+
 def _collect_plan(target: dict, harness: dict, config: dict | None = None) -> dict[str, list]:
     """每台主机的采集计划：list of (key, cmd, fixture 文件名)。
     docker-only：source=local + runtime.image 可解析时，模型探测改为在镜像内执行
@@ -179,6 +259,17 @@ def _collect_plan(target: dict, harness: dict, config: dict | None = None) -> di
             # 用 -o 格式（每行一条 + mtu），避免 -br 别名在不同系统上的解析差异
             _cmd("ip_link", "ip -o link show 2>/dev/null || true"),
             _cmd("ibv_devinfo", "command -v ibv_devinfo >/dev/null 2>&1 && ibv_devinfo -l || true"),
+            # RDMA 主判据（sysfs + rdma 工具；ibstat/ibv_devinfo 仅补充，缺工具不判假阴性）
+            _cmd("rdma_devices", "ls /sys/class/infiniband 2>/dev/null || true"),
+            _cmd("rdma_link", "rdma link show 2>/dev/null || true"),
+            _cmd("rdma_ports",
+                 "for d in /sys/class/infiniband/*/ports/1; do [ -f \"$d/link_layer\" ] || continue; "
+                 "n=${d%/ports/1}; n=${n##*/}; echo \"$n $(cat \"$d/link_layer\" 2>/dev/null) "
+                 "$(cat \"$d/rate\" 2>/dev/null)\"; done 2>/dev/null || true"),
+            _cmd("rdma_numa",
+                 "for d in /sys/class/infiniband/*/device/numa_node; do [ -f \"$d\" ] || continue; "
+                 "n=${d%/device/numa_node}; n=${n##*/}; echo \"$n $(cat \"$d\" 2>/dev/null)\"; "
+                 "done 2>/dev/null || true"),
             _cmd("docker_version", "docker --version 2>/dev/null || true"),
             _cmd("docker_images", "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null || true"),
             # 镜像可解析 → 镜像内 vllm --version（docker-only 主机无宿主 pip 版 vllm）；
@@ -205,6 +296,9 @@ def _collect_plan(target: dict, harness: dict, config: dict | None = None) -> di
                         _cmd("df_model",
                              _docker_cmd(image, mp, f"df -B1 --output=avail {shlex.quote(mp)}")
                              + " 2>/dev/null | tail -1 || true"),
+                        _cmd("read_bw_model",
+                             _docker_cmd(image, mp, _read_bw_cmd(mp)) + " 2>/dev/null || true",
+                             "read_bw_model.txt"),
                     ]
                 else:
                     cmds += [
@@ -213,6 +307,7 @@ def _collect_plan(target: dict, harness: dict, config: dict | None = None) -> di
                              f"cat {shlex.quote(mp)}/*.safetensors.index.json 2>/dev/null || true",
                              "safetensors.index.json"),
                         _cmd("df_model", f"df -B1 --output=avail {shlex.quote(os.path.dirname(mp))} 2>/dev/null | tail -1 || true"),
+                        _cmd("read_bw_model", _read_bw_cmd(mp), "read_bw_model.txt"),
                     ]
             else:  # source=hf：尝试本地 HF 缓存（~/.cache/huggingface/hub/models--<id>/snapshots/*）
                 hid = model.get("id", "").split("@")[0].replace("/", "--")
@@ -225,6 +320,10 @@ def _collect_plan(target: dict, harness: dict, config: dict | None = None) -> di
                          f"for f in {glob}/*.safetensors.index.json; do [ -f \"$f\" ] && cat \"$f\" && exit 0; done; exit 0",
                          "safetensors.index.json"),
                 ]
+            # 互联带宽实测（head）：GPU P2P 需镜像（容器测例）；RDMA 脚本自含选卡/起停
+            if image:
+                cmds += [_cmd("gpu_p2p_bw", _docker_p2p_cmd(image), "gpu_p2p_bw.txt")]
+            cmds += [_cmd("rdma_bw", _RDMA_BW_CMD, "rdma_bw.txt")]
         plan[name] = cmds
     return plan
 
@@ -395,6 +494,130 @@ def parse_ip_link(text: str | None) -> list[dict]:
         if m:
             ifaces.append({"name": m.group(1), "mtu": int(m.group(2))})
     return ifaces
+
+
+def parse_rdma_devices(text: str | None) -> list[str]:
+    """`ls /sys/class/infiniband` → RDMA 设备名列表（mlx5_0 等）；空/缺 → []。"""
+    if not text:
+        return []
+    return [d.strip() for d in text.splitlines() if d.strip()]
+
+
+def parse_rdma_link(text: str | None) -> dict[str, dict]:
+    """`rdma link show` → {dev: {netdev, state, physical_state}}。
+    真机行格式（行尾有尾随空格，netdev 仅 linked 时出现）:
+    `link mlx5_0/1 state ACTIVE physical_state LINK_UP netdev enp24s0f0np0 `"""
+    out: dict[str, dict] = {}
+    if not text:
+        return out
+    for line in text.splitlines():
+        m = re.match(r"^link (\S+)/(\d+) state (\S+) physical_state (\S+)(?:\s+netdev (\S+))?\s*$", line)
+        if not m:
+            continue
+        out[m.group(1)] = {"netdev": m.group(5), "state": m.group(3), "physical_state": m.group(4)}
+    return out
+
+
+def parse_rdma_ports(text: str | None) -> dict[str, dict]:
+    """sysfs ports 循环输出（每行 `<dev> <link_layer> <rate 全文>`）→ {dev: {link_layer, rate}}。
+    rate 为多 token（如 `400 Gb/sec (4X NDR)`），拼接保留原文。"""
+    out: dict[str, dict] = {}
+    if not text:
+        return out
+    for line in text.splitlines():
+        toks = line.split()
+        if len(toks) >= 2:
+            out[toks[0]] = {"link_layer": toks[1], "rate": " ".join(toks[2:]) or None}
+    return out
+
+
+def parse_rdma_numa(text: str | None) -> dict[str, int | None]:
+    """sysfs numa 循环输出（每行 `<dev> <numa_node>`）→ {dev: numa_node}。
+    值可能为 -1（无 NUMA 归属）→ None。"""
+    out: dict[str, int | None] = {}
+    if not text:
+        return out
+    for line in text.splitlines():
+        toks = line.split()
+        if len(toks) >= 2 and toks[1].lstrip("-").isdigit():
+            out[toks[0]] = int(toks[1]) if int(toks[1]) >= 0 else None
+    return out
+
+
+def parse_rate_gbps(rate: str | None) -> int | None:
+    """sysfs `/ports/1/rate` → Gbps。真机格式 `400 Gb/sec (4X NDR)`，
+    兼容 `100 Gb/sec (4X EDR)` / `25 Gb/sec` / `200 Gb/sec (2X HDR)` 等变体。"""
+    if not rate:
+        return None
+    m = re.search(r"(\d+)\s*Gb", rate)
+    return int(m.group(1)) if m else None
+
+
+def parse_topo_nics(text: str | None, gpu_count: int) -> list[dict]:
+    """nvidia-smi topo -m 的 NIC 行 → [{name, gpu_links: {gpu_index: 连接码}, numa_node}]。
+    行格式与 GPU 行一致：首 token NIC<n>，随后 gpu_count 个 GPU 连接码，
+    末 3 列 CPU Affinity / NUMA Affinity / GPU NUMA ID（NUMA Affinity 非数字 → None）。"""
+    nics: list[dict] = []
+    if not text or not gpu_count:
+        return nics
+    for line in text.splitlines():
+        toks = line.split()
+        if len(toks) < gpu_count + 4 or not re.match(r"^NIC(\d+)$", toks[0]):
+            continue
+        gpu_links = {str(j): toks[1 + j] for j in range(gpu_count)}
+        numa_aff = toks[-2]
+        nics.append({"name": toks[0], "index": int(toks[0][3:]), "gpu_links": gpu_links,
+                     "numa_node": int(numa_aff) if numa_aff.isdigit() else None})
+    return nics
+
+
+def parse_dd_bw(text: str | None) -> float | None:
+    """`dd if=<f> of=/dev/null` 尾行 `X bytes copied, T s, S MB/s` → 顺序读带宽 Gbps。
+    容错：无速率行/坏行 → None（探测不中断）。"""
+    if not text:
+        return None
+    for line in reversed(text.splitlines()):
+        m = re.search(r"copied, ([\d.]+) s, ([\d.]+) (MB|GB)/s", line)
+        if m:
+            v = float(m.group(2))
+            return v * 8 / (1000 if m.group(3) == "MB" else 1)
+    return None
+
+
+def parse_gpu_p2p_bw(rec: dict | None) -> dict:
+    """容器内 torch p2p copy 输出 → {intra_numa, cross_numa}（GB/s）。
+    行格式 `P2P_INTRA 43.35 P2P_CROSS 33.87`；不可得 → None + note（绝不抛错）。"""
+    if not rec or not rec.get("ok") or not rec.get("value"):
+        note = f"gpu_p2p_bw: {rec.get('note') or '未采集'}" if rec else "gpu_p2p_bw: 未采集"
+        return {"intra_numa": None, "cross_numa": None, "note": note}
+    out: dict = {"intra_numa": None, "cross_numa": None}
+    for m in re.finditer(r"P2P_INTRA\s+([\d.]+)|P2P_CROSS\s+([\d.]+)", rec["value"]):
+        if m.group(1):
+            out["intra_numa"] = float(m.group(1))
+        if m.group(2):
+            out["cross_numa"] = float(m.group(2))
+    if out["intra_numa"] is None or out["cross_numa"] is None:
+        out["note"] = "gpu_p2p_bw: 输出缺 P2P_INTRA/P2P_CROSS 行"
+    return out
+
+
+def parse_rdma_bw(rec: dict | None) -> dict:
+    """ib_write_bw client 输出 → {bw_gbps}（BW average[Gb/sec]）。
+    数据行形如 ` 65536 0 352.9 341.7 0.000651`（第 4 列为平均带宽）；
+    不可得/RDMA_SKIP → None + note（绝不抛错）。"""
+    if not rec or not rec.get("ok") or not rec.get("value"):
+        note = f"rdma_bw: {rec.get('note') or '未采集'}" if rec else "rdma_bw: 未采集"
+        return {"bw_gbps": None, "note": note}
+    v = None
+    for line in rec["value"].splitlines():
+        m = re.match(r"^\s*(\d+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s", line)
+        if m:
+            v = float(m.group(4))
+    if v is None:
+        skip = re.search(r"RDMA_SKIP\s*(.*)", rec["value"])
+        note = f"rdma_bw: {skip.group(1).strip()}" if skip else "rdma_bw: 无 BW average 数据行"
+        return {"bw_gbps": None, "note": note}
+    return {"bw_gbps": v}
 
 
 def parse_thp(text: str | None) -> str | None:
@@ -609,9 +832,54 @@ def build_host_facts(host: dict, raw: dict) -> dict:
     if rec.get("ok") and rec.get("value"):
         df_avail = _first_int(rec["value"])
 
+    read_bw = None
+    rec = raw.get("read_bw_model", {})
+    if rec.get("ok") and rec.get("value"):
+        read_bw = parse_dd_bw(rec["value"])
+
+    # RDMA 主判据：sysfs 设备名 + rdma link（dev↔netdev/state）+ sysfs link_layer/rate/numa_node；
+    # ibstat/ibv_devinfo 仅补充（缺 ibstat 不再误判「无 RDMA」）
+    rdma_devs = parse_rdma_devices(raw.get("rdma_devices", {}).get("value"))
+    rdma_links = parse_rdma_link(raw.get("rdma_link", {}).get("value"))
+    rdma_ports = parse_rdma_ports(raw.get("rdma_ports", {}).get("value"))
+    rdma_numa_map = parse_rdma_numa(raw.get("rdma_numa", {}).get("value"))
     ib_ok = raw.get("ibstat", {}).get("ok")
     ib_devs_raw = raw.get("ibv_devinfo", {}).get("value")
     ib_devs = [l.strip() for l in ib_devs_raw.splitlines() if l.strip()] if ib_devs_raw else None
+    devices = []
+    for d in rdma_devs:
+        port = rdma_ports.get(d, {})
+        link = rdma_links.get(d, {})
+        devices.append({
+            "name": d,
+            "netdev": link.get("netdev"),
+            "link_layer": port.get("link_layer"),
+            "state": link.get("state"),
+            "physical_state": link.get("physical_state"),
+            "speed_gbps": parse_rate_gbps(port.get("rate")),
+            "numa_node": rdma_numa_map.get(d),
+            "gpu_links": {},
+        })
+    if devices:
+        # 补充 NIC↔GPU 拓扑级别（topo NIC 行）；numa 以 sysfs 为准，topo 仅兜底
+        nics = parse_topo_nics(raw.get("gpu_topo", {}).get("value"), len(gpus or []))
+        for i, d in enumerate(devices):
+            if i < len(nics):
+                if d["numa_node"] is None:
+                    d["numa_node"] = nics[i]["numa_node"]
+                d["gpu_links"] = nics[i]["gpu_links"]
+    if not devices:
+        kind = "none"
+    elif any(d["link_layer"] == "Ethernet" for d in devices):
+        kind = "roce"
+    else:
+        kind = "infiniband"
+    rdma = {
+        "kind": kind,
+        "devices": devices,
+        "ibstat_present": bool(ib_ok),   # 兼容既有字段
+        "ib_devices": ib_devs,           # 兼容既有字段
+    }
 
     docker_ver = (raw.get("docker_version", {}).get("value") or "").strip() or None
     docker_imgs_raw = raw.get("docker_images", {}).get("value") or ""
@@ -656,15 +924,25 @@ def build_host_facts(host: dict, raw: dict) -> dict:
         },
         "net": {
             "interfaces": ifaces,
-            "rdma": {
-                "ibstat_present": bool(ib_ok),
-                "ib_devices": ib_devs,
-            },
+            "rdma": rdma,
         },
-        "disk": {"model_path": None, "avail_bytes": df_avail},
+        "disk": {"model_path": None, "avail_bytes": df_avail, "read_bw_gbps": read_bw},
         "docker": {"version": docker_ver, "vllm_images": docker_vllm},
         "model_src": model_src,
     }
+
+
+def format_rdma(rdma: dict) -> str:
+    """RDMA 描述（env_report 关键事实行）：
+    无 → 「无」；RoCE → 「RoCE(Ethernet) ×N（速率 Gb/s）」；InfiniBand → 「InfiniBand ×N（速率 Gb/s）」。"""
+    kind = rdma.get("kind")
+    if kind not in ("infiniband", "roce"):
+        return "无"
+    devs = rdma.get("devices") or []
+    speeds = sorted({d.get("speed_gbps") for d in devs if d.get("speed_gbps")})
+    sp = f"（{'/'.join(str(s) for s in speeds)} Gb/s）" if speeds else ""
+    label = "RoCE(Ethernet)" if kind == "roce" else "InfiniBand"
+    return f"{label} ×{len(devs)}{sp}"
 
 
 def _system_checklist(facts: dict, is_head: bool, weights_bytes: int | None) -> list[dict]:
@@ -738,7 +1016,10 @@ def _system_checklist(facts: dict, is_head: bool, weights_bytes: int | None) -> 
         items.append({"name": "vm.swappiness", "status": "pass", "detail": f"当前 {sw}", "fix": "—"})
 
     rdma = facts["net"]["rdma"]
-    if rdma["ibstat_present"] or (rdma["ib_devices"] and rdma["ib_devices"][0] != ""):
+    if rdma.get("kind") not in ("infiniband", "roce"):
+        items.append({"name": "RDMA 网卡 MTU", "status": "pass",
+                      "detail": "未启用 RDMA（无 InfiniBand/RoCE）", "fix": "—"})
+    else:  # InfiniBand 与 RoCE 都检查（RoCE 走以太网接口，也可能低于 MTU 阈值）
         low = [i["name"] for i in facts["net"]["interfaces"] if i.get("mtu", 0) < MTU_WARN_BELOW]
         if low:
             items.append({"name": "RDMA 网卡 MTU", "status": "warn",
@@ -746,8 +1027,6 @@ def _system_checklist(facts: dict, is_head: bool, weights_bytes: int | None) -> 
                           "fix": f"sudo ip link set {low[0]} mtu 9000"})
         else:
             items.append({"name": "RDMA 网卡 MTU", "status": "pass", "detail": "MTU ≥ 9000 或未检测到接口", "fix": "—"})
-    else:
-        items.append({"name": "RDMA 网卡 MTU", "status": "pass", "detail": "未启用 RDMA/IB", "fix": "—"})
 
     dv = (facts.get("docker") or {}).get("version")
     if dv:
@@ -930,7 +1209,7 @@ def render_env_report(target: dict, facts: dict, interconnect: dict,
         lines.append(f"- 内存：THP=`{f['mem'].get('thp')}`，swappiness=`{f['mem'].get('swappiness')}`")
         lines.append(f"- vLLM：`{f.get('vllm_version')}`（{f.get('python3_version')}，hostname={f.get('hostname')}）")
         lines.append(f"- 网络接口：{', '.join(i['name'] for i in f['net']['interfaces']) or '—'}"
-                     f"；RDMA/IB：{'有' if f['net']['rdma']['ibstat_present'] else '无'}")
+                     f"；RDMA：{format_rdma(f['net']['rdma'])}")
         dk = f.get("docker") or {}
         lines.append(f"- docker：{dk.get('version') or '不可用'}；本地 vllm 镜像："
                      f"{', '.join(dk.get('vllm_images') or []) or '无'}")
@@ -940,6 +1219,11 @@ def render_env_report(target: dict, facts: dict, interconnect: dict,
     lines.append(f"- covered：{interconnect['covered']}；{interconnect.get('reason') or '（见 checks）'}")
     for c in interconnect.get("checks", []):
         lines.append(f"  - {c['check']}: `{c.get('result') or '—'}` {c.get('note') or ''}".rstrip())
+    p2p = interconnect.get("gpu_p2p_bw_gbps") or {}
+    rdma = interconnect.get("rdma_bw_gbps") or {}
+    lines.append(f"- GPU P2P 带宽（容器实测）：intra_numa={p2p.get('intra_numa')} GB/s，"
+                 f"cross_numa={p2p.get('cross_numa')} GB/s")
+    lines.append(f"- RDMA 带宽（ib_write_bw 实测）：{rdma.get('bw_gbps')} Gb/s")
     lines.append("")
     lines.append(f"## 汇总：pass={total['pass']} warn={total['warn']} fail={total['fail']}")
     lines.append("")
@@ -985,6 +1269,10 @@ def main(argv: list[str] | None = None) -> int:
             raw[h["name"]] = fut.result()
 
     facts = {h["name"]: build_host_facts(h, raw[h["name"]]) for h in target["hosts"]}
+    # disk.model_path：head 上模型目录（build_host_facts 无 target 上下文，此处补）
+    mp = (target.get("model") or {}).get("path")
+    if mp:
+        facts[head["name"]]["disk"]["model_path"] = mp
 
     gmu = read_gmu_default()
     model_profile = build_model_profile(target.get("model") or {}, facts[head["name"]], gmu)
@@ -993,6 +1281,10 @@ def main(argv: list[str] | None = None) -> int:
         facts[h["name"]]["checklist"] = _system_checklist(
             facts[h["name"]], is_head=(h is head), weights_bytes=wb)
     interconnect = interconnect_check(target, mode, args.fixtures)
+    # 互联带宽实测（head）：fixtures 模式从 <key>.txt 读；live 模式由 plan 命令短时实测。
+    # 不可得 → null + note，绝不阻塞其它采集。
+    interconnect["gpu_p2p_bw_gbps"] = parse_gpu_p2p_bw(raw[head["name"]].get("gpu_p2p_bw"))
+    interconnect["rdma_bw_gbps"] = parse_rdma_bw(raw[head["name"]].get("rdma_bw"))
 
     env = {
         "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),

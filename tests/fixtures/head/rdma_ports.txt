@@ -1,0 +1,2 @@
+mlx5_0 Ethernet 400 Gb/sec (4X NDR)
+mlx5_1 Ethernet 400 Gb/sec (4X NDR)

@@ -92,14 +92,34 @@ commit  goodput  goodput_std  output_tok_s  ttft_p99_ms  tpot_p99_ms  peak_vram_
 
 ## 搜索空间与探测驱动剪枝
 
-依据 `env.json` / `model_profile.json` 动态剪枝，避免试已知无效的配置：
+搜索空间与剪枝由**四类环境维度**（主机 / NUMA / 网络 / 存储）共同决定，综合 `env.json` / `env_report.md` / `model_profile.json` 的具体事实，**不是单一指标**（如仅凭「有无 RDMA」）。每条剪枝/纳入都须引用上述文件的具体事实；环境事实变化（NIC/RDMA 状态、拓扑、时钟等）→ 重新评估相关维度；环境相关决策（含「放弃某维度」）写进 `results.tsv.description` 或 `report.md`。
 
-- **节点内互联**：NVLink / NVSwitch 全互联 → `tensor-parallel-size`（tp）可到 GPU 数；仅 PCIe → tp ≤ 4，优先并行数据（dp）。
-- **tp 优先序**：tp ≤ 4（PCIe）是**性能建议**；若单节点装不下模型（依据 `model_profile.json` 的权重量估算）则必须跨节点——此时以"可装下"为先，跨 NUMA 损耗须实测。
-- **NUMA 亲和**：tp 组应限定在**同一 NUMA 节点内**的 GPU（依据 `env.json` 的 `numa_groups`，如 8 卡两节点 → tp=4 选 `[0,1,2,3]` 或 `[4,5,6,7]`）；tp=8 跨两节点（走 SYS/跨 NUMA）仅在同节点方案不可行时才试，跨 NUMA 损耗需实测确认。GPU 选择经 `config.yaml` 的 `serve.tensor-parallel-size` + `env.CUDA_VISIBLE_DEVICES`（如 `"0,1,2,3"`，限定本 trial 容器可见的 GPU，随 `-e` 注入、零冲突）——`tp` 按可见 GPU 数设置。**主机级**绑定（`numactl --cpunodebind/--membind`）→ **只建议**（写进 `report.md`），不自动；**容器级** `--cpuset-cpus/--cpuset-mems`（经 `runtime.extra_docker_args`）→ **agent 可 opt-in**（仅影响本 trial 容器，零破坏，不改变主机）。
-- **RDMA**：有 RoCE / IB → NCCL 相关 env、NIXL / PD 分离进入搜索空间；无 → 移出搜索空间（NCCL env 名见 `docs/vllm-facts.md` §6；NIXL / PD 相关 env 需 agent 自行查证后使用）。
-- **合法 tp 集合**：由 `num_attention_heads` / `num_key_value_heads` 的约数决定，非法 tp 值不试；例外：`num_key_value_heads`≤1（MLA / MQA）时 vLLM 在 tp>kv_heads 时复制 KV heads，合法 tp 只受 `num_attention_heads` 约数约束。
-- **系统级参数**：governor / hugepages / 锁频 / **主机级 NUMA 亲和绑定**等只探测 + 建议（写进 report.md），不自动修改（v1 不提供自动修改开关）。
+### 主机（GPU / 拓扑 / 时钟 / 系统参数）
+- **探测依据**：`env.json`——`gpu.count` / `gpu.topo`（NVLink/NVSwitch vs 仅 PCIe）、`gpu.gpus`（时钟 / 持久模式）、`cpu.governor`、`mem.thp`。
+- **剪枝/纳入**：NVLink/NVSwitch 全互联 → tp 可到 GPU 数；**仅 PCIe → tp ≤ 4 仅是性能建议**（优先并行数据 dp）——**容量优先**：若 `model_profile.json` 的 `tp.min_tp_for_weights` > 4，则必须超出该建议（跨 NUMA 判定见「NUMA 与划分」节，不因该建议排除可行的 tp）。合法 tp 集合由 `num_attention_heads` / `num_key_value_heads` 的约数决定，非法 tp 值不试（例外：`num_key_value_heads`≤1（MLA / MQA）时 vLLM 复制 KV heads，合法 tp 只受 attention heads 约数约束）。governor / hugepages / 锁频 / 主机级 NUMA 亲和绑定等只探测 + 建议（写进 `report.md`），不自动修改（v1 不提供自动修改开关）。
+- **留痕**：系统级建议写 `report.md`。
+
+### NUMA 与划分（placement）
+- **探测依据**：`env.json`——`numa_groups`（`{numa_node, gpus}`）、`gpu.topo` / `interconnect`（域内/跨域连接层级：NV#/PXB/NODE/SYS 与全互联判定）、`net.rdma.devices[].gpu_links` 与 `speed_gbps`（NIC↔GPU 亲和与速率）+ `model_profile.tp`（合法 tp 约数与 `min_tp_for_weights`）。
+- **候选枚举口径**：先按 `min_tp_for_weights` 与合法 tp 约数过滤**可行性**——若 `min_tp_for_weights` > 单 NUMA 节点卡数 → **必然跨 NUMA**（既定事实，不再反复质疑），跨 NUMA 损耗须实测，可选项：跨 NUMA 通信优化（NCCL env，见「网络」）；装得下才谈划分。再枚举划分 = **GPU 子集**（`env.CUDA_VISIBLE_DEVICES`，如 `0-3` / `4-7` / `0-7`，`tp` 按可见 GPU 数设置）× **并行方案**（tp / pp / dp，flag 见 `docs/vllm-facts.md` §4）× **容器级 `--cpuset-cpus/--cpuset-mems`**（经 `runtime.extra_docker_args`，仅影响本 trial 容器，零破坏）；每个候选须能引用实测互联数据（域内/跨域连接码、NIC↔GPU 亲和、速率）。
+- **评估口径**：用「域内 PCIe 带宽 / 跨域 RoCE 带宽（若有 RDMA）」与每步通信字节量做**预估**（带宽 / 时延哪个受限），**不能只看拓扑层级**——tp 组限同 NUMA 仍是**性能建议**（如 8 卡两节点 → tp=4 选 `[0,1,2,3]` 或 `[4,5,6,7]`），但候选须**测量 + 预估**后再选（互联成本因候选而异：域内 PCIe P2P vs 跨域 RoCE）；划分变小会牺牲容量/并发，须与 goodput / SLO 一起权衡。
+- **互联形态覆盖（鲁棒）**：互联评估须对全部形态给出口径，**任一类缺失 → 降级并记录（不得空转或依赖某项存在）**；判定以 probe 实测为输入（`gpu.topo` 连接码、`interconnect`、`net.rdma.kind` / `devices[].speed_gbps`）：
+  - **NVLink/NVSwitch**：域内高带宽，tp 可放大；跨节点走 IB/RoCE（NCCL env 见「网络」）。
+  - **PCIe-only + IB/RoCE**：跨域可选走网络——配方 `NCCL_P2P_LEVEL=PXB` + `NCCL_SHM_DISABLE=1`（见「网络」事实）。
+  - **PCIe-only 且无 RDMA**：跨 NUMA 只能 PCIe P2P / SHM / TCP，**无 NET 选项** → 倾向 tp 落在同一 PCIe 域/NUMA、或 dp；把「无网络可用」记为显式约束（写 `results.tsv.description`）。
+- **决策与留痕**：所选划分 + 依据写 `results.tsv.description` / `report.md`；**主机级 NUMA 划分**（BIOS NPS / SNC / sub-NUMA clustering 等）→ 只探测 + 建议（写 `report.md` 系统级建议节），不自动改；主机级绑定（`numactl`）→ 只建议、不自动。
+
+### 网络（三分：InfiniBand / RoCE / 无）
+- **探测依据**：`env.json` 的 `net.rdma`——`ib_devices` 非空即有 RDMA（如 `mlx5_0`），IB / RoCE 按设备 link_layer 区分（RoCE=Ethernet，IB=InfiniBand）；**不要仅凭 `ibstat_present` 判无**（ibstat 缺席 ≠ 无 RDMA）。结合 NIC↔GPU 亲和（同 NUMA / PCIe 拓扑）与链路速率（来自 probe）。
+- **剪枝/纳入**：三分 InfiniBand / RoCE / 无——「无」→ NCCL/RDMA 相关 env 移出搜索空间；「IB / RoCE 存在」→ NCCL/RDMA env **进入搜索空间**（如 `NCCL_P2P_LEVEL`、`NCCL_IB_HCA`、`NCCL_IB_GID_INDEX`、`NCCL_NET_GDR_LEVEL`、`NCCL_SHM_DISABLE`，名单见 `docs/vllm-facts.md` §6），并按 NIC↔GPU 亲和选 HCA 与 GDR 等级。**NCCL 事实**（口径见 vllm-facts §6）：`NCCL_P2P_LEVEL` 是距离 cutoff（官方文档口径 LOC/NVL/PIX/PXB/PHB/SYS，无 NODE），Intel x86 默认 PXB——**PHB 及以上**默认关 P2P、回落 SHM（主机内存/UPI 中转），**不走网络**（注：`PHB` 是同 NUMA 穿 CPU，`SYS` 才跨 NUMA）；NCCL 仅当 P2P 与 SHM 双双不可用才把该对标 PATH_NET（走 RoCE/IB）——「域内 PCIe P2P + 跨域 RoCE」的配方是 `NCCL_P2P_LEVEL=PXB` + `NCCL_SHM_DISABLE=1`（+ `NCCL_IB_HCA="=<dev>:1"` 精确匹配）。NIXL / PD 分离相关 env 需 agent 自行查证后使用。
+- **留痕**：放弃 RDMA 维度 / HCA 与 GDR 选择写 `results.tsv.description` / `report.md`；RDMA 状态变化 → 重新评估。
+
+### 存储 / 加载
+- **探测依据**：`env.json` 的 `disk.avail_bytes`（模型盘可用空间）+ 校准后 `model_profile.json` 的 `boot.measured_seconds`（真实加载耗时）与权重量。
+- **剪枝/纳入**：加载耗时占单 trial 墙钟比例高（如 >40%）时，把 `--load-format`、权重预热/缓存、`--max-model-len`（KV/加载权衡）等纳入候选；模型盘可用空间不足时优先加载/量化权衡。
+- **留痕**：加载相关决策写 `results.tsv.description` / `report.md`。
+
+### 其它维度（沿用）
 - **布尔参数约定**：`true` → 裸 flag（`--enable-x`）；`false` → 省略（保持 vLLM 默认）；要关闭默认开启的开关，写 `no-<flag>: true`（原样透传为 `--no-<flag>`）。
 - **前缀缓存可测性**：`workload.prefix_hit_pct`（0-100，仅 random 数据集）让 `enable-prefix-caching` 成为可测维度——random 数据默认无共享前缀，prefix caching 测不出收益；`>0` 时 bench 按 `prefix_len = isl×pct/100` 拆共享前缀、`adjusted = isl−prefix_len`（总 prompt ≈ isl）。repeats 之间会 `POST /reset_prefix_cache` 保证每次测量是冷缓存独立（首 repeat 起服即冷缓存）。
 - **运行时与镜像（docker-only）**：`runtime.image` 是合法搜索维度（如 CUDA 12/13 变体镜像）；镜像须在主机**预先准备**（模板不自动拉取，保持主机零新增），先固定镜像再调参。
@@ -113,12 +133,12 @@ commit  goodput  goodput_std  output_tok_s  ttft_p99_ms  tpot_p99_ms  peak_vram_
 
 ## workload 降档（保持可比性）
 
-isl / osl / ref_concurrency 定义负载身份，单次 run 内绝不改动（会破坏可比性）。预算紧张时只允许下调 num_prompts（缩短单 trial 墙钟，不改变 goodput 语义）；降档后所有后续 trial 同口径，必要时重测基线，并在 results.tsv.description 记 `num_prompts:<原>→<新>`。若必须改 isl/osl/ref_concurrency，则结束当前 run、开新 run 重新基线。
+isl / osl / ref_concurrency 定义负载身份，单次 run 内绝不改动（会破坏可比性）。预算紧张时只允许下调 num_prompts（缩短单 trial 墙钟，不改变 goodput 语义）；降档后所有后续 trial 同口径，必要时重测基线，并在 results.tsv.description 记 `num_prompts:1000→300`。若必须改 isl/osl/ref_concurrency，则结束当前 run、开新 run 重新基线。
 
 ## 环境失效与共租处置
 
 1. **显存不足 / 被外部占用致起服失败**（`Free memory ... less than desired`）：判为可自愈 crash，按序尝试——(a) 用 env.CUDA_VISIBLE_DEVICES 缩到空闲 GPU 子集并同步下调 tp；(b) 下调 gpu-memory-utilization；(c) 若 target.yaml 预声明了 fallback 主机/模型则切换；(d) 仍不行记 crash，继续下一配置。
-2. **contention（检测到外部 GPU 进程）**：(a) 切到空闲的声明候选主机/GPU 子集 →(b) 有限时间内重探后重试（参考上限 15min，可按主机调整）→(c) 持续共租则带 contention 告警继续，并在该轮标注「共租，仅供横向参考」；不求助人类。
+2. **contention（检测到外部 GPU 进程）**：(a) 切到空闲的声明候选主机/GPU 子集 →(b) 有限时间内重探后重试（上限如 15min）→(c) 持续共租则带 contention 告警继续，并在该轮标注「共租，仅供横向参考」；不求助人类。
 3. **主机整体不可达 / 模型路径消失**：停止循环，诊断写入 report.md。
 
 ## 崩溃处理
@@ -129,7 +149,7 @@ isl / osl / ref_concurrency 定义负载身份，单次 run 内绝不改动（�
 
 ## 子 agent 分派
 
-- **固定分派点**：Phase 1 —— 探索子 agent 核验环境事实与踩坑查证；Phase 3 —— 周期性（每 N 轮，N 取 3–5，可由 harness 配置）一次分析子 agent 做趋势 / 瓶颈体检；Phase 4 前 —— 验证子 agent 独立复核 best 回归与结论。
+- **固定分派点**：Phase 1 —— 探索子 agent 核验环境事实与踩坑查证；Phase 3 —— 每 5 轮一次分析子 agent 做趋势 / 瓶颈体检；Phase 4 前 —— 验证子 agent 独立复核 best 回归与结论。
 - **触发**：需要跨文件 / 跨知识检索，或结论将被 keep / 采纳时派；纯机械执行（改一个已定参数、跑一次 run.sh）不派。
 - **评估可执行化**：评估子 agent 优先直接运行 scripts/mock_loop.py 的纯函数，不靠心算。
 - **成本护栏**：同一 Phase 内子 agent 总预算设上限；验证角色不得复用产生结论者的会话。

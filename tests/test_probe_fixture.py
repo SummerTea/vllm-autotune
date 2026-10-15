@@ -80,6 +80,21 @@ def test_fixture_probe_produces_artifacts(tmp_path):
     assert head["cpu"]["governor"] == "performance"
     assert head["docker"]["version"]                    # docker 检测（fixture docker_version.txt）
     assert any("vllm/vllm-openai" in i for i in (head["docker"]["vllm_images"] or []))
+    # RDMA：fixture 无 ibstat，但有 sysfs mlx5_* + link_layer Ethernet → 必须判 RoCE（防假阴性回归）
+    rdma = head["net"]["rdma"]
+    assert rdma["kind"] == "roce"
+    assert rdma["ibstat_present"] is False              # 兼容既有字段保留
+    assert len(rdma["devices"]) == 2
+    assert rdma["devices"][0] == {
+        "name": "mlx5_0", "netdev": "enp24s0f0np0", "link_layer": "Ethernet",
+        "state": "ACTIVE", "physical_state": "LINK_UP", "speed_gbps": 400,
+        "numa_node": 0,  # 来自 /sys/class/infiniband/<dev>/device/numa_node
+        "gpu_links": {"0": "PXB", "1": "PXB", "2": "PXB", "3": "NODE",
+                      "4": "PXB", "5": "PXB", "6": "PXB", "7": "NODE"},
+    }
+    assert rdma["devices"][1]["numa_node"] == 1         # sysfs numa_node 生效
+    assert head["disk"]["read_bw_gbps"] == pytest.approx(2.3 * 8, abs=0.01)  # dd 真机逐字输出 → Gbps
+    assert head["disk"]["model_path"] == "/models/qwen3-32b"
     assert isinstance(head["checklist"], list) and head["checklist"]  # 检查清单存在
     assert any(i["status"] == "pass" for i in head["checklist"])
     # NUMA 放置：2-NUMA 且每节点 >1 GPU → warn（仅建议，模板不自动绑定）
@@ -87,6 +102,9 @@ def test_fixture_probe_produces_artifacts(tmp_path):
     assert numa_item["status"] == "warn"
     assert "numa_groups" in numa_item["detail"]
     assert env["interconnect"]["covered"] is False      # 单主机 → 不执行跨机检查
+    # 互联带宽实测（fixture 逐字样例 → 解析出数值）
+    assert env["interconnect"]["gpu_p2p_bw_gbps"] == {"intra_numa": 43.35, "cross_numa": 33.87}
+    assert env["interconnect"]["rdma_bw_gbps"] == {"bw_gbps": 341.7}
 
     profile = json.loads(profile_p.read_text(encoding="utf-8"))
     assert profile["model"] == "Qwen/Qwen3-32B"
@@ -100,6 +118,7 @@ def test_fixture_probe_produces_artifacts(tmp_path):
     report = report_p.read_text(encoding="utf-8")
     assert "系统参数检查清单" in report
     assert "NUMA 分组" in report                       # 关键事实含 numa_groups
+    assert "RDMA：RoCE(Ethernet) ×2（400 Gb/s）" in report  # 报告显示 RoCE 而非「无」（假阴性回归）
     assert "下一步" in report
 
 
@@ -150,6 +169,8 @@ def test_multihost_interconnect_emitted(tmp_path):
     env = json.loads((tmp_path / "out" / "env.json").read_text(encoding="utf-8"))
     assert "head" in env["hosts"] and "worker1" in env["hosts"]
     assert env["hosts"]["worker1"]["hostname"] == "worker1"  # worker fixture 生效
+    # worker1 无任何 RDMA fixture → kind=none（无 RDMA 判 none 回归）
+    assert env["hosts"]["worker1"]["net"]["rdma"]["kind"] == "none"
 
     ic = env["interconnect"]
     assert "checks" in ic
@@ -182,6 +203,10 @@ def test_collect_plan_local_with_image_uses_docker_cmds():
     assert entries["model_config_json"]["fixture"] == "config.json"
     assert entries["model_safetensors_index_json"]["fixture"] == "safetensors.index.json"
     assert entries["df_model"]["fixture"] == "df_model.txt"
+    # 互联实测：有镜像 → gpu_p2p_bw 走容器测例；rdma_bw 恒为 head 采集项
+    assert "docker run" in entries["gpu_p2p_bw"]["cmd"]
+    assert entries["gpu_p2p_bw"]["fixture"] == "gpu_p2p_bw.txt"
+    assert "rdma_bw" in entries and entries["rdma_bw"]["fixture"] == "rdma_bw.txt"
 
 
 def test_collect_plan_local_without_image_uses_host_cmds():
@@ -195,6 +220,9 @@ def test_collect_plan_local_without_image_uses_host_cmds():
     assert "df -B1 --output=avail /models" in entries["df_model"]["cmd"]  # 宿主版取 dirname
     assert "docker run" not in entries["vllm_version"]["cmd"]
     assert "pip show vllm" in entries["vllm_version"]["cmd"]
+    # 无镜像 → 无 gpu_p2p_bw 键（不跑容器测例）；rdma_bw 仍在（脚本自含守卫）
+    assert "gpu_p2p_bw" not in entries
+    assert "rdma_bw" in entries
 
 
 def test_collect_plan_config_none_missing_config_yaml_tolerant(tmp_path, monkeypatch):
@@ -233,7 +261,8 @@ def test_checklist_gpu_persistence_mode_is_warn_not_fail():
         "model_src": {"config_json": None, "note": None},
         "disk": {"avail_bytes": None},
         "mem": {"thp": "madvise", "swappiness": 10},
-        "net": {"rdma": {"ibstat_present": False, "ib_devices": None}, "interfaces": []},
+        "net": {"rdma": {"kind": "none", "devices": [], "ibstat_present": False, "ib_devices": None},
+                "interfaces": []},
         "numa_groups": [{"numa_node": 0, "gpus": [0]}],
         "docker": {"version": "20.10"},
     }
@@ -241,3 +270,154 @@ def test_checklist_gpu_persistence_mode_is_warn_not_fail():
     pm = next(i for i in items if i["name"] == "GPU 持久模式")
     assert pm["status"] == "warn"
     assert pm["fix"] == "sudo nvidia-smi -pm 1"  # detail/fix 文案保留
+
+
+# ── RDMA 检测（sysfs 主判据，缺 ibstat 不假阴性）────────────────────────
+
+# 真机逐字输出（node-user02@10.23.69.131）——必须能用这套字符串解析出全部字段
+REAL_RDMA_LINK = (
+    "link mlx5_0/1 state ACTIVE physical_state LINK_UP netdev enp24s0f0np0 \n"
+    "link mlx5_1/1 state ACTIVE physical_state LINK_UP netdev enp24s0f1np1 \n"
+)
+REAL_RDMA_PORTS = "mlx5_0 Ethernet 400 Gb/sec (4X NDR)\nmlx5_1 Ethernet 400 Gb/sec (4X NDR)\n"
+REAL_RDMA_NUMA = "mlx5_0 0\nmlx5_1 1\n"
+REAL_DD_OUT = "536870912 bytes (537 MB, 512 MiB) copied, 0.238186 s, 2.3 GB/s\n"
+
+_ROCE_RAW = {
+    "rdma_devices": {"ok": True, "value": "mlx5_0\nmlx5_1\n"},
+    "rdma_link": {"ok": True, "value": REAL_RDMA_LINK},
+    "rdma_ports": {"ok": True, "value": REAL_RDMA_PORTS},
+    "rdma_numa": {"ok": True, "value": REAL_RDMA_NUMA},
+    "gpu_smi": {"ok": True, "value": (
+        "0, NVIDIA A100-SXM4-40GB, 42234101760, 535.104.05, Enabled, 810, 1410, 28.63, 300.00\n"
+        "1, NVIDIA A100-SXM4-40GB, 42234101760, 535.104.05, Enabled, 810, 1410, 28.63, 300.00\n")},
+    "gpu_topo": {"ok": True, "value": (HEAD / "gpu_topo.txt").read_text(encoding="utf-8")},
+}
+
+
+def test_rdma_roce_detected_without_ibstat():
+    """防假阴性回归：无 ibstat、有 sysfs mlx5_* + link_layer Ethernet → kind=roce。"""
+    facts = probe.build_host_facts({"name": "head", "role": "head"}, _ROCE_RAW)
+    rdma = facts["net"]["rdma"]
+    assert rdma["kind"] == "roce"
+    assert rdma["ibstat_present"] is False          # 兼容字段：无 ibstat 仍判 RoCE
+    d0 = rdma["devices"][0]
+    assert d0["netdev"] == "enp24s0f0np0"
+    assert d0["state"] == "ACTIVE"                  # 真机 rdma link show 格式
+    assert d0["speed_gbps"] == 400                  # rate "400 Gb/sec (4X NDR)" → 400
+    assert d0["numa_node"] == 0                     # sysfs device/numa_node
+    assert d0["gpu_links"]["0"] == "PXB"            # NIC↔GPU 拓扑级别（topo NIC 行）
+    assert probe.format_rdma(rdma) == "RoCE(Ethernet) ×2（400 Gb/s）"
+
+
+def test_rdma_real_outputs_parse_all_fields():
+    """关键教训回归：真机逐字输出必须解析出 netdev/state/speed_gbps/numa_node/read_bw 全非 None。"""
+    assert probe.parse_rdma_link(REAL_RDMA_LINK)["mlx5_0"]["netdev"] == "enp24s0f0np0"
+    assert probe.parse_rdma_link(REAL_RDMA_LINK)["mlx5_0"]["state"] == "ACTIVE"
+    assert probe.parse_rdma_ports(REAL_RDMA_PORTS)["mlx5_0"]["rate"] == "400 Gb/sec (4X NDR)"
+    assert probe.parse_rate_gbps("400 Gb/sec (4X NDR)") == 400
+    assert probe.parse_rate_gbps("100 Gb/sec (4X EDR)") == 100
+    assert probe.parse_rate_gbps("25 Gb/sec") == 25
+    assert probe.parse_rate_gbps("200 Gb/sec (2X HDR)") == 200
+    assert probe.parse_rdma_numa(REAL_RDMA_NUMA) == {"mlx5_0": 0, "mlx5_1": 1}
+    assert probe.parse_dd_bw(REAL_DD_OUT) == pytest.approx(2.3 * 8, abs=0.01)
+
+
+def test_rdma_none_when_no_devices():
+    """无任何 RDMA 设备 → kind=none（报告「无」）。"""
+    raw = dict(_ROCE_RAW)
+    raw.update({"rdma_devices": {"ok": False, "value": None, "note": "fixture 缺失"},
+                "rdma_link": {"ok": False, "value": None, "note": "fixture 缺失"},
+                "rdma_ports": {"ok": False, "value": None, "note": "fixture 缺失"},
+                "rdma_numa": {"ok": False, "value": None, "note": "fixture 缺失"}})
+    facts = probe.build_host_facts({"name": "head", "role": "head"}, raw)
+    assert facts["net"]["rdma"]["kind"] == "none"
+    assert facts["net"]["rdma"]["devices"] == []
+    assert probe.format_rdma(facts["net"]["rdma"]) == "无"
+
+
+def test_rdma_mtu_check_applies_to_roce():
+    """RoCE 也要过 MTU 检查（原 ibstat 判据会漏）：接口 MTU 1500 < 9000 → warn。"""
+    facts = {
+        "cpu": {"governor": "performance"},
+        "gpu": {"gpus": [{"index": 0, "persistence_mode": "Enabled",
+                          "clocks_sm": 1800, "clocks_max_sm": 2000}]},
+        "model_src": {"config_json": {}, "note": None},
+        "disk": {"avail_bytes": None},
+        "mem": {"thp": "madvise", "swappiness": 10},
+        "net": {"rdma": {"kind": "roce", "devices": [{"speed_gbps": 400}]},
+                "interfaces": [{"name": "enp177s0np0", "mtu": 1500}]},
+        "numa_groups": [{"numa_node": 0, "gpus": [0]}],
+        "docker": {"version": "20.10"},
+    }
+    items = probe._system_checklist(facts, is_head=True, weights_bytes=None)
+    mtu = next(i for i in items if i["name"] == "RDMA 网卡 MTU")
+    assert mtu["status"] == "warn"
+    assert "enp177s0np0" in mtu["detail"]
+
+
+# ── 互联带宽实测（gpu_p2p_bw / rdma_bw 解析）────────────────────────────
+
+_P2P_FIXTURE = "P2P_INTRA 43.35 P2P_CROSS 33.87\n"
+_RDMA_FIXTURE = (
+    "---------------------------------------------------------------------------------------\n"
+    "                    RDMA_Write BW Test\n"
+    "---------------------------------------------------------------------------------------\n"
+    " #bytes     #iterations    BW peak[Gb/sec]    BW average[Gb/sec]   MsgRate[Mpps]\n"
+    " 65536      0               352.9              341.7               0.000651\n"
+    "---------------------------------------------------------------------------------------\n"
+)
+
+
+def test_interconnect_bw_parsed_from_verbatim_samples():
+    """fixture 逐字样例 → 解析出 GPU P2P 与 RDMA 带宽数值。"""
+    p2p = probe.parse_gpu_p2p_bw({"ok": True, "value": _P2P_FIXTURE, "note": None})
+    assert p2p == {"intra_numa": 43.35, "cross_numa": 33.87}
+    rdma = probe.parse_rdma_bw({"ok": True, "value": _RDMA_FIXTURE, "note": None})
+    assert rdma == {"bw_gbps": 341.7}              # BW average[Gb/sec] 第 4 列
+
+
+def test_interconnect_bw_unavailable_gives_null_and_note():
+    """不可得（fixture 缺失/采集失败）→ null + note，绝不抛错。"""
+    rec = {"ok": False, "value": None, "note": "fixture 缺失"}
+    assert probe.parse_gpu_p2p_bw(rec) == {"intra_numa": None, "cross_numa": None,
+                                           "note": "gpu_p2p_bw: fixture 缺失"}
+    assert probe.parse_rdma_bw(rec) == {"bw_gbps": None, "note": "rdma_bw: fixture 缺失"}
+    assert probe.parse_gpu_p2p_bw(None)["intra_numa"] is None     # rec 缺省也容错
+    assert probe.parse_rdma_bw(None)["bw_gbps"] is None
+
+
+def test_interconnect_bw_skip_marker_note():
+    """RDMA_SKIP（无跨 NUMA 对 / 无 ib_write_bw）→ null + 具体 note。"""
+    r = probe.parse_rdma_bw({"ok": True, "value": "RDMA_SKIP no cross-numa pair\n", "note": None})
+    assert r["bw_gbps"] is None
+    assert "no cross-numa pair" in r["note"]
+
+
+def test_p2p_script_warmup_before_timing():
+    """关键教训回归：真机 intra 被低估（无预热）→ 脚本必须在计时前有 ≥2 次不计时预热 copy。"""
+    s = probe._P2P_SCRIPT
+    warm = s.index("for _ in range(2): y.copy_(x)")     # 预热循环
+    t0 = s.index("t0=time.perf_counter()")             # 计时起点
+    timed = s.index("for _ in range(8): y.copy_(x)")   # 计时循环
+    assert warm < t0 < timed                           # 先预热、再计时
+
+
+def test_rdma_cmd_client_single_ip_with_hca():
+    """关键教训回归：真机 rdma_bw=None（client 多传 IP + 未指定 HCA）→
+    client 只传一个 server IP，且两侧都用 -d <hca> 指定跨 NUMA 的卡。"""
+    cmd = probe._RDMA_BW_CMD
+    assert '"$sip"' in cmd
+    assert '"$cip"' not in cmd                          # 不再有 client IP 参数
+    client_lines = [ln.strip() for ln in cmd.splitlines()
+                    if ln.strip().startswith("ib_write_bw") and "nohup" not in ln]
+    server_lines = [ln.strip() for ln in cmd.splitlines() if ln.strip().startswith("nohup")]
+    assert client_lines and server_lines
+    assert '-d "$ca"' in client_lines[0]                # client 指定选中的 HCA
+    assert client_lines[0].count('"$sip"') == 1         # 只传一个 server IP
+    assert '-d "$sa"' in server_lines[0]                # server 指定选中的 HCA
+    # 纪律保留：nohup+重定向、timeout 兜底、按 PID 精确 kill、禁 pkill -f
+    assert "nohup" in cmd and ">/tmp/probe_ibw_srv.log 2>&1 </dev/null &" in cmd
+    assert "timeout 15" in cmd
+    assert 'kill "$spid"' in cmd
+    assert "pkill" not in cmd
