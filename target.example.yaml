@@ -23,6 +23,10 @@ model:
   trust_remote_code: false
   # hf_token_env: HF_TOKEN      # gated 模型时填写环境变量名
 
+# model_scan_dirs:                # 可选。主机探索（host_report.html）扫描模型介质的目录；
+#   - /data/models                #   缺省用内置候选（/data/model(s)、/data/deploy、/nfsdata/models、~/models）
+#   - /nfsdata/models             #   扫描上限 depth=4、超时 45s（护栏）；不影响是否声明 model。
+
 metrics:                        # 可选。缺省则用 harness.yaml 的默认 SLO。
   # 此 SLO 应为该主机/模型可达值；若基线不可达，agent 会按 program.md 做一次性校准并在 report 标注，不会为此打断你。
   slo:

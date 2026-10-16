@@ -6,6 +6,10 @@
   env.json          — 结构化原始事实（供 program.md 剪枝规则消费）
   env_report.md     — 人类可读报告，含系统参数检查清单（pass/warn/fail + 修复命令）
   model_profile.json— 模型权重/配置估算（供搜索空间剪枝与成本估算）
+  host_report.html  — 主机探索报告（GPU/网络/镜像/模型介质/占用），供人类评估该主机
+
+只给 host（未声明 model）也可运行：即「主机探索」阶段——产出 host_report.html 供人类
+评估后再下发调优指令（target.yaml 补 model/SLO/budget/work_dir）。
 
 设计约束：
 - 对系统只读：所有远端命令均为查询类，绝不修改主机状态。
@@ -43,6 +47,11 @@ DISK_FREE_FACTOR = 1.2                   # 磁盘剩余需 ≥ 权重 × 该系�
 DEFAULT_GMU = 0.92                       # vLLM 默认 gpu-memory-utilization（docs §4）
 KV_DTYPE_BYTES = 2                       # KV cache 默认 bf16（2 字节/元素）
 BOOT_DISK_BW_GBPS = 2.0                  # 权重加载粗估带宽（磁盘→显存，含解码开销）
+MODEL_SCAN_DEPTH = 4                     # 主机探索：模型介质扫描最大目录深度（护栏，防深层递归）
+MODEL_SCAN_TIMEOUT_S = 45                # 主机探索：模型介质扫描的远端超时（护栏）
+DEFAULT_MODEL_SCAN_DIRS = [              # 主机探索：模型介质扫描默认候选（可被 target.model_scan_dirs 覆盖）
+    "/data/model", "/data/models", "/data/deploy", "/nfsdata/models", "~/models",
+]
 
 # 已知 GPU 的 HBM 带宽（GB/s）粗表；未知型号 → None（roofline 置 null）
 HBM_BW_GBPS = {
@@ -64,6 +73,26 @@ DTYPE_BYTES = {  # torch_dtype → 每参数字节数（估算用）
 
 
 # ── 输入与校验 ──────────────────────────────────────────────────────────
+
+def _load_dotenv(path: str = ".env") -> None:
+    """把 .env 载入 os.environ（不覆盖已存在的键；`~` 展开），与 run.sh 的 .env 语义一致。
+
+    _ssh 读 SSH_PORT / SSH_KEY，此前须外部 export 才生效——host-only intake 首次即踩坑
+    （静默全字段 None）。此处补齐，使 `python probe.py` 与 `bash run.sh` 共用同一份 .env。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if key and key not in os.environ:
+            os.environ[key] = os.path.expanduser(val)
+
 
 def _err(msg: str) -> NoReturn:
     print(f"probe.py: 错误: {msg}", file=sys.stderr)
@@ -234,6 +263,48 @@ exit 0
 """
 
 
+def _model_inventory_cmd(dirs: list[str]) -> str:
+    """模型介质清单：远端扫描 dirs 下的 config.json 目录，TSV 一行一模型（非阻塞）。
+
+    字段：dir \\t size_bytes \\t n_shards \\t model_type \\t architectures \\t quant_method
+          \\t torch_dtype \\t layers \\t heads \\t kv_heads
+    用 os.walk 限深度 + safetensors 元数据求和（不做 du 全遍历）；缺 python3 → 空输出。"""
+    dirs_literal = "[" + ", ".join(repr(d) for d in dirs) + "]"
+    script = f"""import json, os, glob
+dirs, depth = {dirs_literal}, {MODEL_SCAN_DEPTH}
+found = []
+for d in dirs:
+    base = os.path.expanduser(d).rstrip("/")
+    if not base or not os.path.isdir(base):
+        continue
+    for root, subdirs, files in os.walk(base):
+        rel = os.path.relpath(root, base)
+        if rel != "." and rel.count(os.sep) + 1 >= depth:
+            subdirs[:] = []
+        if "config.json" in files:
+            found.append(root)
+for m in found:
+    try:
+        shards = [f for f in glob.glob(os.path.join(m, "*.safetensors")) if os.path.isfile(f)]
+        size = sum(os.path.getsize(f) for f in shards)
+    except OSError:
+        size, shards = 0, []
+    vals = ["", "", "", "", "", "", ""]
+    try:
+        with open(os.path.join(m, "config.json"), encoding="utf-8") as f:
+            cfg = json.load(f)
+        arch = cfg.get("architectures") or []
+        q = cfg.get("quant_method") or (cfg.get("quantization_config") or {{}}).get("quant_method") or ""
+        vals = [str(cfg.get("model_type") or ""), str(arch[0] if arch else ""),
+                str(q), str(cfg.get("torch_dtype") or ""), str(cfg.get("num_hidden_layers") or ""),
+                str(cfg.get("num_attention_heads") or ""), str(cfg.get("num_key_value_heads") or "")]
+    except Exception:
+        pass
+    print("\\t".join([m, str(size), str(len(shards)), *vals]))
+"""
+    return f"timeout {MODEL_SCAN_TIMEOUT_S} python3 - <<'PY' 2>/dev/null || true\n{script}PY"
+
+
 def _collect_plan(target: dict, harness: dict, config: dict | None = None) -> dict[str, list]:
     """每台主机的采集计划：list of (key, cmd, fixture 文件名)。
     docker-only：source=local + runtime.image 可解析时，模型探测改为在镜像内执行
@@ -271,7 +342,15 @@ def _collect_plan(target: dict, harness: dict, config: dict | None = None) -> di
                  "n=${d%/device/numa_node}; n=${n##*/}; echo \"$n $(cat \"$d\" 2>/dev/null)\"; "
                  "done 2>/dev/null || true"),
             _cmd("docker_version", "docker --version 2>/dev/null || true"),
-            _cmd("docker_images", "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null || true"),
+            # 镜像含 size/created：评估磁盘余量与镜像新旧（host 报告「可用 vLLM 镜像」段）
+            _cmd("docker_images",
+                 "docker images --format '{{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.CreatedSince}}'"
+                 " 2>/dev/null || true"),
+            # 当前占用 / 共租（host 报告）：运行中容器、监听端口、登录用户
+            _cmd("docker_ps",
+                 "docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || true"),
+            _cmd("listening_ports", "ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null || true"),
+            _cmd("logged_in_users", "who 2>/dev/null || true"),
             # 镜像可解析 → 镜像内 vllm --version（docker-only 主机无宿主 pip 版 vllm）；
             # 否则用 pip show（不 import）避免在主机上写入 torch/vllm 缓存
             _cmd("vllm_version",
@@ -281,6 +360,10 @@ def _collect_plan(target: dict, harness: dict, config: dict | None = None) -> di
             _cmd("python3_version", "python3 --version 2>&1 || true"),
         ]
         if h.get("role") == "head":
+            # 模型介质清单（主机探索）：扫描候选目录，与是否声明 model 无关
+            cmds += [_cmd("model_inventory",
+                          _model_inventory_cmd(target.get("model_scan_dirs") or DEFAULT_MODEL_SCAN_DIRS),
+                          "model_inventory.tsv")]
             src = model.get("source", "hf")
             if src == "local" and model.get("path"):
                 mp = model["path"]
@@ -309,7 +392,7 @@ def _collect_plan(target: dict, harness: dict, config: dict | None = None) -> di
                         _cmd("df_model", f"df -B1 --output=avail {shlex.quote(os.path.dirname(mp))} 2>/dev/null | tail -1 || true"),
                         _cmd("read_bw_model", _read_bw_cmd(mp), "read_bw_model.txt"),
                     ]
-            else:  # source=hf：尝试本地 HF 缓存（~/.cache/huggingface/hub/models--<id>/snapshots/*）
+            elif model.get("id"):  # source=hf：尝试本地 HF 缓存（~/.cache/huggingface/hub/models--<id>/snapshots/*）
                 hid = model.get("id", "").split("@")[0].replace("/", "--")
                 glob = f"~/.cache/huggingface/hub/models--{shlex.quote(hid)}/snapshots/*"
                 cmds += [
@@ -629,6 +712,98 @@ def parse_thp(text: str | None) -> str | None:
     return m.group(1) if m else None
 
 
+def _int_or_none(x) -> int | None:
+    try:
+        return int(str(x).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _str_or_none(x) -> str | None:
+    s = (x or "").strip() if isinstance(x, str) else (str(x).strip() if x is not None else "")
+    return s or None
+
+
+def parse_docker_images_detail(text: str | None) -> list[dict]:
+    """`docker images --format '{{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.CreatedSince}}'`
+    → [{repo, size, created}]。仅有名字的行也能解析（size/created 为 None）。"""
+    out: list[dict] = []
+    for line in (text or "").splitlines():
+        if not line.strip():
+            continue
+        p = line.split("\t")
+        repo = p[0].strip()
+        if not repo:
+            continue
+        out.append({"repo": repo,
+                    "size": p[1].strip() if len(p) > 1 and p[1].strip() else None,
+                    "created": p[2].strip() if len(p) > 2 and p[2].strip() else None})
+    return out
+
+
+def parse_docker_ps(text: str | None) -> list[dict]:
+    """`docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'` → [{name,image,status,ports}]。"""
+    out: list[dict] = []
+    for line in (text or "").splitlines():
+        if not line.strip():
+            continue
+        p = line.split("\t")
+        out.append({"name": p[0].strip(),
+                    "image": _str_or_none(p[1] if len(p) > 1 else None),
+                    "status": _str_or_none(p[2] if len(p) > 2 else None),
+                    "ports": _str_or_none(p[3] if len(p) > 3 else None)})
+    return out
+
+
+def parse_listening_ports(text: str | None) -> list[dict]:
+    """`ss -ltn` → [{addr, port}]（去重、按端口排序）。Local Address:Port 是第 4 列。"""
+    out: list[dict] = []
+    seen: set[int] = set()
+    for line in (text or "").splitlines():
+        cols = line.split()
+        if len(cols) < 4 or not line.lstrip().startswith("LISTEN"):
+            continue
+        m = re.search(r":(\d+)$", cols[3])
+        if not m:
+            continue
+        port = int(m.group(1))
+        if port in seen:
+            continue
+        seen.add(port)
+        out.append({"addr": cols[3], "port": port})
+    return sorted(out, key=lambda d: d["port"])
+
+
+def parse_who(text: str | None) -> list[str]:
+    """`who` → 非空行列表（登录会话）。"""
+    return [l.strip() for l in (text or "").splitlines() if l.strip()]
+
+
+def parse_model_inventory(text: str | None) -> list[dict]:
+    """model_inventory TSV → [{dir,size_bytes,n_shards,model_type,architectures,
+    quant_method,torch_dtype,layers,heads,kv_heads}]，按大小降序。坏行跳过。"""
+    out: list[dict] = []
+    for line in (text or "").splitlines():
+        if not line.strip():
+            continue
+        p = line.split("\t")
+        if len(p) < 3 or not p[0].strip():
+            continue
+        out.append({
+            "dir": p[0].strip(),
+            "size_bytes": _int_or_none(p[1] if len(p) > 1 else None),
+            "n_shards": _int_or_none(p[2] if len(p) > 2 else None),
+            "model_type": _str_or_none(p[3] if len(p) > 3 else None),
+            "architectures": _str_or_none(p[4] if len(p) > 4 else None),
+            "quant_method": _str_or_none(p[5] if len(p) > 5 else None),
+            "torch_dtype": _str_or_none(p[6] if len(p) > 6 else None),
+            "layers": _int_or_none(p[7] if len(p) > 7 else None),
+            "heads": _int_or_none(p[8] if len(p) > 8 else None),
+            "kv_heads": _int_or_none(p[9] if len(p) > 9 else None),
+        })
+    return sorted(out, key=lambda d: -(d["size_bytes"] or 0))
+
+
 # ── 纯估算函数（单元测试目标）──────────────────────────────────────────
 
 _NESTED_KEYS = (
@@ -883,8 +1058,8 @@ def build_host_facts(host: dict, raw: dict) -> dict:
     }
 
     docker_ver = (raw.get("docker_version", {}).get("value") or "").strip() or None
-    docker_imgs_raw = raw.get("docker_images", {}).get("value") or ""
-    docker_vllm = [l.strip() for l in docker_imgs_raw.splitlines() if "vllm" in l.lower()] or None
+    docker_images = parse_docker_images_detail(raw.get("docker_images", {}).get("value"))
+    docker_vllm = [i["repo"] for i in docker_images if "vllm" in i["repo"].lower()] or None
 
     # NUMA 放置：numa_node 合并进每张 GPU；numa_groups 按 topo 的 GPU 索引分组
     #（真实主机上 topo 与 gpu_smi 的 GPU 集合一致；None=N/A 的组放最后）
@@ -928,7 +1103,16 @@ def build_host_facts(host: dict, raw: dict) -> dict:
             "rdma": rdma,
         },
         "disk": {"model_path": None, "avail_bytes": df_avail, "read_bw_gbps": read_bw},
-        "docker": {"version": docker_ver, "vllm_images": docker_vllm},
+        "docker": {
+            "version": docker_ver,
+            "images": docker_images,       # 全部镜像（repo/size/created）
+            "vllm_images": docker_vllm,    # vllm 过滤后的镜像名（env_report.md 用）
+            "containers": parse_docker_ps(raw.get("docker_ps", {}).get("value")),
+        },
+        # 主机探索（host 报告）用：当前占用 / 共租 + 模型介质清单
+        "ports": {"listening": parse_listening_ports(raw.get("listening_ports", {}).get("value"))},
+        "users": {"logged_in": parse_who(raw.get("logged_in_users", {}).get("value"))},
+        "model_inventory": parse_model_inventory(raw.get("model_inventory", {}).get("value")),
         "model_src": model_src,
     }
 
@@ -946,7 +1130,8 @@ def format_rdma(rdma: dict) -> str:
     return f"{label} ×{len(devs)}{sp}"
 
 
-def _system_checklist(facts: dict, is_head: bool, weights_bytes: int | None) -> list[dict]:
+def _system_checklist(facts: dict, is_head: bool, weights_bytes: int | None,
+                      model_declared: bool = True) -> list[dict]:
     """系统参数检查清单：每项 pass/warn/fail + 修复命令。阈值见模块常量。"""
     items: list[dict] = []
 
@@ -976,7 +1161,12 @@ def _system_checklist(facts: dict, is_head: bool, weights_bytes: int | None) -> 
 
     if is_head:
         cfg = facts["model_src"]["config_json"]
-        if cfg is None:
+        if not model_declared:
+            # host-only intake（只给主机、未声明 model）：模型路径尚不适用，不应判 fail
+            items.append({"name": "模型权重路径", "status": "warn",
+                          "detail": "未声明 model（主机探索阶段）；待下发调优指令后核对",
+                          "fix": "在 target.yaml 填 model 后重跑 probe.py"})
+        elif cfg is None:
             items.append({"name": "模型权重路径", "status": "fail",
                           "detail": f"config.json 不可读（{facts['model_src'].get('note') or '路径缺失'}）",
                           "fix": "核对 target.yaml 的 model.path / 重新下载 HF 模型后重跑 Phase 1"})
@@ -1424,6 +1614,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out-dir", default=".")
     ap.add_argument("--ssh-timeout", type=int, default=30)
     args = ap.parse_args(argv)
+    _load_dotenv()   # 与 run.sh 一致：SSH_PORT / SSH_KEY 来自 .env
 
     target = load_yaml(args.target)
     harness = load_yaml(args.harness)
@@ -1464,9 +1655,17 @@ def main(argv: list[str] | None = None) -> int:
                                       gmu_suggested=gmu_suggested,
                                       host_count=len(target["hosts"]))
     wb = model_profile["weights"]["bytes"]
+    model_declared = bool((target.get("model") or {}).get("path")
+                          or (target.get("model") or {}).get("id"))
+    # 端口冲突：与 harness.remote.vllm_port 比对（build_host_facts 无 harness 上下文，此处补）
+    vllm_port = (harness.get("remote") or {}).get("vllm_port")
     for h in target["hosts"]:
-        facts[h["name"]]["checklist"] = _system_checklist(
-            facts[h["name"]], is_head=(h is head), weights_bytes=wb)
+        f = facts[h["name"]]
+        f["checklist"] = _system_checklist(
+            f, is_head=(h is head), weights_bytes=wb, model_declared=model_declared)
+        listening = (f.get("ports") or {}).get("listening") or []
+        f["ports"]["vllm_port_conflict"] = bool(vllm_port) and any(
+            p.get("port") == vllm_port for p in listening)
     interconnect = interconnect_check(target, mode, args.fixtures)
     # 本机互联带宽：host 级事实（hosts.<name>.interconnect）——fixtures 模式从 <key>.txt 读、
     # live 模式由 plan 命令短时实测；每台主机都产出该键，不可得 → null + note，绝不阻塞。
@@ -1501,13 +1700,28 @@ def main(argv: list[str] | None = None) -> int:
     with open(search_space_path, "w", encoding="utf-8") as f:
         json.dump(search_space, f, ensure_ascii=False, indent=2)
 
+    # 主机探索报告（人类评估用）：渲染失败不阻塞探测（附加产物）
+    host_report_path = os.path.join(args.out_dir, "host_report.html")
+    try:
+        import host_report
+        html = host_report.render_host_report(target, facts, harness, model_profile)
+    except Exception as e:  # noqa: BLE001 —— 附加产物，任何渲染问题都不应中断 Phase 1
+        html = None
+        print(f"提示：host_report.html 跳过渲染（{e}）", file=sys.stderr)
+    if html is not None:
+        with open(host_report_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
     print(f"探测完成：{len(target['hosts'])} 台主机（并行采集，mode={mode}）")
     for name, f in facts.items():
         ck = f["checklist"]
         n = {s: sum(1 for i in ck if i["status"] == s) for s in ("pass", "warn", "fail")}
         print(f"  {name} ({f['role']}): pass={n['pass']} warn={n['warn']} fail={n['fail']}")
     print(f"模型配置：{model_profile.get('model')} → weights.source={model_profile['weights']['source']}")
-    print(f"产物：env.json / env_report.md / model_profile.json / search_space.json（{args.out_dir}）")
+    arts = "env.json / env_report.md / model_profile.json / search_space.json"
+    if os.path.exists(host_report_path):
+        arts += " / host_report.html"
+    print(f"产物：{arts}（{args.out_dir}）")
     return 0
 
 

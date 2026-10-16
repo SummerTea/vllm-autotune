@@ -13,6 +13,7 @@ bench_results/
 results.tsv
 env.json
 env_report.md
+host_report.html
 model_profile.json
 search_space.json
 report.md

@@ -1,0 +1,2 @@
+/data/DeepSeek-V4.1-Flash	510286023000	62	deepseek_v41	DeepseekV41ForCausalLM	fp8	bfloat16	40	64	1
+/data/model/Kimi-K3	1560936091448	96	kimi_k3	KimiK3ForConditionalGeneration	compressed-tensors	bfloat16	93	96	96

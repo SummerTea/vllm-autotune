@@ -1,0 +1,2 @@
+dynamo-fe-1	nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.5.0	Up 2 days	0.0.0.0:8000->8000/tcp
+minio-kvbm	harbor.asiainfo/af/minio:latest	Up 2 days	

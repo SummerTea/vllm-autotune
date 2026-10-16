@@ -58,6 +58,22 @@ def _run_probe(tmp_path: Path, target: dict = TARGET,
     return subprocess.run(cmd, capture_output=True, text=True, cwd=tmp_path)
 
 
+def test_host_only_target_runs_without_model(tmp_path):
+    """host-only intake（只给主机、未声明 model）必须跑通：画像降级、模型路径不误判 fail、
+    host_report.html 仍产出——这是「先提供主机 → 出报告 → 再下发调优指令」的前置条件。"""
+    host_only = {"hosts": [{"name": "head", "ssh": "user@10.0.0.1", "role": "head"}]}
+    r = _run_probe(tmp_path, target=host_only)
+    assert r.returncode == 0, f"probe 失败:\n{r.stdout}\n{r.stderr}"
+    out = tmp_path / "out"
+    assert (out / "host_report.html").exists()
+    env = json.loads((out / "env.json").read_text(encoding="utf-8"))
+    assert env["hosts"]["head"]["model_inventory"]              # 模型清单与是否声明 model 无关
+    prof = json.loads((out / "model_profile.json").read_text(encoding="utf-8"))
+    assert prof["weights"]["source"] == "unavailable"           # 降级而非报错
+    md = (out / "env_report.md").read_text(encoding="utf-8")
+    assert "模型权重路径 | warn" in md                          # 未声明 model → warn（不再误判 fail）
+
+
 def test_fixture_probe_produces_artifacts(tmp_path):
     r = _run_probe(tmp_path)
     assert r.returncode == 0, f"probe 失败:\n{r.stdout}\n{r.stderr}"
@@ -66,7 +82,8 @@ def test_fixture_probe_produces_artifacts(tmp_path):
     report_p = tmp_path / "out" / "env_report.md"
     profile_p = tmp_path / "out" / "model_profile.json"
     ss_p = tmp_path / "out" / "search_space.json"
-    for p in (env_p, report_p, profile_p, ss_p):
+    host_html_p = tmp_path / "out" / "host_report.html"
+    for p in (env_p, report_p, profile_p, ss_p, host_html_p):
         assert p.exists(), f"缺产物: {p.name}"
 
     env = json.loads(env_p.read_text(encoding="utf-8"))
@@ -88,6 +105,20 @@ def test_fixture_probe_produces_artifacts(tmp_path):
     assert head["cpu"]["governor"] == "performance"
     assert head["docker"]["version"]                    # docker 检测（fixture docker_version.txt）
     assert any("vllm/vllm-openai" in i for i in (head["docker"]["vllm_images"] or []))
+    # 主机探索字段：镜像含 size/created、运行中容器、监听端口冲突、登录用户、模型介质清单
+    imgs = {i["repo"]: i for i in head["docker"]["images"]}
+    assert imgs["vllm/vllm-openai:v0.31.0"]["size"] == "32.3GB"
+    assert imgs["vllm/vllm-openai:v0.31.0"]["created"] == "12 days ago"
+    assert head["docker"]["containers"][0]["name"] == "dynamo-fe-1"
+    assert head["ports"]["vllm_port_conflict"] is True      # fixture 有 8000；harness remote.vllm_port=8000
+    assert "node-user06" in (head["users"]["logged_in"] or [""])[0]
+    assert [m["dir"] for m in head["model_inventory"]] == [
+        "/data/model/Kimi-K3", "/data/DeepSeek-V4.1-Flash"]  # 按大小降序
+    assert head["model_inventory"][0]["n_shards"] == 96
+    # host_report.html：自包含离线（无 <script>、无外链）
+    html = host_html_p.read_text(encoding="utf-8")
+    assert "<script" not in html and "http://" not in html and "https://" not in html
+    assert "A100" in html and "vllm/vllm-openai:v0.31.0" in html
     # RDMA：fixture 无 ibstat，但有 sysfs mlx5_* + link_layer Ethernet → 必须判 RoCE（防假阴性回归）
     rdma = head["net"]["rdma"]
     assert rdma["kind"] == "roce"
