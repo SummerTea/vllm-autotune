@@ -7,12 +7,12 @@
 
 ### A. 预检自动探测最大 `gpu-memory-utilization` ★★★
 - 来源：`auto_tune.sh:252-272`（从 0.98 起每步 -0.01，直到服务器能起不 OOM，之后固定用该值做网格）。
-- 价值：**直接解决我们真机遇到的痛点**——共享主机上每卡只剩 ~34GB，`gmu=0.5` 被拒；自动下降探测可自动落到 0.35。
+- 价值：**直接解决共享主机的痛点**——每卡可用显存常远低于标称，固定高 `gmu` 会被拒；自动下降探测可落到实际可用值。
 - 适配（**已实现**）：`bench.py --detect-gmu`（`run.sh --detect-gmu` → `bash run.sh --poll`）——从高值下降直到 serve 就绪，产出 `gmu_probe.json` 的 `gmu_suggested` 与 status.json（可直接轮询）；建议值用进后续 config 的 `serve.gpu-memory-utilization`。可保留为搜索维度，只是给一个"安全上限"起点。
 
 ### B. `--load-format dummy` 快速扫描 ★★★（已实现 `--detect-gmu`）
 - 来源：`auto_tune.sh:95`。
-- 价值：**用随机权重启动**，省去真实权重加载（我们真机 load=192s/次），把"起服/内存适配"预检从分钟级降到秒级。
+- 价值：**用随机权重启动**，省去真实权重加载（真实加载常达分钟级），把"起服/内存适配"预检从分钟级降到秒级。
 - 适配：`bench.py --detect-gmu` 用 dummy 快速起服探测安全 gmu。**适用范围**：dummy 生成同 shape/dtype 的张量，显存占用与稠密模型调度有代表性；**MoE 模型不适用**——router 依赖门控权重，dummy 下各 expert 负载/显存/吞吐失真，**仅可用于起服/内存适配探测，不得用于吞吐 keep/discard**（吞吐/精度实验用真实权重）。
 
 ### C. 前缀缓存感知工作负载 `--random-prefix-len` ★★★

@@ -329,7 +329,7 @@ def test_checklist_gpu_persistence_mode_is_warn_not_fail():
 
 # ── RDMA 检测（sysfs 主判据，缺 ibstat 不假阴性）────────────────────────
 
-# 真机逐字输出（node-user02@10.23.69.131）——必须能用这套字符串解析出全部字段
+# 真机逐字输出——必须能用这套字符串解析出全部字段
 REAL_RDMA_LINK = (
     "link mlx5_0/1 state ACTIVE physical_state LINK_UP netdev enp24s0f0np0 \n"
     "link mlx5_1/1 state ACTIVE physical_state LINK_UP netdev enp24s0f1np1 \n"

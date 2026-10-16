@@ -1,8 +1,8 @@
 # 对「GPT 5-Sprint 改造计划」的评估
 
 > 评估对象：会话中 GPT 提出的「立即落地改造计划」（Loop Controller / Workload-Concurrency Sweep / Executable Search Space / GuideLLM 验收 / 硬件与质量证据）。
-> 方法：对计划的事实前提做 `file:line` 核验（3 个只读 lane）+ 外部最佳实践调研 + 一轮对抗性复核（@oracle），证据面见 `.slim/deepwork/remake-plan-review.md`。
-> 结论基于本仓工作树当前 HEAD 与 `results.tsv` 实测数据；未运行真实 GPU trial。
+> 方法：对计划的事实前提做 `file:line` 核验（3 个只读 lane）+ 外部最佳实践调研 + 一轮对抗性复核（@oracle）。
+> 结论中的成本数据取自某次真机演练的账本快照（`results.tsv`——本地生成物，不入库）；未运行真实 GPU trial。
 
 ---
 
@@ -36,14 +36,14 @@
 
 - 计划把「agent 改不了并发/负载」当作既定事实。
 - 实测代码：`bench.py:1028` `ref_conc = workload.get("ref_concurrency") or bench_cfg.get("ref_concurrency", DEFAULT)`，而 `workload = harness.workload ⊕ target.workload`（`bench.py:1026`）、`bench_cfg = harness.bench ⊕ config.bench`（`bench.py:1004`）。
-- 因此优先级为：**`target.workload` > `harness.workload` > `config.bench` > `harness.bench` > 默认**（注意 `config.bench` **覆盖** `harness.bench`，见 `bench.py:1004` `bench_cfg = {**harness.bench, **config.bench}`）。当前 `target.yaml:29` 已声明 `ref_concurrency: 128`，会**短路** `config.bench.ref_concurrency`。
+- 因此优先级为：**`target.workload` > `harness.workload` > `config.bench` > `harness.bench` > 默认**（注意 `config.bench` **覆盖** `harness.bench`，见 `bench.py:1004` `bench_cfg = {**harness.bench, **config.bench}`）。当前若用户在 `target.yaml`（本地文件，不入库）声明了 `ref_concurrency`，会**短路** `config.bench.ref_concurrency`。
 - **含义**：今天 agent 经 `config.yaml` 确实改不了参考并发点。但这里是**文档承诺 vs 代码禁用**的张力：`program.md:42` 明文把 `config.bench.ref_concurrency` 列为覆盖 `harness.bench` 的通道，而 `bench.py:1028` 的优先级让 `target.workload` 把它短路——既非「缺少通道」，也非纯粹设计意图，而是**两处语义未对齐**。
 - **对计划的修正**：Sprint 2 引入 `config.workload` 时，必须**明确定义覆盖优先级**并对齐 `program.md:42`，同时保持「负载身份不可变」（`program.md:155`）约束——否则会把一处刻意的设计误当 bug 去「修」。
 
 ### A2. `budget` 不是「缺失」，而是「已声明、未执行」
 
 - 计划称「预算检查下沉到代码」，暗示现状没有预算。
-- 实测：`target.yaml:32-33` 已写 `budget: max_hours: 2`；`program.md:82` 定义了语义（`max_hours` 优先 / `stop_at`）；但**没有任何代码读取它**（`scripts/mock_loop.py:118-126` 的 `should_exit` 是纯函数且**未接线** `run.sh`）。
+- 实测：`target.yaml`（本地文件，不入库）已声明 `budget`（`max_hours` 优先 / `stop_at`）；`program.md:82` 定义了语义；但**没有任何代码读取它**（`scripts/mock_loop.py:118-126` 的 `should_exit` 是纯函数且**未接线** `run.sh`）。
 - **含义**：controller 不是「接一根现成的线」，而是**首次引入预算执行语义**——改造面比计划宣称的大，且它将成为唯一读取 budget 的执行者。
 - **对计划的修正**：把「下沉预算」重述为「**新增预算执行语义**」，并明确 budget 的真源仍是 `target.yaml`（人类侧），controller 只读不写。
 
@@ -79,17 +79,17 @@
 
 ### C1. `loop_state.json` 是第二真源
 
-- 契约真源是 `results.tsv` + git（`README.md:65`）。新增 `loop_state.json` 若无约束，会与账本分歧——正是本仓已经打过的那类「陈旧产物污染」bug（`.slim/deepwork/autotune-hardening-v2.md:22`）。
+- 契约真源是 `results.tsv` + git（`README.md:65`）。新增 `loop_state.json` 若无约束，会与账本分歧——正是本仓已经打过的那类「陈旧产物污染」bug。
 - **修正**：`loop_state.json` 必须**严格派生/可重建**（由 `results.tsv` + git HEAD + `.trial_id` + 远端 status.json 重算），**永不作为权威真源**；写入即可被删除并由重算复原。计划需把这条写成硬约束 + 恢复测试。
 
 ### C2. 多并发 sweep 成本未量化（实测反证）
 
-基于本仓 `results.tsv` 的真实数据：
+基于某次真机演练账本（`results.tsv`）的实测数据（**示例，非模板保证值**）：
 
 | 观测 | 数值 |
 |---|---|
-| baseline `dur_s` / load | 764s / 446.8s |
-| confirm `dur_s` / load | 637.3s / 319.6s |
+| 基线 trial `dur_s` / load | 764s / 446.8s |
+| 确认 trial `dur_s` / load | 637.3s / 319.6s |
 | 单次 bench 均摊（`(dur−load)/4`，warmup1+repeats3） | ≈ 79s @ `num_prompts=400`, `concurrency=128` |
 | 单 trial 总耗时区间 | 636–937s（≈10.6–15.6min） |
 | 2h 预算可容纳 trial 数 | ≈ 8–11 |
@@ -154,7 +154,7 @@
 ## 六、E 段：计划遗漏的部分
 
 1. **agent ↔ controller 权责边界**（最重要，见 B1）——不定义则必然退化为「脚本裁决策略」。
-2. **已有 run 的迁移**：旧 `results.tsv`（当前仅 10 列旧格式，见 `results.tsv` 表头）与新 17 列头的兼容、在途远端 trial 的接管——计划只把它列为风险，未列为交付项。
+2. **已有 run 的迁移**：旧格式账本（列集与新表头不一致时）与新 17 列头的兼容、在途远端 trial 的接管——计划只把它列为风险，未列为交付项。
 3. **controller 状态机的测试策略**：计划只写「现有测试必须通过」，未要求状态机专项测试（crash 中断/半途 commit/重复入账/预算边界）。
 4. **顶层未知 config 键的 fail-loud**（见 A3）。
 5. **成本闸门**（见 C2）。
@@ -209,6 +209,6 @@
 
 ## 九、适用范围与残留风险
 
-- 本评估基于工作树当前 HEAD 与 `results.tsv` 实测成本；**未运行真实 GPU trial**，多并发 sweep 的实际墙钟与低并发点退化程度仍属**估算**。
+- 本评估基于某次真机演练的账本（`results.tsv`）实测成本；**未运行真实 GPU trial**，多并发 sweep 的实际墙钟与低并发点退化程度仍属**估算**。
 - 未核验：`vllm bench sweep` 在 `vllm/vllm-openai:v0.31.0` 中是否存在（C3 前提）；本地无 `bench_results/*.json`，原始 JSON 键取自 `docs/vllm-facts.md:45`。
 - 外部工具的成熟度（vllm-tuner 等）未实测。

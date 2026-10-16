@@ -8,7 +8,7 @@
 
 - v1 保持**单节点（head 独占）+ docker-only 运行时**：跨机涉及 NCCL/RDMA 拓扑与故障域，v2 才做；单节点上「serve 参数 + 进程级 env」已可覆盖大部分收益。vLLM 环境复杂，运行时统一收敛为 docker 镜像（此前曾支持本机安装式，已移除）。
 - 零破坏契约不变：默认不 pull 镜像、不安装环境；v1.1 的监控/基准均为可选旁路，缺失不影响默认循环。
-- 真机已验证：**8×RTX6000D**（docker 运行时）跑通 probe → bench → report 全链路与校准。
+- 真机已验证：**单节点多卡**（docker 运行时）跑通 probe → bench → report 全链路与校准。
 - 已随仓库交付工程级 skills（`.agents/skills/`：vllm-bench-serve / vllm-deploy-docker / vllm-prefix-cache-bench，见 `skills-lock.json`）。
 - **NUMA 采集/约束已实现**：`probe.py` 产出 `env.json` 的 `numa_groups`（每 GPU `numa_node`）+ 检查清单「NUMA 放置」建议（warn on 多 NUMA）+ `program.md` 剪枝规则（tp 组限同 NUMA 节点）；系统级绑定仍**只建议、不自动**（零破坏契约不变）。
 
@@ -48,11 +48,11 @@
 - **目标**：把「NUMA 亲和」从只建议升级为可 opt-in 的自动绑定——容器 `--cpuset-cpus/--cpuset-mems` + `env.CUDA_VISIBLE_DEVICES` 限定可见 GPU、必要时宿主机 `numactl` 绑定（改动前记录原值、失败自动回滚）。**注意**：`build_docker_run_cmd` 已固定 `--gpus all`，若将来改用 `--gpus device=` 限卡，须先在构建器做 `--gpus` 去重（或统一走 `CUDA_VISIBLE_DEVICES`）。
 - **成本**：低-中；属 v2「系统级参数白名单自动调」的前置子项。
 
-## v1.2 — 本轮真机演练新增待办（131 / DeepSeek-V4.1-Flash）
+## v1.2 — 真机演练新增待办
 
-> 来源：`drill/deepseek-v4-flash-6000d05` 全流程演练。**前两项属设计决策，需人工拍板后再实现**；其余为低成本增强。
+> 来源：一次全流程真机演练。**前两项属设计决策，需人工拍板后再实现**；其余为低成本增强。
 
-- **(g) 高方差 workload 的噪声模型**：keep 阈值 `max(best×3%, k×σ)` 在 σ 达 best 的 ~55% 时几乎无法 keep（实测 σ≈3.67 vs best 6.62 req/s），循环会退化为「平台期退出」。候选手段：**丢弃预热轮**（首轮冷启动污染：实测 ttft_p99 的组间 σ 达 13s）、**σ 上限**、**自适应 repeats**。注意：改 `harness.yaml` 语义会影响跨 run 可比性，需与历史行区分标注。
+- **(g) 高方差 workload 的噪声模型**：keep 阈值 `max(best×3%, k×σ)` 在 σ 接近 best 量级时几乎无法 keep（实测 σ 可达 best 的约一半），循环会退化为「平台期退出」。候选手段：**丢弃预热轮**（首轮冷启动污染可显著放大 ttft_p99 的组间波动）、**σ 上限**、**自适应 repeats**。注意：改 `harness.yaml` 语义会影响跨 run 可比性，需与历史行区分标注。
 - **(h) `fallbacks`（换机 / 换模型）**：`target.example.yaml` 已留注释位，但**当前未实现**（`run.sh` 硬绑唯一 `role:head`）。需要：target schema（候选主机/模型）+ `run.sh` 的选主/切换与失败回退机制 + 留痕。
 - **(i) `loop-orchestration` skill**：把「主循环唯一写者 / 子 agent 只读认知分工（探索·分析·验证·评估）/ 摘要即弃」的纪律做成 `.agents/skills/` 工程级 skill，使不支持子 agent 的 harness 也有一致降级口径。
 - **(j) `scripts/mock_loop.py --score`**：让「评估」角色直接跑纯函数打分，而非 LLM 心算 keep/discard。

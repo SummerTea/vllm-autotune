@@ -214,8 +214,8 @@ class TestValidTpDivisors:
             assert mtp is None or mtp in tp["valid_divisors"]
 
     def test_kv_heads_one_mla_only_constrained_by_heads(self):
-        # 真机 DeepSeek-V4-Flash-0731（MLA）：heads=64 / kv_heads=1 / 权重 166878536440B
-        # / GPU≈85651MiB / gmu=0.88 → tp=8 实机可用；kv_heads<=1 时只受 heads 约数约束
+        # MLA 形态样例（kv_heads=1）：heads=64 / kv_heads=1 / 权重按 safetensors index
+        # / GPU≈85651MiB / gmu=0.88 → tp 受权重容量约束；kv_heads<=1 时只受 heads 约数约束
         tp = probe.valid_tp_divisors(
             {"num_attention_heads": 64, "num_key_value_heads": 1},
             int(85651 * 1024**2), 0.88, 166878536440)
