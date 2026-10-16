@@ -5,6 +5,7 @@
 在 SLO 约束下最大化 goodput；每次实验只改 `config.yaml`，其余文件只读。满足任一退出条件即进 Phase 4，不要无限循环。
 
 - **远端约束**：所有远端操作只写 `target.yaml` 确认的 `work_dir`；默认不 pull 镜像、不安装环境。
+- **主机探索（Phase 0.5）**：只给主机（未声明 model）时 `python probe.py` 仍可运行，产出 `host_report.html`（GPU / 网络 / 可用 vLLM 镜像 / 模型介质 / 当前占用），作为人类「下发调优指令」的评估依据；该阶段为只读采集，无需 `work_dir`。
 
 ## 运行期自主性契约
 
@@ -187,7 +188,7 @@ isl / osl / ref_concurrency 定义负载身份，单次 run 内绝不改动（�
 
 ## 子 agent 分派
 
-- **固定分派点**：Phase 1 —— 探索子 agent 核验环境事实与踩坑查证；Phase 3 —— 周期性（每 N 轮，N 取 3–5，可由 harness 配置）一次分析子 agent 做趋势 / 瓶颈体检；Phase 4 前 —— 验证子 agent 独立复核 best 回归与结论。
+- **固定分派点**：Phase 0.5 —— 「主机探索」子 agent 独占「跑 `probe.py` + 归纳」：跑 host-only 探测并回传 ≤15 行摘要 + `host_report.html` 路径，**原文（`env.json` 等）不进主上下文**（主循环零接触）；Phase 1 —— 探索子 agent 核验环境事实与踩坑查证；Phase 3 —— 周期性（每 N 轮，N 取 3–5，可由 harness 配置）一次分析子 agent 做趋势 / 瓶颈体检；Phase 4 前 —— 验证子 agent 独立复核 best 回归与结论。
 - **触发**：需要跨文件 / 跨知识检索，或结论将被 keep / 采纳时派；纯机械执行（改一个已定参数、跑一次 run.sh）不派。
 - **评估可执行化**：评估子 agent 优先直接运行 scripts/mock_loop.py 的纯函数，不靠心算。
 - **成本护栏**：同一 Phase 内子 agent 总预算设上限；验证角色不得复用产生结论者的会话。

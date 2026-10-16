@@ -16,7 +16,7 @@
 ## 如何使用（fork 指南）
 
 1. Fork / clone 本仓库。
-2. `cp target.example.yaml target.yaml`，填写主机、模型、SLO、预算。
+2. `cp target.example.yaml target.yaml`：可**先只填主机**段 → 跑 `python probe.py` 得到 **`host_report.html`**（主机探索报告：GPU / 网络 / 可用 vLLM 镜像 / 模型介质 / 当前占用），据此评估后再补模型、SLO、预算（即「先提供主机 → 出报告 → 下发调优指令」）。
 3. `cp .env.example .env`，填写 SSH 选项（端口、私钥路径、远端目录）。
 4. 在编排机（本仓库目录）运行 `bash setup_remote.sh`（一次性校验：docker 可用 + 镜像已就绪；零 pull、零安装）。
 5. 把编码 agent（Claude Code / Codex / opencode）指向本仓库。
@@ -35,7 +35,8 @@
 | `AGENTS.md` | agent 的入口：权限边界 + 四阶段流程 | 只读 |
 | `program.md` | 调优循环细则：决策规则、退出机制、剪枝策略 | 只读 |
 | `README.md` | 本文件 | 只读 |
-| `probe.py` | 多机环境探测（并行）→ env.json / env_report.md / model_profile.json / search_space.json | 只读 |
+| `probe.py` | 多机环境探测（并行）→ env.json / env_report.md / model_profile.json / search_space.json / **host_report.html** | 只读 |
+| `host_report.py` | 主机探索报告渲染：读 env.json → 自包含离线 `host_report.html`（GPU/网络/可用镜像/模型介质/当前占用 五段）；被 probe.py 调用 | 只读 |
 | `search_space.json` | Phase 1 探测产物：机器可读候选池（tp / placement / NCCL env / cheap knobs + `pruned` 剪枝清单，均带 reason） | 生成物（agent 据此选候选） |
 | `bench.py` | 远端起服 + `vllm bench serve --goodput` 度量 + 僵尸清理 + 可选 `--detect-gmu` 预检；crash 时在 result.json 写机器可读 `crash_kind` | 只读 |
 | `report.py` | 收尾汇总 → report.md（基线 vs 最佳 + 全部 trial + 系统级建议） | 只读 |
@@ -88,13 +89,14 @@
 
 ## 推荐 skills（工程级 `.agents/`）
 
-仓库已内置 3 个工程级 agent skills（来源 `vllm-project/vllm-skills`，由 `skills-lock.json` 锁定版本）：
+仓库已内置 4 个工程级 agent skills：`host-explore` 为本仓库自写；其余 3 个来自 `vllm-project/vllm-skills`（由 `skills-lock.json` 锁定版本）。
 
-| skill | 用途 |
-|---|---|
-| `vllm-bench-serve` | `vllm bench serve` 基准运行（与模板度量一致） |
-| `vllm-deploy-docker` | vLLM 的 docker 部署/参数核对（与 docker 运行时互补） |
-| `vllm-prefix-cache-bench` | prefix-caching 专项压测（`enable-prefix-caching` 调优证据） |
+| skill | 用途 | 来源 |
+|---|---|---|
+| `host-explore` | Phase 0.5 主机探索子 agent：跑 host-only `probe.py` → 回传 ≤15 行摘要 + `host_report.html`（原文不进主上下文） | 本仓库 |
+| `vllm-bench-serve` | `vllm bench serve` 基准运行（与模板度量一致） | vllm-skills |
+| `vllm-deploy-docker` | vLLM 的 docker 部署/参数核对（与 docker 运行时互补） | vllm-skills |
+| `vllm-prefix-cache-bench` | prefix-caching 专项压测（`enable-prefix-caching` 调优证据） | vllm-skills |
 
 添加更多：`npx skills add vllm-project/vllm-skills`（或 NVIDIA/skills 等，见 `docs/external-resources.md`）。注意 CLI 会为其他 harness 创建 gitignore 掉的软链接。
 
